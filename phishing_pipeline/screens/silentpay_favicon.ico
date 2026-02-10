@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Вход | SilentPay</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="/css/auth.css">
+    <link rel="stylesheet" href="/css/login.css">
+    <link rel="stylesheet" href="/css/graf.css">
+    <link rel="icon" href="images/favicon.ico" type="image/x-icon">
+</head>
+<body>
+<div class="auth-container" id="auth-container">
+    <header class="auth-header">
+        <a href="/" class="logo">
+            <img src="/images/logo.svg" alt="SilentPay" class="logo-img">
+            <span class="logo-text">SilentPay</span>
+        </a>
+    </header>
+
+    <main class="auth-content">
+        <div class="graphic-side">
+            <div class="graphic-container">
+
+
+                <div class="profit-display">
+                    <div class="profit-header">
+                        <h3 class="profit-title">Обновлено <span class="update-timer">5</span> сек назад</h3>
+                    </div>
+
+                    <div class="profit-graph">
+                        <svg class="graph-grid" viewBox="0 0 500 200" preserveAspectRatio="none">
+                            <!-- Горизонтальные линии -->
+                            <line class="grid-line" x1="0" y1="40" x2="500" y2="40"></line>
+                            <line class="grid-line" x1="0" y1="100" x2="500" y2="100"></line>
+                            <line class="grid-line" x1="0" y1="160" x2="500" y2="160"></line>
+                        </svg>
+
+                        <svg class="graph-line" viewBox="0 0 500 200" preserveAspectRatio="none">
+                            <defs>
+                                <linearGradient id="graph-gradient" x1="0%" y1="0%" x2="0%" y2="100%">
+                                    <stop offset="0%" stop-color="var(--profit-color)" stop-opacity="0.8"></stop>
+                                    <stop offset="100%" stop-color="var(--profit-color)" stop-opacity="0"></stop>
+                                </linearGradient>
+                            </defs>
+                            <path d="M0,160 C50,140 100,180 150,120 C200,60 250,100 300,80 C350,60 400,100 450,40 C500,0 500,200 500,200 L500,200 L0,200 Z"
+                                  class="graph-fill"></path>
+                            <path d="M0,160 C50,140 100,180 150,120 C200,60 250,100 300,80 C350,60 400,100 450,40"
+                                  class="graph-line"></path>
+                        </svg>
+                    </div>
+
+                    <div class="profit-stats">
+                        <div class="profit-stats">
+                            <div class="stat-card">
+                                <div class="stat-value">$2,453 <span class="mini-chart">↑</span></div>
+                                <div class="metric-label">Объем прибыли</div>
+                                <div class="metric-subtext">Последние 5 секунд</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-value up">8.42%</div>
+                                <div class="metric-label">Изменение</div>
+                                <div class="metric-subtext">Текущий поток</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-value">124</div>
+                                <div class="metric-label">Количество сделок</div>
+                                <div class="metric-subtext">Текущий поток</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="form-side">
+            <form class="auth-form" action="/login" method="post"><input type="hidden" name="_csrf" value="l7A7l_3hVnjntPnul5U4Z4WyvzEsHK7Ru1I0B2iEoU8zNMvopIVfpJuAZ0rKjMjer7gMAreKkglNfs38iWACPlm8kywGAq3b"/>
+                <div class="form-header">
+                    <h1 class="form-title">Вход</h1>
+                    <p class="form-subtitle">Войдите в свой аккаунт, чтобы продолжить</p>
+                </div>
+
+                
+
+                <div class="form-fields">
+                    <div class="input-group">
+                        <label class="input-label">Логин</label>
+
+                        <input class="input-field" type="text" name="username" required placeholder="Введите логин">
+
+                    </div>
+
+                    <div class="input-group">
+                        <label class="input-label">Пароль</label>
+                        <div class="password-container">
+                            <input class="input-field" type="password" name="password" required
+                                   placeholder="Введите пароль" id="password-field">
+                            <i class="fas fa-eye eye-icon" id="togglePassword"></i>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="form-footer">
+                    <div class="register-link">
+                        <span class="register-text">Нет аккаунта?</span>
+                        <a href="/register" class="register-btn">Регистрация</a>
+                    </div>
+                    <button type="submit" class="submit-btn">Войти</button>
+                </div>
+            </form>
+        </div>
+    </main>
+</div>
+
+</body>
+</html>
+
+
+<script>
+    document.addEventListener("DOMContentLoaded", function () {
+        // Изменил селектор на .eye-icon (как в вашем HTML)
+        const togglePassword = document.querySelector(".eye-icon");
+        const passwordField = document.getElementById("password-field");
+
+        if (togglePassword && passwordField) {
+            console.log("Элементы найдены!");
+            togglePassword.addEventListener("click", function () {
+                console.log("Клик сработал!");
+                const isPassword = passwordField.type === "password";
+                passwordField.type = isPassword ? "text" : "password";
+                // Переключаем между fa-eye и fa-eye-slash
+                togglePassword.classList.toggle("fa-eye");
+                togglePassword.classList.toggle("fa-eye-slash");
+            });
+        } else {
+            console.error("Элементы не найдены!");
+            console.log("Ищем:", {
+                togglePassword: document.querySelector(".eye-icon"),
+                passwordField: document.getElementById("password-field")
+            });
+        }
+    });
+
+    // Конфигурация графика
+    const graphConfig = {
+        day: {
+            points: 24, // Часы
+            volatility: 0.3,
+            growthFactor: 0.8
+        },
+        week: {
+            points: 7, // Дни
+            volatility: 0.5,
+            growthFactor: 1.2
+        },
+        month: {
+            points: 30, // Дни
+            volatility: 0.7,
+            growthFactor: 1.5
+        },
+        year: {
+            points: 12, // Месяцы
+            volatility: 1.0,
+            growthFactor: 2.0
+        }
+    };
+
+    // Текущие значения
+    let currentData = {
+        profit: 2453,
+        growth: 8.42,
+        deals: 124
+    };
+
+    // Генерация данных графика
+    function generateGraphData(period) {
+        const config = graphConfig[period];
+        const data = [];
+        let lastValue = 2000 + Math.random() * 500;
+
+        for (let i = 0; i < config.points; i++) {
+            // Основной рост + случайные колебания
+            const growth = lastValue * (0.005 * config.growthFactor);
+            const randomChange = lastValue * (Math.random() - 0.5) * 0.01 * config.volatility;
+            lastValue += growth + randomChange;
+
+            data.push(Math.max(1500, lastValue));
+        }
+
+        return data;
+    }
+
+    // Обновление графика
+    function updateGraph(period) {
+        const data = generateGraphData(period);
+        const svg = document.querySelector('.graph-line');
+        const fill = document.querySelector('.graph-fill');
+
+        // Создаем путь для линии
+        let path = `M0,200 `;
+        let fillPath = `M0,200 `;
+
+        const step = 500 / (data.length - 1);
+        const minVal = Math.min(...data);
+        const maxVal = Math.max(...data);
+        const range = maxVal - minVal || 1;
+
+        data.forEach((value, i) => {
+            const x = i * step;
+            const y = 200 - ((value - minVal) / range) * 160;
+
+            if (i === 0) {
+                path += `L${x},${y} `;
+                fillPath += `L${x},${y} `;
+            } else {
+                const prevX = (i - 1) * step;
+                const prevY = 200 - ((data[i - 1] - minVal) / range * 160);
+                const cpx1 = prevX + (x - prevX) / 3;
+                const cpx2 = prevX + (x - prevX) * 2 / 3;
+
+                path += `C${cpx1},${prevY} ${cpx2},${y} ${x},${y} `;
+                fillPath += `C${cpx1},${prevY} ${cpx2},${y} ${x},${y} `;
+            }
+        });
+
+        fillPath += `L500,200 L0,200 Z`;
+
+        svg.querySelector('path.graph-line').setAttribute('d', path);
+        fill.setAttribute('d', fillPath);
+
+        // Анимация прорисовки
+        svg.querySelector('path.graph-line').style.strokeDasharray = '1000';
+        svg.querySelector('path.graph-line').style.strokeDashoffset = '1000';
+
+        const animate = svg.querySelector('path.graph-line').animate(
+            [{strokeDashoffset: '1000'}, {strokeDashoffset: '0'}],
+            {duration: 1500, easing: 'ease-out'}
+        );
+
+        // Обновляем текущие значения
+        const lastValue = data[data.length - 1];
+        const firstValue = data[0];
+        currentData = {
+            profit: lastValue,
+            growth: ((lastValue - firstValue) / firstValue * 100),
+            deals: Math.floor(currentData.deals * (1 + Math.random() * 0.05))
+        };
+    }
+
+    // Анимация чисел
+    function animateNumbers() {
+        const elements = [
+            {
+                el: document.querySelector('.stat-card:nth-child(1) .stat-value'),
+                value: currentData.profit,
+                format: val => '$' + Math.floor(val).toLocaleString()
+            },
+            {
+                el: document.querySelector('.stat-card:nth-child(2) .stat-value'),
+                value: currentData.growth,
+                format: val => val.toFixed(2) + '%'
+            },
+            {
+                el: document.querySelector('.stat-card:nth-child(3) .stat-value'),
+                value: currentData.deals,
+                format: val => Math.floor(val).toLocaleString()
+            }
+        ];
+
+        elements.forEach(item => {
+            const start = parseFloat(item.el.textContent.replace(/[^0-9.]/g, ''));
+            const duration = 1000;
+            const startTime = performance.now();
+
+            const animate = (currentTime) => {
+                const elapsed = currentTime - startTime;
+                const progress = Math.min(elapsed / duration, 1);
+                const currentValue = start + (item.value - start) * progress;
+
+                item.el.textContent = item.format(currentValue);
+
+                if (progress < 1) {
+                    requestAnimationFrame(animate);
+                }
+            };
+
+            requestAnimationFrame(animate);
+        });
+    }
+
+    // Автоматическое обновление
+    let autoUpdateInterval;
+    let currentPeriod = 'week';
+
+    function startAutoUpdate() {
+        if (autoUpdateInterval) clearInterval(autoUpdateInterval);
+
+        autoUpdateInterval = setInterval(() => {
+            updateGraph(currentPeriod);
+            animateNumbers();
+
+            // Периодически меняем период для разнообразия
+            if (Math.random() > 0.9) {
+                const periods = Object.keys(graphConfig);
+                currentPeriod = periods[Math.floor(Math.random() * periods.length)];
+                document.querySelectorAll('.period-btn').forEach(btn => {
+                    btn.classList.toggle('active', btn.textContent.toLowerCase() === currentPeriod);
+                });
+            }
+        }, 5000);
+    }
+
+    // Инициализация
+    document.addEventListener('DOMContentLoaded', () => {
+        // Начальная установка
+        updateGraph(currentPeriod);
+        animateNumbers();
+        startAutoUpdate();
+
+        // Обработчики кнопок периода
+        document.querySelectorAll('.period-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                currentPeriod = btn.textContent.toLowerCase();
+                document.querySelectorAll('.period-btn').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+
+                updateGraph(currentPeriod);
+                animateNumbers();
+            });
+        });
+
+        // Добавляем микроанимацию для графика при hover
+        const graph = document.querySelector('.profit-graph');
+        graph.addEventListener('mousemove', (e) => {
+            const rect = graph.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+
+            // Создаем эффект параллакса
+            graph.style.transform = `perspective(500px) rotateX(${(y - rect.height / 2) / 20}deg) rotateY(${(x - rect.width / 2) / 20}deg)`;
+        });
+
+        graph.addEventListener('mouseleave', () => {
+            graph.style.transform = 'perspective(500px) rotateX(0) rotateY(0)';
+        });
+    });
+    function startUpdateTimer() {
+        const timerElement = document.querySelector('.update-timer');
+        let seconds = 5;
+
+        const timer = setInterval(() => {
+            seconds--;
+            timerElement.textContent = seconds;
+
+            if (seconds <= 0) {
+                clearInterval(timer);
+                timerElement.textContent = "5";
+                // Здесь можно вызвать обновление данных
+                startUpdateTimer();
+            }
+        }, 1000);
+    }
+
+    // Запускаем при загрузке
+    startUpdateTimer();
+</script>

@@ -1,4 +1,12 @@
-import os, re, base64, mimetypes, requests, asyncio
+import os, re, base64, mimetypes, requests, asyncio, warnings, logging as _logging, socket
+import aiohttp  # For HEAD request pre-check
+# Suppress harmless PyTorch RNN warning from EasyOCR's LSTM
+warnings.filterwarnings("ignore", message="RNN module weights are not part of single contiguous chunk")
+# Suppress screenshot failure warnings (they clutter the terminal)
+class ScreenshotWarningFilter(_logging.Filter):
+    def filter(self, record):
+        return "Failed to capture screenshot" not in record.getMessage()
+_logging.getLogger("phishing_pipeline.visual_features").addFilter(ScreenshotWarningFilter())
 import numpy as np, cv2, imagehash
 from PIL import Image
 from urllib.parse import urlparse
@@ -26,6 +34,7 @@ _context: BrowserContext | None = None
 
 # _async_* variables are now handled by AsyncBrowserManager class
 _ocr_reader: easyocr.Reader | None = None
+_ocr_call_count: int = 0  # Counter for periodic GPU cache cleanup
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +218,61 @@ async def close_browser_async():
     """Wrapper to close the singleton manager."""
     await _async_browser_manager.close()
 
+# ------------------ Pre-Flight Checks for Speed ------------------
+
+async def quick_dns_check(host: str, timeout: float = 2.0) -> bool:
+    """
+    Quick DNS resolution check before attempting screenshot.
+    
+    Saves 4-5 seconds per dead domain by failing fast.
+    
+    Args:
+        host: Domain hostname to check
+        timeout: Maximum time to wait for DNS resolution
+    
+    Returns:
+        True if domain resolves, False otherwise
+    """
+    try:
+        loop = asyncio.get_event_loop()
+        await asyncio.wait_for(
+            loop.getaddrinfo(host, 80),
+            timeout=timeout
+        )
+        return True
+    except (asyncio.TimeoutError, socket.gaierror, OSError):
+        return False
+    except Exception:
+        return False
+
+async def is_site_reachable(url: str, timeout: float = 1.5) -> bool:
+    """
+    Quick HEAD request to verify site responds before full screenshot.
+    
+    Saves 3-4 seconds per unreachable site.
+    
+    Args:
+        url: Full URL to check (with http/https)
+        timeout: Maximum time to wait for response
+    
+    Returns:
+        True if site responds (any status), False if unreachable
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.head(
+                url, 
+                timeout=aiohttp.ClientTimeout(total=timeout),
+                allow_redirects=True,
+                ssl=False  # Skip SSL verification for speed
+            ) as response:
+                # Any response (even 403/404) means site is reachable
+                return True
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return False
+    except Exception:
+        return False
+
 # ------------------ Screenshot ------------------
 def capture_screenshot(url: str, out_file: str, width: int = 1280, height: int = 900) -> tuple[str, bool]:
     """
@@ -254,12 +318,42 @@ def capture_screenshot(url: str, out_file: str, width: int = 1280, height: int =
 async def capture_screenshot_async(url: str, out_file: str, width: int = 1280, height: int = 900) -> tuple[str, bool]:
     """
     Capture screenshot asynchronously with automatic retry and browser recovery.
+    
+    Includes pre-flight checks:
+    1. DNS resolution check (2s timeout) - skips dead domains
+    2. HEAD request check (1.5s timeout) - skips unreachable sites
     """
     if not url.startswith("http"):
         try_urls = [f"https://{url}", f"http://{url}"]
     else:
         try_urls = [url]
 
+    # ============ PRE-FLIGHT CHECKS (Save 4-5s per dead domain) ============
+    
+    # Extract hostname for DNS check
+    try:
+        host = urlparse(try_urls[0]).hostname
+    except:
+        host = url
+    
+    # 1. Quick DNS check - skip if domain doesn't resolve
+    if host and not await quick_dns_check(host, timeout=2.0):
+        logger.debug(f"⚡ DNS failed for {host}, skipping screenshot")
+        return url, False
+    
+    # 2. Quick HEAD check - skip if site doesn't respond
+    for target_url in try_urls:
+        if await is_site_reachable(target_url, timeout=1.5):
+            # Found a reachable URL, proceed with this one first
+            try_urls = [target_url] + [u for u in try_urls if u != target_url]
+            break
+    else:
+        # Neither https nor http responded
+        logger.debug(f"⚡ HEAD check failed for {url}, skipping screenshot")
+        return url, False
+    
+    # ============ BROWSER SCREENSHOT (only if pre-checks pass) ============
+    
     # Retry logic for the entire operation (in case browser crashes mid-op)
     MAX_RETRIES = 2
     for attempt in range(MAX_RETRIES):
@@ -479,6 +573,15 @@ def extract_ocr_text(image_path: str) -> str:
     Returns:
         Extracted text string (empty if extraction fails)
     """
+    global _ocr_call_count
+    
+    def _do_ocr(img_np):
+        """Inner function to perform OCR (can be retried on OOM)."""
+        reader = _get_ocr_reader()
+        results = reader.readtext(img_np, detail=0)  # detail=0 → only text
+        txt = " ".join(results)
+        return re.sub(r"\s+", " ", txt).strip()
+    
     try:
         if not os.path.exists(image_path):
             logger.warning("Image file not found for OCR: %s", image_path)
@@ -487,21 +590,33 @@ def extract_ocr_text(image_path: str) -> str:
         # Optimize image for OCR to save VRAM
         img = Image.open(image_path).convert('L') # Convert to grayscale
         
-        # Downscale if too large (limit width to 800px for 2GB VRAM GPU)
+        # Downscale if too large (limit width to 800px for 2GB VRAM)
         max_width = 800
         if img.width > max_width:
             ratio = max_width / img.width
             new_height = int(img.height * ratio)
             img = img.resize((max_width, new_height), Image.Resampling.LANCZOS)
+        
+        # Force cleanup BEFORE OCR if counter is high
+        if _ocr_call_count > 0 and _ocr_call_count % 3 == 0:
+            torch.cuda.empty_cache()
+            import gc
+            gc.collect()
             
         img_np = np.array(img)
         
-        # Use the getter function to ensure the model is loaded
-        reader = _get_ocr_reader()
-        results = reader.readtext(img_np, detail=0)  # detail=0 → only text
-        txt = " ".join(results)
-        txt = re.sub(r"\s+", " ", txt).strip()
+        # Try OCR with OOM retry safeguard
+        try:
+            txt = _do_ocr(img_np)
+        except torch.cuda.OutOfMemoryError:
+            logger.warning("⚠️ CUDA OOM during OCR, clearing cache and retrying...")
+            torch.cuda.empty_cache()
+            import gc
+            gc.collect()
+            txt = _do_ocr(img_np)  # Retry after cleanup
+        
         return txt
+        
     except FileNotFoundError:
         logger.warning("Image file not found for OCR: %s", image_path)
         return ""
@@ -509,14 +624,15 @@ def extract_ocr_text(image_path: str) -> str:
         logger.error("OCR extraction failed for %s: %s", image_path, e)
         return ""
     finally:
-        # GPU memory cleanup after EVERY OCR call (success or failure)
-        try:
-            import torch
-            import gc
-            torch.cuda.empty_cache()
-            gc.collect()  # Force Python garbage collection too
-        except Exception:
-            pass
+        # Aggressive GPU cleanup (every 3 OCR calls)
+        _ocr_call_count += 1
+        if _ocr_call_count % 3 == 0:
+            try:
+                torch.cuda.empty_cache()
+                import gc
+                gc.collect()
+            except Exception:
+                pass
 
 # ------------------ Sharpness ------------------
 def laplacian_variance(image_path: str, min_size: int = 50) -> float:

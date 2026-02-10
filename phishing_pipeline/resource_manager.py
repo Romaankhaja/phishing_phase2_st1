@@ -59,6 +59,17 @@ class ResourceMonitor:
     async def wait_for_resources(self):
         """
         Blocks asynchronously until resources are available.
+        Actively clears GPU cache while waiting to help free memory.
         """
+        wait_count = 0
         while not self.check_resources():
+            wait_count += 1
+            # Actively try to free GPU memory while waiting
+            if self.gpu_available and wait_count % 3 == 0:
+                try:
+                    torch.cuda.empty_cache()
+                    import gc
+                    gc.collect()
+                except Exception:
+                    pass
             await asyncio.sleep(self.check_interval)

@@ -129,7 +129,11 @@ This module manages the lifecycle of machine learning artifacts. It is responsib
 ## 6. File: `phishing_pipeline/pipeline.py`
 
 **Purpose of the file:**
-This is the core orchestration engine of the application. It ties together all valid components—preprocessing, feature extraction, model prediction, evidence generation, and reporting—into a cohesive workflow. It implements an asynchronous producer-consumer pattern to efficiently process thousands of URLs.
+This is the core orchestration engine of the application. It ties together all valid components—preprocessing, feature extraction, model prediction, evidence generation, and reporting—into a cohesive workflow. It uses a **Chunked Processing Pipeline** to efficiently process thousands of URLs while preventing GPU memory exhaustion.
+
+**Constants:**
+
+* **`CHUNK_SIZE = 50`** — Number of domains processed per batch. Tunable per system (50 for local 2GB VRAM, 100-150 for Kaggle T4).
 
 **Functions:**
 
@@ -151,12 +155,13 @@ This is the core orchestration engine of the application. It ties together all v
   * Overrides the Machine Learning model's source prediction if a deterministic keyword match is found.
   * Maps keywords to broader categories (e.g., "hdfc" -> "Banking/Financial").
 
-* **`process_urls(input_csv, output_csv, ...)`**
+* **`process_urls(input_csv, output_csv, network_semaphore)`**
   * The main asynchronous driver for the feature extraction phase.
-  * Initializes a `ResourceMonitor` to manage system load.
-  * Orchestrates a two-stage pipeline: fast network feature extraction followed by resource-intensive visual extraction.
-  * Manages concurrent tasks using asyncio queues and semaphores.
-  * Updates a progress bar to keep the user informed of the batch processing status.
+  * **Architecture:** Chunked Processing — processes domains in batches of `CHUNK_SIZE` to prevent GPU memory fragmentation.
+  * Within each chunk: Network features + Screenshots run in parallel via `asyncio.gather()`.
+  * Between chunks: Explicit GPU cleanup with `torch.cuda.empty_cache()` and `gc.collect()`.
+  * Displays a progress bar showing Phase 1 domains processed.
+  * No longer uses `ResourceMonitor` (replaced by chunking strategy).
 
 * **`format_evidence_filename(org_name, domain, serial_no, ...)`**
   * Standardizes the naming convention for evidence files.
@@ -180,12 +185,11 @@ This is the core orchestration engine of the application. It ties together all v
 
 * **`run_pipeline(holdout_folder, ps02_whitelist_file, ...)`**
   * The high-level entry point that runs the full end-to-end process.
-  * Manages the shortlisting of domains from raw inputs.
-  * Triggers the `process_urls` extraction loop.
-  * Enriches the data with GeoIP information.
-  * Loads models and runs the prediction/classification logic.
-  * Performs WHOIS lookups for the final report.
-  * Writes the final detailed CSV and the filtered submission CSV.
+  * **Master Progress Bar:** Tracks overall pipeline progress across 3 phases (Phase 1: 60%, Phase 2: 35%, Phase 3: 5%).
+  * **Phase 1:** Triggers `process_urls` for feature extraction, enriches with GeoIP data.
+  * **Phase 2:** Performs WHOIS lookups with `RateLimiter` (20 req/min), classifies domains. WHOIS timeout set to 15 seconds.
+  * **Phase 3:** Generates evidence PDFs, writes final CSV, applies filtering.
+  * Displays final summary with total time, average speed per domain.
 
 * **`package_results(output_file, zip_path)`**
   * Creates the final deliverable artifact.
@@ -206,6 +210,8 @@ This is the core orchestration engine of the application. It ties together all v
 **Purpose of the file:**
 This module acts as a safeguard for system stability. Since the pipeline runs resource-heavy tasks like browser automation (RAM) and neural network inference (GPU/CPU), this manager monitors system vitals and throttles execution to prevent crashes or "Out of Memory" errors.
 
+> **Note:** As of the chunked processing update, `ResourceMonitor` is **no longer actively used** by `process_urls()`. GPU memory management is now handled through explicit `torch.cuda.empty_cache()` + `gc.collect()` calls between chunks. The file is retained for potential future use.
+
 **Functions:**
 
 * **`ResourceMonitor.__init__(cpu_threshold, ram_threshold, ...)`**
@@ -225,6 +231,28 @@ This module acts as a safeguard for system stability. Since the pipeline runs re
   * If `check_resources()` returns `False`, this method sleeps (non-blocking) and retries.
   * Ensures that new resource-intensive tasks are only started when the system has capacity.
   * Prevents the pipeline from spawning thousands of browsers and crashing the OS.
+
+---
+
+## 7b. File: `phishing_pipeline/rate_limiter.py` *(NEW)*
+
+**Purpose of the file:**
+This utility module implements a time-based rate limiter for throttling WHOIS and other network requests. It ensures compliance with server rate limits to prevent IP blocking. Used by `run_pipeline()` during Phase 2 WHOIS lookups.
+
+**Class: `RateLimiter`**
+
+* **`__init__(requests_per_minute=20)`**
+  * Configures the maximum allowed request rate (default: 20 req/min = 3s delay).
+  * Initializes an `asyncio.Lock` for thread-safe async operation.
+  * Calculates the minimum delay between requests.
+
+* **`acquire()`**
+  * Async method — blocks (non-blocking sleep) until enough time has passed since the last request.
+  * Called before each WHOIS lookup to space out requests.
+  * Safe to call from multiple coroutines.
+
+* **`reset()`**
+  * Resets the internal timer. Useful for testing or pipeline restarts.
 
 ---
 
@@ -269,6 +297,15 @@ This module implements the "Shortlisting" phase. It filters a massive list of po
 **Purpose of the file:**
 This file contains lower-level utility functions and acts as the bridge between the raw features and the pipeline orchestration. It manages the specific semaphores for concurrency control and provides wrapper functions that combine multiple feature extraction steps into single callable units.
 
+**Concurrency Settings (Tunable):**
+
+| Setting | Local (2GB VRAM) | Kaggle T4 (15GB) | Purpose |
+|---------|------------------|-------------------|---------|
+| `MAX_CONCURRENT_OCR` | 1 | 3 | GPU-bound OCR tasks |
+| `MAX_CONCURRENT_SCREENSHOTS` | 10 | 16 | Browser instances (I/O bound) |
+| `MAX_CONCURRENT_IMAGE_PROCESSING` | 5 | 10 | CPU image analysis |
+| `MAX_CONCURRENT_CPU_TASKS` | 20 | 40 | DNS, URL parsing, etc. |
+
 **Functions:**
 
 * **`_get_*_semaphore()` (OCR, Screenshot, CPU)**
@@ -303,12 +340,20 @@ This file contains lower-level utility functions and acts as the bridge between 
 ## 10. File: `phishing_pipeline/visual_features.py`
 
 **Purpose of the file:**
-This is the heavy-lifting module for visual analysis. It houses the code for controlling the headless browser (Playwright) to take screenshots, running the Optical Character Recognition (OCR) model (EasyOCR), and performing computer vision tasks like logo detection and image quality assessment.
+This is the heavy-lifting module for visual analysis. It houses the code for controlling the headless browser (Playwright) to take screenshots, running the Optical Character Recognition (OCR) model (EasyOCR), and performing computer vision tasks like logo detection and image quality assessment. Includes **pre-flight checks** to skip dead/unreachable domains before expensive browser operations.
 
-**Functions:**
+**Classes:**
+
+* **`AsyncBrowserManager`**
+  * Manages the lifecycle of the async Playwright browser to prevent "Context closed" errors.
+  * Auto-restarts the browser if it crashes mid-operation.
+  * Thread-safe via `asyncio.Lock`.
+  * Methods: `get_context()`, `_start_new_session()`, `_force_close()`, `close()`.
+
+**Functions — Initialization:**
 
 * **`_get_browser_context()`**
-  * Lazy-loading initializer for the Playwright browser.
+  * Lazy-loading initializer for the sync Playwright browser.
   * Ensures the browser process is only started when the first screenshot is requested.
   * Returns a shared browser context to be reused, saving startup time.
 
@@ -317,14 +362,34 @@ This is the heavy-lifting module for visual analysis. It houses the code for con
   * Loads the neural network weights into VRAM (or RAM) only on the first call.
   * Checks for GPU availability to enable hardware acceleration.
 
+**Functions — Pre-Flight Checks** *(NEW)*:
+
+* **`quick_dns_check(host, timeout=2.0)`**
+  * Performs async DNS resolution check before attempting screenshot.
+  * Skips dead domains in ~0.5s instead of waiting 5s for browser timeout.
+  * Saves 4-5 seconds per dead domain.
+  * Handles `TimeoutError`, `socket.gaierror`, and `OSError`.
+
+* **`is_site_reachable(url, timeout=1.5)`**
+  * Sends a lightweight HTTP HEAD request to verify site responds.
+  * Uses `aiohttp` with SSL verification disabled for speed.
+  * Any response (even 403/404) counts as reachable.
+  * Saves 3-4 seconds per unreachable site.
+
+**Functions — Screenshot Capture:**
+
 * **`capture_screenshot_async(url, out_file)`**
-  * Navigates to the URL using a headless Chromium browser.
-  * Waits for the page to load (DOM Content Loaded).
+  * **Pre-flight:** Runs DNS check (2s) and HEAD request (1.5s) before launching browser. Skips if either fails.
+  * Navigates to the URL using a headless Chromium browser via `AsyncBrowserManager`.
+  * Waits for the page to load (DOM Content Loaded, 5s timeout).
   * Saves a full-page screenshot to the specified path.
-  * Includes auto-retry logic to handle browser crashes or timeouts.
+  * Includes auto-retry logic (2 attempts) to handle browser crashes or timeouts.
+  * Automatic browser restart if context dies mid-operation.
+
+**Functions — Image Analysis:**
 
 * **`extract_brand_colors(image_path, num_colors)`**
-  * Uses K-Means clustering (an unchecked learning algorithm) to analyze the image's color palette.
+  * Uses K-Means clustering to analyze the image's color palette.
   * Identifies the `k` most dominant colors (e.g., the primary red of Netflix).
   * Used to compare against known brand guidelines.
 
@@ -335,7 +400,9 @@ This is the heavy-lifting module for visual analysis. It houses the code for con
 
 * **`extract_ocr_text(image_path)`**
   * The primary text extraction function.
-  * Pre-processes the image (converts to grayscale, resizes) to optimize for the OCR model.
+  * Pre-processes the image (converts to grayscale, resizes to max 800px) to reduce GPU memory.
+  * Includes periodic GPU cleanup every 3 OCR calls (`torch.cuda.empty_cache()` + `gc.collect()`).
+  * OOM retry safeguard: if CUDA OOM occurs, clears cache and retries once.
   * Feeds the image to EasyOCR to read all visible text on the webpage.
   * Returns the raw text string, which is crucial for detecting keywords like "Login", "Password", or "Bank".
 

@@ -1,0 +1,741 @@
+<!DOCTYPE html>
+<html ⚡ lang="tr">
+
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title></title>
+
+    <meta name="description" content="" />
+
+    <meta name="copyright" content="Betpas" />
+    <meta name="author" content="Betpas" />
+    <meta name="publisher" content="Betpas" />
+    <meta name="OWNER" content="Betpas" />
+
+    <meta property="og:locale" content="tr_TR" />
+    <meta property="og:type" content="website" />
+
+    <meta property="og:title" content="" />
+    <meta property="og:description" content="" />
+
+    <meta property="og:url" content="https://airtonet.net/favicon.jpg" />
+
+    <meta property="og:site_name" content="Betpas" />
+    <meta property="og:updated_time" content="1970-01-01T00:00:00+00:00" />
+    
+    <meta property="article:published_time" content="1970-01-01T00:00:00+00:00" />
+    <meta property="article:modified_time" content="1970-01-01T00:00:00+00:00" />
+
+    <meta name="twitter:card" content="summary_large_image" />
+
+    <meta name="twitter:title" content="" />
+    <meta name="twitter:description" content="" />
+    
+    <meta name="twitter:label1" content="Yazan" />
+    <meta name="twitter:data1" content="Betpas" />
+    <meta name="twitter:label2" content="Okuma süresi" />
+    <meta name="twitter:data2" content="1 dakika" />
+
+
+    <link rel="canonical" href="https://airtonet.net/favicon.jpg" />
+    <link rel="icon" type="image/png" href="/favicon.jpg" />
+
+    <!-- Css -->
+    <style amp-custom>
+        *,:after,:before{--tw-border-spacing-x:0;--tw-border-spacing-y:0;--tw-translate-x:0;--tw-translate-y:0;--tw-rotate:0;--tw-skew-x:0;--tw-skew-y:0;--tw-scale-x:1;--tw-scale-y:1;--tw-pan-x: ;--tw-pan-y: ;--tw-pinch-zoom: ;--tw-scroll-snap-strictness:proximity;--tw-gradient-from-position: ;--tw-gradient-via-position: ;--tw-gradient-to-position: ;--tw-ordinal: ;--tw-slashed-zero: ;--tw-numeric-figure: ;--tw-numeric-spacing: ;--tw-numeric-fraction: ;--tw-ring-inset: ;--tw-ring-offset-width:0px;--tw-ring-offset-color:#fff;--tw-ring-color:rgba(59,130,246,.5);--tw-ring-offset-shadow:0 0 #0000;--tw-ring-shadow:0 0 #0000;--tw-shadow:0 0 #0000;--tw-shadow-colored:0 0 #0000;--tw-blur: ;--tw-brightness: ;--tw-contrast: ;--tw-grayscale: ;--tw-hue-rotate: ;--tw-invert: ;--tw-saturate: ;--tw-sepia: ;--tw-drop-shadow: ;--tw-backdrop-blur: ;--tw-backdrop-brightness: ;--tw-backdrop-contrast: ;--tw-backdrop-grayscale: ;--tw-backdrop-hue-rotate: ;--tw-backdrop-invert: ;--tw-backdrop-opacity: ;--tw-backdrop-saturate: ;--tw-backdrop-sepia: ;--tw-contain-size: ;--tw-contain-layout: ;--tw-contain-paint: ;--tw-contain-style: }::backdrop{--tw-border-spacing-x:0;--tw-border-spacing-y:0;--tw-translate-x:0;--tw-translate-y:0;--tw-rotate:0;--tw-skew-x:0;--tw-skew-y:0;--tw-scale-x:1;--tw-scale-y:1;--tw-pan-x: ;--tw-pan-y: ;--tw-pinch-zoom: ;--tw-scroll-snap-strictness:proximity;--tw-gradient-from-position: ;--tw-gradient-via-position: ;--tw-gradient-to-position: ;--tw-ordinal: ;--tw-slashed-zero: ;--tw-numeric-figure: ;--tw-numeric-spacing: ;--tw-numeric-fraction: ;--tw-ring-inset: ;--tw-ring-offset-width:0px;--tw-ring-offset-color:#fff;--tw-ring-color:rgba(59,130,246,.5);--tw-ring-offset-shadow:0 0 #0000;--tw-ring-shadow:0 0 #0000;--tw-shadow:0 0 #0000;--tw-shadow-colored:0 0 #0000;--tw-blur: ;--tw-brightness: ;--tw-contrast: ;--tw-grayscale: ;--tw-hue-rotate: ;--tw-invert: ;--tw-saturate: ;--tw-sepia: ;--tw-drop-shadow: ;--tw-backdrop-blur: ;--tw-backdrop-brightness: ;--tw-backdrop-contrast: ;--tw-backdrop-grayscale: ;--tw-backdrop-hue-rotate: ;--tw-backdrop-invert: ;--tw-backdrop-opacity: ;--tw-backdrop-saturate: ;--tw-backdrop-sepia: ;--tw-contain-size: ;--tw-contain-layout: ;--tw-contain-paint: ;--tw-contain-style: }/*! tailwindcss v3.4.14 | MIT License | https://tailwindcss.com*/*,:after,:before{box-sizing:border-box;border:0 solid #e5e7eb}:after,:before{--tw-content:""}:host,html{line-height:1.5;-webkit-text-size-adjust:100%;-moz-tab-size:4;-o-tab-size:4;tab-size:4;font-family:ui-sans-serif,system-ui,sans-serif,Apple Color Emoji,Segoe UI Emoji,Segoe UI Symbol,Noto Color Emoji;font-feature-settings:normal;font-variation-settings:normal;-webkit-tap-highlight-color:transparent}body{margin:0;line-height:inherit}hr{height:0;color:inherit;border-top-width:1px}abbr:where([title]){-webkit-text-decoration:underline dotted;text-decoration:underline dotted}h1,h2,h3,h4,h5,h6{font-size:inherit;font-weight:inherit}a{color:inherit;text-decoration:inherit}b,strong{font-weight:bolder}code,kbd,pre,samp{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,Liberation Mono,Courier New,monospace;font-feature-settings:normal;font-variation-settings:normal;font-size:1em}small{font-size:80%}sub,sup{font-size:75%;line-height:0;position:relative;vertical-align:baseline}sub{bottom:-.25em}sup{top:-.5em}table{text-indent:0;border-color:inherit;border-collapse:collapse}button,input,optgroup,select,textarea{font-family:inherit;font-feature-settings:inherit;font-variation-settings:inherit;font-size:100%;font-weight:inherit;line-height:inherit;letter-spacing:inherit;color:inherit;margin:0;padding:0}button,select{text-transform:none}button,input:where([type=button]),input:where([type=reset]),input:where([type=submit]){-webkit-appearance:button;background-color:transparent;background-image:none}:-moz-focusring{outline:auto}:-moz-ui-invalid{box-shadow:none}progress{vertical-align:baseline}::-webkit-inner-spin-button,::-webkit-outer-spin-button{height:auto}[type=search]{-webkit-appearance:textfield;outline-offset:-2px}::-webkit-search-decoration{-webkit-appearance:none}::-webkit-file-upload-button{-webkit-appearance:button;font:inherit}summary{display:list-item}blockquote,dd,dl,figure,h1,h2,h3,h4,h5,h6,hr,p,pre{margin:0}fieldset{margin:0}fieldset,legend{padding:0}menu,ol,ul{list-style:none;margin:0;padding:0}dialog{padding:0}textarea{resize:vertical}input::-moz-placeholder,textarea::-moz-placeholder{opacity:1;color:#9ca3af}input::placeholder,textarea::placeholder{opacity:1;color:#9ca3af}[role=button],button{cursor:pointer}:disabled{cursor:default}audio,canvas,embed,iframe,img,object,svg,video{display:block;vertical-align:middle}img,video{max-width:100%;height:auto}[hidden]:where(:not([hidden=until-found])){display:none}.container{width:100%;margin-right:auto;margin-left:auto}@media (min-width:576px){.container{max-width:576px}}@media (min-width:768px){.container{max-width:768px}}@media (min-width:992px){.container{max-width:992px}}@media (min-width:1200px){.container{max-width:1200px}}@media (min-width:1441px){.container{max-width:1441px}}.container{padding-left:1.25rem;padding-right:1.25rem}@media (min-width:1200px){.container{max-width:64rem}}input#offcanvas-menu:checked~header label[for=offcanvas-menu] svg:first-child,label[for=offcanvas-menu] svg:nth-child(2){display:none}input#offcanvas-menu:checked~#mobile-menu__wrapper>nav,input#offcanvas-menu:checked~header label[for=offcanvas-menu] svg:nth-child(2){display:flex}.post-content h1,.post-content h2,.post-content h3,.post-content img,.post-content p,.post-content table,.post-content ul{margin-bottom:1.25rem}.post-content h1:last-child,.post-content h2:last-child,.post-content h3:last-child,.post-content img:last-child,.post-content p:last-child,.post-content table:last-child,.post-content ul:last-child{margin-bottom:0}.post-content h1,.post-content h2,.post-content h3{font-weight:700;line-height:1.25;--tw-text-opacity:1;color:rgb(34 34 34/var(--tw-text-opacity))}.post-content h1{font-size:2.25rem;line-height:2.5rem}.post-content h2{font-size:1.875rem;line-height:2.25rem}.post-content h3{font-size:1.5rem;line-height:2rem}.post-content img{display:flex;height:auto;max-width:100%;-o-object-fit:contain;object-fit:contain}.post-content a{--tw-text-opacity:1;color:rgb(30 115 190/var(--tw-text-opacity))}.post-content table,.post-content td,.post-content th{border:1px solid rgba(34,34,34,.1)}.post-content td,.post-content th{padding:.5rem}.footer-menu{display:grid;gap:.25rem}.footer-menu li a{display:flex;padding-top:.25rem;padding-bottom:.25rem}.footer-menu li a:hover{--tw-text-opacity:1;color:rgb(30 115 190/var(--tw-text-opacity))}.mb-2{margin-bottom:.5rem}.mb-4{margin-bottom:1rem}.mb-5{margin-bottom:1.25rem}.flex{display:flex}.inline-flex{display:inline-flex}.grid{display:grid}.hidden{display:none}.h-auto{height:auto}.w-full{width:100%}.flex-col{flex-direction:column}.flex-wrap{flex-wrap:wrap}.items-center{align-items:center}.justify-center{justify-content:center}.justify-between{justify-content:space-between}.gap-1{gap:.25rem}.gap-2{gap:.5rem}.gap-4{gap:1rem}.gap-5{gap:1.25rem}.gap-6{gap:1.5rem}.border-t{border-top-width:1px}.border-t-2{border-top-width:2px}.border-solid{border-style:solid}.border-slate-200{--tw-border-opacity:1;border-color:rgb(226 232 240/var(--tw-border-opacity))}.border-white\/20{border-color:hsla(0,0%,100%,.2)}.bg-\[\#111\]{--tw-bg-opacity:1;background-color:rgb(17 17 17/var(--tw-bg-opacity))}.bg-\[\#e7e7e7\]{--tw-bg-opacity:1;background-color:rgb(231 231 231/var(--tw-bg-opacity))}.bg-slate-100{--tw-bg-opacity:1;background-color:rgb(241 245 249/var(--tw-bg-opacity))}.bg-slate-200{--tw-bg-opacity:1;background-color:rgb(226 232 240/var(--tw-bg-opacity))}.bg-white{--tw-bg-opacity:1;background-color:rgb(255 255 255/var(--tw-bg-opacity))}.object-contain{-o-object-fit:contain;object-fit:contain}.p-3{padding:.75rem}.p-5{padding:1.25rem}.px-4{padding-left:1rem;padding-right:1rem}.px-5{padding-left:1.25rem;padding-right:1.25rem}.py-1{padding-top:.25rem;padding-bottom:.25rem}.py-10{padding-top:2.5rem;padding-bottom:2.5rem}.py-2{padding-top:.5rem;padding-bottom:.5rem}.py-4{padding-top:1rem;padding-bottom:1rem}.py-5{padding-top:1.25rem;padding-bottom:1.25rem}.pb-4{padding-bottom:1rem}.text-center{text-align:center}.text-3xl{font-size:1.875rem;line-height:2.25rem}.text-4xl{font-size:2.25rem;line-height:2.5rem}.text-base{font-size:1rem;line-height:1.5rem}.text-sm{font-size:.875rem;line-height:1.25rem}.text-xl{font-size:1.25rem;line-height:1.75rem}.font-bold{font-weight:700}.font-semibold{font-weight:600}.uppercase{text-transform:uppercase}.lowercase{text-transform:lowercase}.leading-none{line-height:1}.text-black{--tw-text-opacity:1;color:rgb(34 34 34/var(--tw-text-opacity))}.text-white{--tw-text-opacity:1;color:rgb(255 255 255/var(--tw-text-opacity))}.text-white\/40{color:hsla(0,0%,100%,.4)}.underline{text-decoration-line:underline}.hover\:text-blue:hover{--tw-text-opacity:1;color:rgb(30 115 190/var(--tw-text-opacity))}@media (min-width:576px){.sm\:col-span-2{grid-column:span 2/span 2}.sm\:grid-cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}.sm\:flex-row{flex-direction:row}.sm\:justify-start{justify-content:flex-start}.sm\:justify-between{justify-content:space-between}}@media (min-width:768px){.md\:grid-cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}.md\:text-2xl{font-size:1.5rem;line-height:2rem}}@media (min-width:992px){.lg\:col-span-3{grid-column:span 3/span 3}.lg\:col-span-7{grid-column:span 7/span 7}.lg\:inline{display:inline}.lg\:hidden{display:none}.lg\:grid-cols-10{grid-template-columns:repeat(10,minmax(0,1fr))}.lg\:grid-cols-4{grid-template-columns:repeat(4,minmax(0,1fr))}.lg\:text-3xl{font-size:1.875rem;line-height:2.25rem}}
+
+        body.brand-betpas a#notification-bar,
+        body.brand-betpas a#register-btn {
+            background-color: #1b2c43;
+            color: #5fb046;
+        }
+
+        body.brand-betpas a#notification-bar:hover,
+        body.brand-betpas a#register-btn:hover {
+            background-color: #0f1a29;
+        }
+
+        a#notification-bar,
+        a#register-btn {
+            background-color: #a3f330;
+            color: #222222;
+        }
+
+        a#notification-bar:hover,
+        a#register-btn:hover {
+            background-color: #8cd025;
+        }
+    </style>
+    <style amp-boilerplate>
+        body {
+            -webkit-animation: -amp-start 8s steps(1, end) 0s 1 normal both;
+            -moz-animation: -amp-start 8s steps(1, end) 0s 1 normal both;
+            -ms-animation: -amp-start 8s steps(1, end) 0s 1 normal both;
+            animation: -amp-start 8s steps(1, end) 0s 1 normal both
+        }
+
+        @-webkit-keyframes -amp-start {
+            from {
+                visibility: hidden
+            }
+
+            to {
+                visibility: visible
+            }
+        }
+
+        @-moz-keyframes -amp-start {
+            from {
+                visibility: hidden
+            }
+
+            to {
+                visibility: visible
+            }
+        }
+
+        @-ms-keyframes -amp-start {
+            from {
+                visibility: hidden
+            }
+
+            to {
+                visibility: visible
+            }
+        }
+
+        @-o-keyframes -amp-start {
+            from {
+                visibility: hidden
+            }
+
+            to {
+                visibility: visible
+            }
+        }
+
+        @keyframes -amp-start {
+            from {
+                visibility: hidden
+            }
+
+            to {
+                visibility: visible
+            }
+        }
+    </style>
+    <noscript>
+        <style amp-boilerplate>
+            body {
+                -webkit-animation: none;
+                -moz-animation: none;
+                -ms-animation: none;
+                animation: none
+            }
+        </style>
+    </noscript>
+    <script async src="https://cdn.ampproject.org/v0.js"></script>
+    <script async custom-element="amp-analytics" src="https://cdn.ampproject.org/v0/amp-analytics-0.1.js"></script>
+
+    <script type="application/ld+json">
+        {
+            "@context": "https://schema.org",
+            "@type": "Organization",
+            "image": "",
+            "url": "https://airtonet.net",
+            "logo": "",
+            "name": "Betpas",
+            "description": "",
+            "email": "destek@airtonet.net"
+        }
+    </script>
+
+    <script type="application/ld+json">
+        {
+            "@context": "https://schema.org/",
+            "@type": "WebSite",
+            "name": "Betpas",
+            "alternateName": "Betpas Giriş",
+            "url": "https://airtonet.net",
+            "potentialAction": {
+                "@type": "SearchAction",
+                "target": "https://airtonet.net/?s={search_term_string}",
+                "query-input": "required name=search_term_string"
+            }
+        }
+    </script>
+
+    <script type="application/ld+json">
+        {
+            "@context": "https://schema.org",
+            "@type": "LocalBusiness",
+            "name": "Betpas",
+            "url": "https://airtonet.net",
+            "logo": "",
+            "image": "",
+            "address": {
+                "@type": "PostalAddress",
+                "streetAddress": "Kuştepe, Mecidiyeköy Yolu Cd. No:12",
+                "addressLocality": "İstanbul",
+                "addressRegion": "Şişli",
+                "postalCode": "34381",
+                "addressCountry": "TR"
+            },
+            "telephone": "+90 850 555 0 444"
+        }
+    </script>
+
+</head>
+
+<body class="bg-slate-100 text-base text-black brand-betpas">
+
+    <!-- Header -->
+    <input type="checkbox" id="offcanvas-menu"
+        on="change:AMP.setState({ offcanvas_menu: (event.checked ? true : false) })" [checked]="offcanvas_menu"
+        class="hidden" />
+    <header class="py-5 bg-white">
+        <div class="container flex items-center justify-between">
+            <!-- Header Left -->
+            <div class="flex gap-4 items-center">
+                <!-- Header Logo -->
+                <a href="https://airtonet.net" rel="home" class="flex text-3xl font-bold">Betpas</a>
+            </div>
+
+            <!-- Header Menu -->
+            <nav class="hidden lg:inline">
+                <ul class="flex items-center gap-1">
+                    <li><a href="https://t.ly/cXnVJ" class="flex py-2 px-4 font-semibold">Giriş Yap</a></li>
+                    <li><a href="https://t.ly/cXnVJ" class="flex py-2 px-4 font-semibold" id="register-btn">Kayıt Ol</a></li>
+                </ul>
+            </nav>
+
+            <!-- Navigation Hamburger -->
+            <!-- <label for="offcanvas-menu" class="p-3 bg-slate-200 lg:hidden">
+                <svg viewBox="0 0 512 512" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="16px" height="16px">
+                    <path d="M0 96c0-13.255 10.745-24 24-24h464c13.255 0 24 10.745 24 24s-10.745 24-24 24H24c-13.255 0-24-10.745-24-24zm0 160c0-13.255 10.745-24 24-24h464c13.255 0 24 10.745 24 24s-10.745 24-24 24H24c-13.255 0-24-10.745-24-24zm0 160c0-13.255 10.745-24 24-24h464c13.255 0 24 10.745 24 24s-10.745 24-24 24H24c-13.255 0-24-10.745-24-24z">
+                    </path>
+                </svg>
+                <svg viewBox="0 0 512 512" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="16px" height="16px">
+                    <path d="M71.029 71.029c9.373-9.372 24.569-9.372 33.942 0L256 222.059l151.029-151.03c9.373-9.372 24.569-9.372 33.942 0 9.372 9.373 9.372 24.569 0 33.942L289.941 256l151.03 151.029c9.372 9.373 9.372 24.569 0 33.942-9.373 9.372-24.569 9.372-33.942 0L256 289.941l-151.029 151.03c-9.373 9.372-24.569 9.372-33.942 0-9.372-9.373-9.372-24.569 0-33.942L222.059 256 71.029 104.971c-9.372-9.373-9.372-24.569 0-33.942z">
+                    </path>
+                </svg>
+            </label> -->
+
+        </div>
+    </header>
+
+    <!-- Mobile Menu -->
+    <!-- <div id="mobile-menu__wrapper" class="mb-5">
+        <nav class="hidden">
+            <ul class="flex flex-col bg-white w-full">
+                <li><a href="https://t.ly/cXnVJ" class="flex py-2 px-4 font-semibold" style="background-color: #5fb046; color: #fff;">Giriş Yap</a></li>
+                <li><a href="https://t.ly/cXnVJ" class="flex py-2 px-4 font-semibold" id="register-btn" style="background-color: #f1bb16; color: #fff;">Kayıt Ol</a></li>
+            </ul>
+        </nav>
+    </div> -->
+
+    <!-- Notification Bar -->
+    <a href="https://t.ly/cXnVJ" target="_blank" id="notification-bar"
+        class="flex items-center justify-center text-center gap-2 py-4 px-5 font-bold text-xl md:text-2xl lg:text-3xl uppercase">
+        <span><svg aria-hidden="true" role="img" height="1em" width="1em" viewBox="0 0 512 512"
+                xmlns="http://www.w3.org/2000/svg">
+                <path fill="currentColor"
+                    d="M173.898 439.404l-166.4-166.4c-9.997-9.997-9.997-26.206 0-36.204l36.203-36.204c9.997-9.998 26.207-9.998 36.204 0L192 312.69 432.095 72.596c9.997-9.997 26.207-9.997 36.204 0l36.203 36.204c9.997 9.997 9.997 26.206 0 36.204l-294.4 294.401c-9.998 9.997-26.207 9.997-36.204-.001z">
+                </path>
+            </svg></span>
+        <span>Betpas GİRİŞ İÇİN TIKLAYIN</span>
+    </a>
+
+    <!-- Main -->
+    <main class="container mb-5">
+
+        <!-- Content Wrapper -->
+        <div class="grid lg:grid-cols-10 gap-5">
+            <!-- Content -->
+
+              <div class="post-content lg:col-span-7 bg-white p-5" itemscope="" itemtype="https://schema.org/Article">
+                <meta itemprop="datePublished" content="2025-12-16T07:24:24+00:00">
+                <meta itemprop="dateModified" content="2025-12-16T07:24:24+00:00">
+                <span itemprop="author" itemscope="" itemtype="https://schema.org/Person">
+                    <meta itemprop="url" content="https://airtonet.net">
+                    <meta itemprop="name" content="Betpas">
+                </span> 
+                
+            </div>
+            <!-- Sidebar -->
+            <div class="lg:col-span-3 bg-[#e7e7e7] p-5">
+                <h2 class="font-bold text-black text-3xl leading-none mb-5">Son Yazılar</h2>
+
+                <ul class="wp-block-latest-posts__list wp-block-latest-posts">
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-guvenli-giris">
+                            <h3>Betpas G&uuml;venli Giriş</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-deneme-bonusu">
+                            <h3>Betpas Deneme Bonusu</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-hizli-giris">
+                            <h3>Betpas Hızlı Giriş</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-online-casino">
+                            <h3>Betpas Online Casino</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-giris-yap">
+                            <h3>Betpas Giriş Yap</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-en-guncel-giris">
+                            <h3>Betpas En G&uuml;ncel Giriş</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/guncel-betpas-adresleri">
+                            <h3>G&uuml;ncel Betpas Adresleri</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/mobil-betpas">
+                            <h3>Mobil Betpas</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-canli-bahis">
+                            <h3>Betpas Canlı Bahis</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-yeni-giris">
+                            <h3>Betpas Yeni Giriş</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-giris">
+                            <h3>Betpas Giriş</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-giris-2025">
+                            <h3>Betpas Giriş 2025</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-guncel-giris-linki">
+                            <h3>Betpas G&uuml;ncel Giriş Linki</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/mobil-guncel-betpas">
+                            <h3>Mobil G&uuml;ncel Betpas</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-2026-giris-linki">
+                            <h3>Betpas 2026 Giriş Linki</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-firma-bilgileri">
+                            <h3>Betpas Firma Bilgileri</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-kayit-ol">
+                            <h3>Betpas Kayıt Ol</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-guncel-giris">
+                            <h3>Betpas G&uuml;ncel Giriş</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-yeni-adres-ile-giris">
+                            <h3>Betpas Yeni Adres ile Giriş</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-resmi-giris-adresi">
+                            <h3>Betpas Resmi Giriş Adresi</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-uye-ol">
+                            <h3>Betpas &Uuml;ye Ol</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-mobil-hizli-giris">
+                            <h3>Betpas Mobil Hızlı Giriş</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-giris-ve-uyelik">
+                            <h3>Betpas Giriş ve &Uuml;yelik</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-sorunsuz-giris">
+                            <h3>Betpas Sorunsuz Giriş</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/hizli-ve-guvenli-betpas">
+                            <h3>Hızlı ve G&uuml;venli Betpas</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-yeni-giris-adresi">
+                            <h3>Betpas Yeni Giriş Adresi</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/guncel-betpas-2025">
+                            <h3>G&uuml;ncel Betpas 2025</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/guncel-betpas-linki">
+                            <h3>G&uuml;ncel Betpas Linki</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-kampanyalar">
+                            <h3>Betpas Kampanyalar</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/guncel-betpas">
+                            <h3>G&uuml;ncel Betpas</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-aninda-giris">
+                            <h3>Betpas Anında Giriş</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-guncel-giris-adresi">
+                            <h3>Betpas G&uuml;ncel Giriş Adresi</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/yeni-betpas">
+                            <h3>Yeni Betpas</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-en-hizli-giris">
+                            <h3>Betpas En Hızlı Giriş</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-hizli-mobil-giris">
+                            <h3>Betpas Hızlı Mobil Giriş</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-nasil-kayit-olunur">
+                            <h3>Betpas Nasıl Kayıt Olunur?</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-bonuslari">
+                            <h3>Betpas Bonusları</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-garantili-giris">
+                            <h3>Betpas Garantili Giriş</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/yeni-betpas-adresi">
+                            <h3>Yeni Betpas Adresi</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-kesintisiz-giris">
+                            <h3>Betpas Kesintisiz Giriş</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-mobil-giris">
+                            <h3>Betpas Mobil Giriş</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-alternatif-giris">
+                            <h3>Betpas Alternatif Giriş</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-sorunsuz-guncel-giris">
+                            <h3>Betpas Sorunsuz G&uuml;ncel Giriş</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-hesap-olusturma">
+                            <h3>Betpas Hesap Oluşturma</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/yeni-guncel-betpas">
+                            <h3>Yeni G&uuml;ncel Betpas</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-hizli-guncel-giris">
+                            <h3>Betpas Hızlı G&uuml;ncel Giriş</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-kolay-giris">
+                            <h3>Betpas Kolay Giriş</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/betpas-hosgeldin-bonusu">
+                            <h3>Betpas Hoşgeldin Bonusu</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/resmi-betpas-adresi">
+                            <h3>Resmi Betpas Adresi</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/guncel-betpas-adresi">
+                            <h3>G&uuml;ncel Betpas Adresi</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/en-hizli-betpas">
+                            <h3>En Hızlı Betpas</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/guncel-betpas-girisi">
+                            <h3>G&uuml;ncel Betpas Girişi</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/kolay-betpas">
+                            <h3>Kolay Betpas</h3>
+                        </a>
+                    </li>
+                    
+                    <li>
+                        <a class="py-1 inline-flex text-black hover:text-blue underline"
+                            href="https://airtonet.net/alternatif-betpas">
+                            <h3>Alternatif Betpas</h3>
+                        </a>
+                    </li>
+                    
+                </ul>
+            </div>
+
+        </div>
+
+    </main>
+
+    <!-- Footer -->
+    <footer class="bg-[#111] text-white">
+        <div class="container py-10 grid sm:grid-cols-2 lg:grid-cols-4 gap-6">
+
+            <!-- Contact -->
+            <div class="">
+                <div class="font-bold text-4xl mb-4">Betpas</div>
+
+                <ul class="footer-menu">
+                    <li>Kuştepe, Mecidiyeköy Yolu Cd. No:12, 34381 Şişli/İstanbul</li>
+                    <li>destek@airtonet.net</li>
+                    <li>+90 850 555 0 444</li>
+                </ul>
+
+            </div>
+
+
+            <!-- Contact -->
+            <div class="">
+                <div class="text-xl font-semibold mb-2">Site Haritası</div>
+                <nav>
+                    <ul class="footer-menu">
+                        
+                        <li><a href="https://airtonet.net/gizlilik-politikasi">Gizlilik Politikası</a></li>
+                        
+                        <li><a href="https://airtonet.net/cerez-politikasi">&Ccedil;erez Politikası</a></li>
+                        
+                        <li><a href="https://airtonet.net/hakkimizda">Hakkımızda</a></li>
+                        
+                        <li><a href="https://airtonet.net/kullanim-sozlesmesi">Kullanım S&ouml;zleşmesi</a></li>
+                        
+                        <li><a href="https://airtonet.net/iletisim">İletişim</a></li>
+                        
+                    </ul>
+                </nav>
+            </div>
+
+            <!-- Contact -->
+            <div class="sm:col-span-2">
+                <div class="text-xl font-semibold mb-2">Sayfalar</div>
+                <nav>
+                    <ul class="footer-menu sm:grid-cols-2">
+                        
+                        <li><a href="https://airtonet.net/betpas-guvenli-giris">Betpas G&uuml;venli Giriş</a></li>
+                        
+                        <li><a href="https://airtonet.net/betpas-deneme-bonusu">Betpas Deneme Bonusu</a></li>
+                        
+                        <li><a href="https://airtonet.net/betpas-hizli-giris">Betpas Hızlı Giriş</a></li>
+                        
+                        <li><a href="https://airtonet.net/betpas-online-casino">Betpas Online Casino</a></li>
+                        
+                        <li><a href="https://airtonet.net/betpas-giris-yap">Betpas Giriş Yap</a></li>
+                        
+                        <li><a href="https://airtonet.net/betpas-en-guncel-giris">Betpas En G&uuml;ncel Giriş</a></li>
+                        
+                        <li><a href="https://airtonet.net/guncel-betpas-adresleri">G&uuml;ncel Betpas Adresleri</a></li>
+                        
+                        <li><a href="https://airtonet.net/mobil-betpas">Mobil Betpas</a></li>
+                        
+                        <li><a href="https://airtonet.net/betpas-canli-bahis">Betpas Canlı Bahis</a></li>
+                        
+                        <li><a href="https://airtonet.net/betpas-yeni-giris">Betpas Yeni Giriş</a></li>
+                        
+                    </ul>
+                </nav>
+            </div>
+        </div>
+
+        <div class="border-t border-solid border-white/20">
+            <div
+                class="container flex flex-col sm:flex-row gap-2 items-center justify-center sm:justify-between w-full text-sm py-4">
+                <span>© Betpas 2026</span>
+                <span>İletişim: <a href="https://cutt.ly/betseo" target="_blank" rel="nofollow">Bet SEO</a></span>
+            </div>
+        </div>
+
+        <div class="container">
+            <a title="Betpas" href="https://betpas.com/home">Betpas</a>  <a title="Restbet" href="https://restbetgiris.co/ana2/">Restbet</a>
+        </div>
+
+    </footer>
+</body>
+</html>
