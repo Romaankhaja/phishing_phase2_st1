@@ -1,0 +1,104 @@
+# ==============================================================================
+# PHISHING PIPELINE - COMPLETE FEATURE LIST
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. URL STRUCTURAL FEATURES
+# Source: phishing_pipeline/features.py
+# ------------------------------------------------------------------------------
+url_length                  # Total length of the URL
+num_dots                    # Count of '.' in the URL
+has_repeated_digits         # Boolean: Contains repeated digits (e.g., '11')
+num_special_chars           # Count of non-alphanumeric characters
+num_hyphens                 # Count of '-'
+num_slashes                 # Count of '/'
+num_underscores             # Count of '_'
+num_question_marks          # Count of '?'
+num_equal_signs             # Count of '='
+num_dollar_signs            # Count of '$'
+num_exclamations            # Count of '!'
+num_hashtags                # Count of '#'
+num_percent                 # Count of '%'
+
+# Domain-specific
+domain_length               # Length of the domain part
+num_hyphens_domain          # Count of '-' in domain
+has_special_chars_domain    # Boolean: Domain contains non-alphanumeric chars
+num_special_chars_domain    # Count of special chars in domain
+
+# ------------------------------------------------------------------------------
+# 2. SUBDOMAIN FEATURES
+# Source: phishing_pipeline/features.py
+# ------------------------------------------------------------------------------
+num_subdomains              # Number of subdomains (e.g., a.b.com -> 2)
+avg_subdomain_length        # Average length of subdomain parts
+subdomain_length            # Total length of the subdomain string
+subdomain_has_hyphen        # Boolean: Subdomain contains '-'
+subdomain_has_repeated_digits # Boolean: Subdomain contains repeated digits
+
+# ------------------------------------------------------------------------------
+# 3. PATH & QUERY FEATURES
+# Source: phishing_pipeline/features.py
+# ------------------------------------------------------------------------------
+path_length                 # Length of the URL path
+has_query                   # Boolean: URL has a query string (?)
+has_fragment                # Boolean: URL has a fragment (#)
+has_anchor                  # Boolean: URL contains '#'
+
+# ------------------------------------------------------------------------------
+# 4. ENTROPY FEATURES
+# Source: phishing_pipeline/features.py
+# ------------------------------------------------------------------------------
+entropy_url                 # Shannon entropy of the full URL
+entropy_domain              # Shannon entropy of the domain (detects random/DGA)
+
+# ------------------------------------------------------------------------------
+# 5. SSL / TLS FEATURES
+# Source: phishing_pipeline/features.py
+# ------------------------------------------------------------------------------
+ssl_present                 # Boolean: SSL certificate detected
+ssl_valid                   # Boolean: Certificate is valid and not expired
+ssl_days_to_expiry          # Days remaining until expiry (or -1 if missing)
+ssl_issuer                  # Organization name of the issuer
+
+# ------------------------------------------------------------------------------
+# 6. VISUAL & BRANDING FEATURES
+# Source: phishing_pipeline/visual_features.py
+# ------------------------------------------------------------------------------
+brand_colors                # List of dominant colors (RGB tuples)
+avg_color_diff              # Distance from legitimate brand colors
+logo_hash                   # Perceptual hash of the screenshot/logo
+logo_match_score            # Similarity score to target brand logo
+laplacian_variance          # Image sharpness score (detects blurry screenshots)
+ocr_text                    # Full text extracted from screenshot (via EasyOCR)
+
+# Favicon
+favicon_detected            # Boolean: Favicon found
+favicon_url                 # URL of the favicon
+favicon_size                # Size of the favicon image
+favicon_hash                # Perceptual hash of the favicon
+favicon_colors              # Dominant colors in the favicon
+
+# ------------------------------------------------------------------------------
+# 7. NETWORK & INFRASTRUCTURE FEATURES
+# Source: phishing_pipeline/geoip_utils.py & pipeline.py
+# ------------------------------------------------------------------------------
+ip_address                  # Hosting IP address
+asn                         # Autonomous System Number
+asn_org                     # ISP / Organization Name
+country                     # Hosting Country Code
+region                      # Hosting Region
+city                        # Hosting City
+
+# ------------------------------------------------------------------------------
+# 8. REGISTRATION & REPORTING DATA (Used in Final Output)
+# Source: phishing_pipeline/pipeline.py
+# ------------------------------------------------------------------------------
+Domain Registration Date    # Creation date from RDAP/WHOIS
+Registrar Name              # Registrar organization
+Registrant Name             # Registrant name/org
+Name Servers                # List of nameservers
+DNS Records                 # A, NS, MX, CNAME records
+Evidence file name          # Path to generated PDF evidence
+Source of detection         # Origin of the URL (e.g., 'Social Media', 'Certificate Logs')
+Phishing/Suspected Domains  # Final classification label

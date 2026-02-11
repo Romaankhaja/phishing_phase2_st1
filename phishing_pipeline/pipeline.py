@@ -1,4 +1,5 @@
-import sys, asyncio, re, os, socket, whois, dns.resolver, logging
+import sys, asyncio, re, os, socket, whois, dns.resolver, logging, time
+import httpx
 import pandas as pd
 import tldextract
 from tqdm.asyncio import tqdm
@@ -26,6 +27,92 @@ from .geoip_utils import enrich_with_geoip
 from .model_utils import load_models_and_preproc
 from .shortlisting import generate_shortlisted_csv
 from .rate_limiter import RateLimiter
+
+# ------------------------------------------------------------------
+# RDAP lookup (fast, async, structured JSON)
+# ------------------------------------------------------------------
+async def rdap_lookup(domain: str, timeout: float = 10.0) -> dict | None:
+    """
+    Query the RDAP bootstrap service for domain registration data.
+    Returns a dict with: reg_date, registrar, registrant_name, registrant_country, name_servers.
+    Returns None on any failure (timeout, 404, parse error).
+    """
+    url = f"https://rdap.org/domain/{domain}"
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+
+        result = {}
+
+        # --- Registration date ---
+        for event in data.get("events", []):
+            if event.get("eventAction") == "registration":
+                result["reg_date"] = event.get("eventDate", "NA")
+                break
+        if "reg_date" not in result:
+            result["reg_date"] = "NA"
+
+        # --- Registrar ---
+        result["registrar"] = "NA"
+        result["registrant_name"] = "NA"
+        result["registrant_country"] = "NA"
+        for entity in data.get("entities", []):
+            roles = entity.get("roles", [])
+            vcard = entity.get("vcardArray", [None, []])
+            vcard_items = vcard[1] if len(vcard) > 1 else []
+
+            # Extract "fn" (full name) from vCard
+            fn = "NA"
+            for item in vcard_items:
+                if isinstance(item, list) and len(item) >= 4 and item[0] == "fn":
+                    fn = item[3]
+                    break
+
+            if "registrar" in roles and fn != "NA":
+                result["registrar"] = fn
+            if "registrant" in roles:
+                if fn != "NA":
+                    result["registrant_name"] = fn
+                # Try to extract country from adr vCard field
+                for item in vcard_items:
+                    if isinstance(item, list) and len(item) >= 4 and item[0] == "adr":
+                        adr_val = item[3]
+                        if isinstance(adr_val, dict):
+                            result["registrant_country"] = adr_val.get("country-name", "NA")
+                        elif isinstance(adr_val, list) and len(adr_val) >= 7:
+                            result["registrant_country"] = adr_val[6] if adr_val[6] else "NA"
+                        break
+
+            # Check nested entities (registrar often has registrant inside)
+            for sub_entity in entity.get("entities", []):
+                sub_roles = sub_entity.get("roles", [])
+                sub_vcard = sub_entity.get("vcardArray", [None, []])
+                sub_items = sub_vcard[1] if len(sub_vcard) > 1 else []
+                sub_fn = "NA"
+                for item in sub_items:
+                    if isinstance(item, list) and len(item) >= 4 and item[0] == "fn":
+                        sub_fn = item[3]
+                        break
+                if "registrant" in sub_roles and sub_fn != "NA":
+                    result["registrant_name"] = sub_fn
+
+        # --- Name servers ---
+        ns_list = []
+        for ns in data.get("nameservers", []):
+            ldh = ns.get("ldhName", "")
+            if ldh:
+                ns_list.append(ldh)
+        result["name_servers"] = ";".join(ns_list) if ns_list else "NA"
+
+        return result
+
+    except (httpx.TimeoutException, httpx.HTTPStatusError, httpx.ConnectError):
+        return None
+    except Exception:
+        return None
 
 # ---
 # --- FIX 1: Define ROOT_DIR at the top so all functions can use it.
@@ -483,6 +570,8 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
     
     # ---------------- Collect WHOIS/DNS and write output ----------------
     records = []
+    rdap_times = []   # Track RDAP lookup durations
+    whois_times = []  # Track WHOIS fallback durations
     total_domains = len(df_features)
     
     from tqdm import tqdm as tqdm_sync
@@ -504,43 +593,70 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
             hosting_isp = "NA"
             hosting_country = "NA"
             
-            # --- WHOIS lookup (rate-limited: 20 req/min) ---
-            await whois_rate_limiter.acquire()  # Wait for rate limit
-            max_retries = 2
-            for attempt in range(max_retries):
-                try:
-                    # Run blocking whois call in executor with timeout
-                    loop = asyncio.get_running_loop()
-                    w = await asyncio.wait_for(
-                        loop.run_in_executor(None, whois.whois, host),
-                        timeout=15  # 15 seconds for slow WHOIS servers
-                    )
-                    if w:
-                        creation_date = w.creation_date
-                        if isinstance(creation_date, list):
-                            creation_date = creation_date[0]
-                        
-                        # Only overwrite "NA" if the value is not empty
-                        if creation_date:
-                            reg_date = str(creation_date)
-                        if w.registrar:
-                            registrar = w.registrar
-                        if w.name or w.org or w.registrant_name:
-                            registrant_name = w.name or w.org or w.registrant_name
-                        if w.country:
-                            registrant_country = w.country
-                        if w.name_servers:
-                            ns_list = [str(ns) for ns in w.name_servers]
-                            name_servers = ";".join(ns_list)
-                    break  # Success, exit retry loop
-                except asyncio.TimeoutError:
-                    logger.warning("⚠️ WHOIS timeout for %s (attempt %d/%d)", host, attempt+1, max_retries)
-                except Exception as e:
-                    logger.warning("⚠️ WHOIS lookup failed for %s: %s (attempt %d/%d)", host, e, attempt+1, max_retries)
-                
-                # Exponential backoff before retry (except on last attempt)
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)  # 1s, 2s, 4s
+            # --- Domain Registration Lookup (RDAP first, WHOIS fallback) ---
+            lookup_start = time.time()
+            lookup_method = "NONE"
+
+            # === Try RDAP first (fast, async, structured JSON) ===
+            try:
+                rdap_data = await rdap_lookup(host, timeout=8.0)
+                if rdap_data:
+                    lookup_method = "RDAP"
+                    if rdap_data.get("reg_date", "NA") != "NA":
+                        reg_date = rdap_data["reg_date"]
+                    if rdap_data.get("registrar", "NA") != "NA":
+                        registrar = rdap_data["registrar"]
+                    if rdap_data.get("registrant_name", "NA") != "NA":
+                        registrant_name = rdap_data["registrant_name"]
+                    if rdap_data.get("registrant_country", "NA") != "NA":
+                        registrant_country = rdap_data["registrant_country"]
+                    if rdap_data.get("name_servers", "NA") != "NA":
+                        name_servers = rdap_data["name_servers"]
+            except Exception as e:
+                logger.debug("RDAP failed for %s: %s", host, e)
+
+            # === Fallback to WHOIS if RDAP didn't work ===
+            if lookup_method == "NONE":
+                await whois_rate_limiter.acquire()  # Rate limit only for WHOIS
+                max_retries = 2
+                for attempt in range(max_retries):
+                    try:
+                        loop = asyncio.get_running_loop()
+                        w = await asyncio.wait_for(
+                            loop.run_in_executor(None, whois.whois, host),
+                            timeout=15
+                        )
+                        if w:
+                            lookup_method = "WHOIS"
+                            creation_date = w.creation_date
+                            if isinstance(creation_date, list):
+                                creation_date = creation_date[0]
+                            if creation_date:
+                                reg_date = str(creation_date)
+                            if w.registrar:
+                                registrar = w.registrar
+                            if w.name or w.org or w.registrant_name:
+                                registrant_name = w.name or w.org or w.registrant_name
+                            if w.country:
+                                registrant_country = w.country
+                            if w.name_servers:
+                                ns_list = [str(ns) for ns in w.name_servers]
+                                name_servers = ";".join(ns_list)
+                        break  # Success
+                    except asyncio.TimeoutError:
+                        logger.warning("⚠️ WHOIS timeout for %s (attempt %d/%d)", host, attempt+1, max_retries)
+                    except Exception as e:
+                        logger.warning("⚠️ WHOIS failed for %s: %s (attempt %d/%d)", host, e, attempt+1, max_retries)
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2 ** attempt)
+
+            # --- Track timing ---
+            lookup_duration = time.time() - lookup_start
+            if lookup_method == "RDAP":
+                rdap_times.append(lookup_duration)
+            elif lookup_method == "WHOIS":
+                whois_times.append(lookup_duration)
+            logger.debug("🔎 %s → %s in %.2fs", host, lookup_method, lookup_duration)
 
 
             # --- IP lookup ---
@@ -627,6 +743,19 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
     phase2_time = time.time() - phase2_start
     master_pbar.update(35)  # Phase 2 = 35% of work
     logger.info("✅ Phase 2 Complete: %d records in %.1f seconds", len(records), phase2_time)
+    
+    # --- Speed summary ---
+    rdap_count = len(rdap_times)
+    whois_count = len(whois_times)
+    failed_count = total_domains - rdap_count - whois_count
+    rdap_avg = sum(rdap_times) / rdap_count if rdap_times else 0
+    whois_avg = sum(whois_times) / whois_times.__len__() if whois_times else 0
+    logger.info("")
+    logger.info("📊 Lookup Speed Summary:")
+    logger.info("   ⚡ RDAP:  %d domains, avg %.2fs/domain", rdap_count, rdap_avg)
+    logger.info("   🐢 WHOIS: %d domains, avg %.2fs/domain", whois_count, whois_avg)
+    logger.info("   ❌ Failed: %d domains", failed_count)
+    logger.info("")
     
     df_out = pd.DataFrame(records)
     # Save to CSV
