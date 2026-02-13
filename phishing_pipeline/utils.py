@@ -39,15 +39,27 @@ logger = logging.getLogger(__name__)
 # ================== RESOURCE MANAGEMENT SEMAPHORES ==================
 # These semaphores limit concurrent operations to prevent memory exhaustion
 # Tuned for RTX 2050 with 2GB VRAM
-MAX_CONCURRENT_OCR = 1
-MAX_CONCURRENT_SCREENSHOTS = 8
-MAX_CONCURRENT_IMAGE_PROCESSING = 5
-MAX_CONCURRENT_CPU_TASKS = 20
+MAX_CONCURRENT_OCR = 4
+MAX_CONCURRENT_SCREENSHOTS = 20
+MAX_CONCURRENT_IMAGE_PROCESSING = 20
+MAX_CONCURRENT_CPU_TASKS = 40
+
+# ================== WHOIS/RDAP CONCURRENCY SETTINGS ==================
+# Adjust these to control parallel domain lookup throughput.
+# RDAP: Direct to authoritative registries (Verisign, etc.) — no published rate limit
+# WHOIS: Port 43 fallback — strict per-IP rate limits (~1 req/sec most registries)
+# DNS: Pre-filter resolution — lightweight, high concurrency safe
+MAX_CONCURRENT_RDAP = 10            # Concurrent RDAP lookups (direct to registries)
+MAX_CONCURRENT_WHOIS = 2           # Concurrent WHOIS fallback lookups
+MAX_CONCURRENT_DNS_PREFILTER = 60  # Concurrent DNS resolution checks
 
 _ocr_semaphore: asyncio.Semaphore | None = None
 _screenshot_semaphore: asyncio.Semaphore | None = None
 _image_semaphore: asyncio.Semaphore | None = None
 _cpu_semaphore: asyncio.Semaphore | None = None
+_rdap_semaphore: asyncio.Semaphore | None = None
+_whois_semaphore: asyncio.Semaphore | None = None
+_dns_prefilter_semaphore: asyncio.Semaphore | None = None
 
 def _get_ocr_semaphore() -> asyncio.Semaphore:
     global _ocr_semaphore
@@ -72,6 +84,24 @@ def _get_cpu_semaphore() -> asyncio.Semaphore:
     if _cpu_semaphore is None:
         _cpu_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CPU_TASKS)
     return _cpu_semaphore
+
+def _get_rdap_semaphore() -> asyncio.Semaphore:
+    global _rdap_semaphore
+    if _rdap_semaphore is None:
+        _rdap_semaphore = asyncio.Semaphore(MAX_CONCURRENT_RDAP)
+    return _rdap_semaphore
+
+def _get_whois_semaphore() -> asyncio.Semaphore:
+    global _whois_semaphore
+    if _whois_semaphore is None:
+        _whois_semaphore = asyncio.Semaphore(MAX_CONCURRENT_WHOIS)
+    return _whois_semaphore
+
+def _get_dns_prefilter_semaphore() -> asyncio.Semaphore:
+    global _dns_prefilter_semaphore
+    if _dns_prefilter_semaphore is None:
+        _dns_prefilter_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DNS_PREFILTER)
+    return _dns_prefilter_semaphore
 
 def cleanup_gpu_cache():
     if TORCH_AVAILABLE:
