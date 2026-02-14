@@ -26,12 +26,12 @@ if not logger.handlers:
 logger.setLevel(logging.INFO)
 
 # Defaults (used when caller doesn't provide explicit paths)
-DEFAULT_holdout_folder = os.path.join(ROOT_DIR, "PS-02_hold-out_Set_2")
-DEFAULT_TARGET_URLS_FILE = os.path.join(ROOT_DIR, "target_urls.txt")
-DEFAULT_WHITELIST_FILE = os.path.join(ROOT_DIR, "uploads", "PS-02_hold-out_Set1_Legitimate_Domains_for_10_CSEs.xlsx")
-DEFAULT_MERGED_TARGET_FILE = os.path.join(ROOT_DIR, "merge.txt")
-DEFAULT_FOUND_FILE = os.path.join(ROOT_DIR, "found.txt")
-DEFAULT_OUTPUT_FILE = os.path.join(ROOT_DIR, "holdout.csv")
+DEFAULT_holdout_folder = os.path.join(ROOT_DIR, "data", "holdout_sets", "PS-02_hold-out_Set_2")
+DEFAULT_TARGET_URLS_FILE = os.path.join(ROOT_DIR, "data", "target_urls.txt")
+DEFAULT_WHITELIST_FILE = os.path.join(ROOT_DIR, "data", "whitelists", "PS-02_hold-out_Set1_Legitimate_Domains_for_10_CSEs.xlsx")
+DEFAULT_MERGED_TARGET_FILE = os.path.join(ROOT_DIR, "output", "merge.txt")
+DEFAULT_FOUND_FILE = os.path.join(ROOT_DIR, "output", "found.txt")
+DEFAULT_OUTPUT_FILE = os.path.join(ROOT_DIR, "output", "holdout.csv")
 
 GENERIC_DOMAIN_PARTS = {
     'com', 'in', 'gov', 'org', 'co', 'net', 'www', 'io', 'xyz', 'app', 'site',

@@ -1,5 +1,9 @@
 import sys, asyncio, re, os, socket, whois, dns.resolver, logging, time
 import httpx
+
+# Suppress noisy httpx request logs
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 import pandas as pd
 import tldextract
 from tqdm.asyncio import tqdm
@@ -8,6 +12,14 @@ from dateutil import parser
 import warnings
 from urllib.parse import urlparse
 from fpdf import FPDF
+
+# Suppress noisy sklearn warnings that clutter progress bars
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+try:
+    from sklearn.exceptions import ConvergenceWarning
+    warnings.filterwarnings("ignore", category=ConvergenceWarning)
+except ImportError:
+    pass
 
 # NEW: visual analysis imports
 import cv2, imagehash
@@ -566,7 +578,7 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
     # ROOT_DIR is now defined at the top of the file
     
     # --- This is your new output file ---
-    holdout_csv_path = os.path.join(ROOT_DIR, "holdout.csv")
+    holdout_csv_path = os.path.join(ROOT_DIR, "output", "holdout.csv")
 
     if not use_existing_holdout or not os.path.exists(holdout_csv_path):
         logger.info("Generating new holdout.csv...")
@@ -703,7 +715,11 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
             except Exception:
                 return host, None
 
-    dns_results = await asyncio.gather(*[_dns_check(h) for h in host_list])
+    dns_tasks = [_dns_check(h) for h in host_list]
+    dns_results = []
+    for coro in tqdm(dns_tasks, desc="🔍 DNS Pre-filter", unit="domain",
+                     bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"):
+        dns_results.append(await coro)
     dns_map = {host: ip for host, ip in dns_results}  # host → ip or None
     live_hosts = {h for h, ip in dns_map.items() if ip is not None}
     dead_hosts = {h for h, ip in dns_map.items() if ip is None}
@@ -751,7 +767,11 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
 
     async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as rdap_client:
         rdap_tasks = [_rdap_one(h, rdap_client) for h in rdap_targets]
-        rdap_raw = await asyncio.gather(*rdap_tasks, return_exceptions=True)
+        rdap_raw = []
+        for coro in tqdm(asyncio.as_completed(rdap_tasks), total=len(rdap_tasks),
+                         desc="⚡ RDAP Batch", unit="domain",
+                         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"):
+            rdap_raw.append(await coro)
 
     for item in rdap_raw:
         if isinstance(item, Exception):
@@ -778,7 +798,7 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
         async with whois_sem:
             await whois_rate_limiter.acquire()
             start = time.time()
-            max_retries = 2
+            max_retries = 1
             for attempt in range(max_retries):
                 try:
                     loop = asyncio.get_running_loop()
@@ -810,8 +830,15 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
                     await asyncio.sleep(2 ** attempt)
             return host, None
 
-    whois_tasks = [_whois_one(h) for h in rdap_failures]
-    whois_raw = await asyncio.gather(*whois_tasks, return_exceptions=True)
+    whois_tasks_list = [_whois_one(h) for h in rdap_failures]
+    whois_raw = []
+    if whois_tasks_list:
+        for coro in tqdm(asyncio.as_completed(whois_tasks_list), total=len(whois_tasks_list),
+                         desc="🐢 WHOIS Fallback", unit="domain",
+                         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"):
+            whois_raw.append(await coro)
+    else:
+        logger.info("   No WHOIS fallback needed.")
 
     for item in whois_raw:
         if isinstance(item, Exception):
@@ -955,35 +982,34 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
     df_out.to_csv(FINAL_OUTPUT, index=False, encoding="utf-8")
     logger.info("✅ Final output written to %s", FINAL_OUTPUT)
 
-    # ---------------- Filtering step ----------------
-    start = datetime(2025, 10, 1).date()
-    end   = datetime(2025, 10, 15).date()
-
-    def parse_date(val):
-        if not val or pd.isna(val) or val == "NA":
-            return None
-        try:
-            dt = parser.parse(str(val), fuzzy=True)
-            return dt.date()
-        except:
-            return None
-
-    df_temp = df_out.copy()
-    df_temp["_parsed_reg_date"] = df_temp["Domain Registration Date"].apply(parse_date)
-    mask = df_temp["_parsed_reg_date"].notna() & df_temp["_parsed_reg_date"].between(start, end)
-    df_filtered = df_temp.loc[mask].drop(columns=["_parsed_reg_date"])
-    
-    # --- Ensure we use the new column order for the filtered file as well ---
-    if not df_filtered.empty:
-        # Get column order from the *full* output dataframe
-        df_filtered = df_filtered[df_out.columns] 
-
-    filtered_path = FINAL_OUTPUT.replace(".csv", "_filtered.csv")
-    df_filtered.to_csv(filtered_path, index=False, encoding="utf-8")
-
-    logger.info("✅ Filtered %d domains registered between %s and %s",
-                len(df_filtered), start.isoformat(), end.isoformat())
-    logger.info("📄 Filtered output written to %s", filtered_path)
+    # # ---------------- Filtering step (DISABLED) ----------------
+    # To re-enable, uncomment the block below and set appropriate start/end dates.
+    # start = datetime(2025, 10, 1).date()
+    # end   = datetime(2025, 10, 15).date()
+    #
+    # def parse_date(val):
+    #     if not val or pd.isna(val) or val == "NA":
+    #         return None
+    #     try:
+    #         dt = parser.parse(str(val), fuzzy=True)
+    #         return dt.date()
+    #     except:
+    #         return None
+    #
+    # df_temp = df_out.copy()
+    # df_temp["_parsed_reg_date"] = df_temp["Domain Registration Date"].apply(parse_date)
+    # mask = df_temp["_parsed_reg_date"].notna() & df_temp["_parsed_reg_date"].between(start, end)
+    # df_filtered = df_temp.loc[mask].drop(columns=["_parsed_reg_date"])
+    #
+    # if not df_filtered.empty:
+    #     df_filtered = df_filtered[df_out.columns]
+    #
+    # filtered_path = FINAL_OUTPUT.replace(".csv", "_filtered.csv")
+    # df_filtered.to_csv(filtered_path, index=False, encoding="utf-8")
+    #
+    # logger.info("✅ Filtered %d domains registered between %s and %s",
+    #             len(df_filtered), start.isoformat(), end.isoformat())
+    # logger.info("📄 Filtered output written to %s", filtered_path)
 
     # Remove the temporary holdout_temp.csv file
     try:

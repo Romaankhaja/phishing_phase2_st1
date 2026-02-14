@@ -39,19 +39,19 @@ logger = logging.getLogger(__name__)
 # ================== RESOURCE MANAGEMENT SEMAPHORES ==================
 # These semaphores limit concurrent operations to prevent memory exhaustion
 # Tuned for RTX 2050 with 2GB VRAM
-MAX_CONCURRENT_OCR = 4
-MAX_CONCURRENT_SCREENSHOTS = 20
-MAX_CONCURRENT_IMAGE_PROCESSING = 20
-MAX_CONCURRENT_CPU_TASKS = 40
+MAX_CONCURRENT_OCR = 2
+MAX_CONCURRENT_SCREENSHOTS = 10
+MAX_CONCURRENT_IMAGE_PROCESSING = 10
+MAX_CONCURRENT_CPU_TASKS = 20
 
 # ================== WHOIS/RDAP CONCURRENCY SETTINGS ==================
 # Adjust these to control parallel domain lookup throughput.
 # RDAP: Direct to authoritative registries (Verisign, etc.) — no published rate limit
 # WHOIS: Port 43 fallback — strict per-IP rate limits (~1 req/sec most registries)
 # DNS: Pre-filter resolution — lightweight, high concurrency safe
-MAX_CONCURRENT_RDAP = 10            # Concurrent RDAP lookups (direct to registries)
-MAX_CONCURRENT_WHOIS = 2           # Concurrent WHOIS fallback lookups
-MAX_CONCURRENT_DNS_PREFILTER = 60  # Concurrent DNS resolution checks
+MAX_CONCURRENT_RDAP = 5            # Concurrent RDAP lookups (direct to registries)
+MAX_CONCURRENT_WHOIS = 1           # Concurrent WHOIS fallback lookups
+MAX_CONCURRENT_DNS_PREFILTER = 100  # Concurrent DNS resolution checks
 
 _ocr_semaphore: asyncio.Semaphore | None = None
 _screenshot_semaphore: asyncio.Semaphore | None = None
@@ -146,7 +146,7 @@ def extract_all_features(url: str, csv_file: str | None = None) -> tuple:
             d = ImageDraw.Draw(img)
             d.text((20, 30), f"Failed to capture: {url}", fill=(0, 0, 0))
             img.save(screenshot_path)
-            logger.warning("Screenshot capture failed for %s", url)
+            logger.debug("Screenshot capture failed for %s", url)
 
         # Extract all independent features in parallel where possible
         url_feats = extract_url_features(target_url)
@@ -252,7 +252,7 @@ async def _extract_visual_impl(url: str) -> tuple:
 
         if not capture_ok:
             await asyncio.to_thread(_create_dummy_image, url, screenshot_path)
-            logger.warning("Screenshot capture failed for %s", url)
+            logger.debug("Screenshot capture failed for %s", url)
 
         loop = asyncio.get_running_loop()
         ocr_sem = _get_ocr_semaphore()

@@ -99,9 +99,9 @@ async def main():
     # ---
     # --- FIX 1: Updated default paths to match your new system
     # ---
-    parser.add_argument("--whitelist", type=str, default="uploads/PS-02_hold-out_Set1_Legitimate_Domains_for_10_CSEs.xlsx",
+    parser.add_argument("--whitelist", type=str, default=r"data\whitelists\PS-02_hold-out_Set1_Legitimate_Domains_for_10_CSEs.xlsx",
                         help="Path to whitelist Excel file")
-    parser.add_argument("--shortlisting", type=str, default="PS-02_hold-out_Set_2",
+    parser.add_argument("--shortlisting", type=str, default=r"data\holdout_sets\PS-02_hold-out_Set_2",
                         help="Folder containing shortlisting .xlsx files")
     # --- (End of Fix 1) ---
     
