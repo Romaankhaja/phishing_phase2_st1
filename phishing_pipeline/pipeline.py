@@ -851,6 +851,48 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
     logger.info("   ✅ WHOIS done in %.1fs: %d success, %d failed",
                 whois_time, len(whois_results), len(rdap_failures) - len(whois_results))
 
+    # ======================== PASS 2.5: DNS Records Batch ========================
+    # NEW: Fetch DNS records (MX, NS, etc.) in parallel to speed up record building
+    logger.info("⚡ Pass 2.5: DNS Records Batch (%d domains)...", len(live_hosts))
+    dns_records_map = {} # host -> ";".join(records)
+
+    dns_sem_recs = _get_dns_prefilter_semaphore() # Re-use the high concurrency semaphore
+
+    async def _get_dns_records_async(host):
+        """Fetch A, NS, MX, CNAME records concurrently."""
+        if host not in live_hosts:
+            return host, "NA"
+        
+        async with dns_sem_recs:
+            try:
+                loop = asyncio.get_running_loop()
+                # Run resolver in thread pool to avoid blocking
+                def _resolve_sync():
+                    results = []
+                    for qtype in ["A", "NS", "MX", "CNAME"]:
+                        try:
+                            # shorter timeout for these checks
+                            answers = dns.resolver.resolve(host, qtype, lifetime=2.0)
+                            results.extend([f"{qtype}:{r.to_text()}" for r in answers])
+                        except:
+                            pass
+                    return ";".join(results) if results else "NA"
+
+                records_str = await loop.run_in_executor(None, _resolve_sync)
+                return host, records_str
+            except Exception as e:
+                return host, "NA"
+
+    # Tasks for all live hosts
+    dns_rec_tasks = [_get_dns_records_async(h) for h in host_list]
+    
+    # Run in parallel
+    for coro in tqdm(asyncio.as_completed(dns_rec_tasks), total=len(dns_rec_tasks),
+                     desc="📡 DNS Records", unit="domain",
+                     bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"):
+        host, recs = await coro
+        dns_records_map[host] = recs
+
     # ======================== Merge results into records ========================
     from tqdm import tqdm as tqdm_sync
     with tqdm_sync(total=total_domains, desc="📝 Building Records", unit="domain",
@@ -893,21 +935,8 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
             elif dns_map.get(host):
                 ip = dns_map[host]
 
-            # --- DNS records lookup ---
-            dns_records = "NA"
-            try:
-                dns_recs = []
-                if host and host in live_hosts:
-                    for qtype in ["A", "NS", "MX", "CNAME"]:
-                        try:
-                            answers = dns.resolver.resolve(host, qtype, lifetime=3)
-                            dns_recs.extend([f"{qtype}:{r.to_text()}" for r in answers])
-                        except:
-                            pass
-                if dns_recs:
-                    dns_records = ";".join(dns_recs)
-            except Exception as e:
-                logger.debug("DNS lookup failed for %s: %s", host, e)
+            # --- DNS records lookup (Instant now) ---
+            dns_records = dns_records_map.get(host, "NA")
 
             # --- GeoIP/ISP lookup (from features file) ---
             hosting_isp = "NA"

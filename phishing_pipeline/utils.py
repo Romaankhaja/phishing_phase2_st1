@@ -1,4 +1,5 @@
 import os, re
+import psutil
 import tldextract
 import numpy as np
 import logging
@@ -36,22 +37,66 @@ from .visual_features import (
 
 logger = logging.getLogger(__name__)
 
-# ================== RESOURCE MANAGEMENT SEMAPHORES ==================
-# These semaphores limit concurrent operations to prevent memory exhaustion
-# Tuned for RTX 2050 with 2GB VRAM
-MAX_CONCURRENT_OCR = 4
-MAX_CONCURRENT_SCREENSHOTS = 20
-MAX_CONCURRENT_IMAGE_PROCESSING = 20
-MAX_CONCURRENT_CPU_TASKS = 40
+# ================== DYNAMIC RESOURCE ALLOCATION ==================
+def _get_optimal_concurrency():
+    """
+    Calculate optimal concurrency limits based on system resources.
+    Strategy defined in docs/DYNAMIC_RESOURCE_ALLOCATION.md
+    """
+    import torch
+
+    # 1. Detect Resources
+    cpu_cores = os.cpu_count() or 4
+    ram_gb = psutil.virtual_memory().total / (1024**3)
+    
+    vram_gb = 0
+    if torch.cuda.is_available():
+        try:
+            # Get VRAM of the first GPU in GB
+            vram_bytes = torch.cuda.get_device_properties(0).total_memory
+            vram_gb = vram_bytes / (1024**3)
+        except Exception:
+            vram_gb = 0
+
+    logger.info(f"⚙️  System Resources Detected: CPU={cpu_cores} cores, RAM={ram_gb:.1f}GB, VRAM={vram_gb:.1f}GB")
+
+    # 2. Apply Formulas
+    
+    # OCR: 1.5GB VRAM per process (GPU) or 2 cores per process (CPU)
+    if vram_gb > 0:
+        max_ocr = max(1, int(vram_gb / 1.5))
+    else:
+        max_ocr = max(1, int(cpu_cores / 2))
+
+    # Screenshots: ~500MB RAM per headless browser instance
+    # Cap at 20 to avoid CPU thrashing on consumer hardware
+    max_screenshots = min(20, max(1, int(ram_gb / 0.5)))
+
+    # Image Processing (CPU bound but light): 2x CPU cores
+    max_image_proc = cpu_cores * 2
+
+    # CPU Tasks (General): 2x CPU cores (async tasks usually wait on I/O)
+    max_cpu = cpu_cores * 5  # Increased multiplier for I/O bound tasks
+
+    return max_ocr, max_screenshots, max_image_proc, max_cpu
+
+# Calculate dynamic values
+MAX_CONCURRENT_OCR, MAX_CONCURRENT_SCREENSHOTS, \
+MAX_CONCURRENT_IMAGE_PROCESSING, MAX_CONCURRENT_CPU_TASKS = _get_optimal_concurrency()
+
+logger.info(f"🚀 Dynamic Concurrency Limits: OCR={MAX_CONCURRENT_OCR}, "
+            f"Screenshots={MAX_CONCURRENT_SCREENSHOTS}, "
+            f"ImgProc={MAX_CONCURRENT_IMAGE_PROCESSING}, "
+            f"CPU={MAX_CONCURRENT_CPU_TASKS}")
 
 # ================== WHOIS/RDAP CONCURRENCY SETTINGS ==================
 # Adjust these to control parallel domain lookup throughput.
 # RDAP: Direct to authoritative registries (Verisign, etc.) — no published rate limit
 # WHOIS: Port 43 fallback — strict per-IP rate limits (~1 req/sec most registries)
 # DNS: Pre-filter resolution — lightweight, high concurrency safe
-MAX_CONCURRENT_RDAP = 7            # Concurrent RDAP lookups (direct to registries)
-MAX_CONCURRENT_WHOIS = 1           # Concurrent WHOIS fallback lookups
-MAX_CONCURRENT_DNS_PREFILTER = 100  # Concurrent DNS resolution checks
+MAX_CONCURRENT_RDAP = 10           # Moderate (polite)
+MAX_CONCURRENT_WHOIS = 1           # Strict (1 per IP)
+MAX_CONCURRENT_DNS_PREFILTER = 200  # Fast (network bound)
 
 _ocr_semaphore: asyncio.Semaphore | None = None
 _screenshot_semaphore: asyncio.Semaphore | None = None

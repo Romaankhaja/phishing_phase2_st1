@@ -9,8 +9,8 @@ import os
 # ==========================
 # 1. Load Files
 # ==========================
-FEATURES_PATH = r"C:\Users\SATWIK\Downloads\features_enriched (3).csv"
-LABELS_PATH = r"PS-02_ISS_NLP_Holdout_Submission_Set.xlsx"
+FEATURES_PATH = r"C:\Users\SATWIK\Downloads\features_enriched (6).csv"
+LABELS_PATH = r"C:\Users\SATWIK\Downloads\PS-02_ISS_NLP_Submission (5)\PS-02_ISS_NLP_Submission\PS-02_ISS_NLP_Holdout_Submission_Set.xlsx"
 OUTPUT_PATH = r"final_training_dataset_with_source.xlsx"
 
 features = pd.read_csv(FEATURES_PATH)
