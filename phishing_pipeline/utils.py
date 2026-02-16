@@ -39,17 +39,17 @@ logger = logging.getLogger(__name__)
 # ================== RESOURCE MANAGEMENT SEMAPHORES ==================
 # These semaphores limit concurrent operations to prevent memory exhaustion
 # Tuned for RTX 2050 with 2GB VRAM
-MAX_CONCURRENT_OCR = 2
-MAX_CONCURRENT_SCREENSHOTS = 10
-MAX_CONCURRENT_IMAGE_PROCESSING = 10
-MAX_CONCURRENT_CPU_TASKS = 20
+MAX_CONCURRENT_OCR = 4
+MAX_CONCURRENT_SCREENSHOTS = 20
+MAX_CONCURRENT_IMAGE_PROCESSING = 20
+MAX_CONCURRENT_CPU_TASKS = 40
 
 # ================== WHOIS/RDAP CONCURRENCY SETTINGS ==================
 # Adjust these to control parallel domain lookup throughput.
 # RDAP: Direct to authoritative registries (Verisign, etc.) — no published rate limit
 # WHOIS: Port 43 fallback — strict per-IP rate limits (~1 req/sec most registries)
 # DNS: Pre-filter resolution — lightweight, high concurrency safe
-MAX_CONCURRENT_RDAP = 5            # Concurrent RDAP lookups (direct to registries)
+MAX_CONCURRENT_RDAP = 7            # Concurrent RDAP lookups (direct to registries)
 MAX_CONCURRENT_WHOIS = 1           # Concurrent WHOIS fallback lookups
 MAX_CONCURRENT_DNS_PREFILTER = 100  # Concurrent DNS resolution checks
 

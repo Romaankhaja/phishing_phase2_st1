@@ -343,7 +343,7 @@ def adjust_source(org_name, whitelisted_domain, ml_source="Unknown"):
 # ------------------------------------------------------------------
 # Feature extraction (Chunked Processing for GPU Safety)
 # ------------------------------------------------------------------
-CHUNK_SIZE = 200  # Process 50 domains at a time (tune for your system)
+CHUNK_SIZE = 100  # Process 50 domains at a time (tune for your system)
 
 async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=None):
     """
@@ -1138,69 +1138,69 @@ def package_results(output_file=FINAL_OUTPUT, zip_path="PS-02_ISS_NLP_Submission
 
     # --- Call the existing cleanup function ---
     # This will remove all the intermediate .csv, /screens, and /evidence folders
-    try:
-        cleanup_generated_artifacts(zip_path=zip_path_full)
-    except Exception as e:
-        logger.warning("⚠ Cleanup after packaging failed: %s", e)
+    # try:
+    #     cleanup_generated_artifacts(zip_path=zip_path_full)
+    # except Exception as e:
+    #     logger.warning("⚠ Cleanup after packaging failed: %s", e)
 
     return zip_path_full
 
 
-def cleanup_generated_artifacts(root_dir=None, zip_path="PS-02_ISS_NLP_Submission.zip"):
-    """
-    Cleans up all intermediate files (CSVs, screenshots, evidence)
-    after the final zip has been created.
-    """
-    import os, shutil, pathlib
-    
-    if root_dir is None:
-        root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..")) # project root
-    logger.info("🧹 Cleaning generated artifacts in %s (preserving code & models)...", root_dir)
-
-    project_root = pathlib.Path(root_dir)
-    zip_path_abs = pathlib.Path(zip_path).resolve() # Use absolute path for comparison
-
-    # List of files/folders to delete
-    # Note: We do *not* delete *.xlsx files, only the temporary one.
-    patterns_to_delete = [
-        "*.csv", # Deletes holdout.csv, features.csv, etc. from pipeline and root
-    ]
-    
-    folders_to_delete = [
-        SCREENS_DIR,  # The screenshot folder
-        EVIDENCE_DIR, # The evidence folder
-    ]
-
-    # Delete matching files in root and phishing_pipeline folder
-    for pattern in patterns_to_delete:
-        for p in project_root.glob(pattern):
-            if p.is_file() and p.resolve() != zip_path_abs:
-                try:
-                    p.unlink()
-                    logger.info("🗑 Deleted file: %s", p)
-                except Exception as e:
-                    logger.debug("Could not delete file: %s (%s)", p, e)
-        
-        for p in (project_root / "phishing_pipeline").glob(pattern):
-             if p.is_file() and p.resolve() != zip_path_abs:
-                try:
-                    p.unlink()
-                    logger.info("🗑 Deleted file: %s", p)
-                except Exception as e:
-                    logger.debug("Could not delete file: %s (%s)", p, e)
-
-    # Delete directories
-    for dir_path_str in folders_to_delete:
-        dir_path = pathlib.Path(dir_path_str)
-            
-        if dir_path.exists() and dir_path.is_dir():
-            try:
-                shutil.rmtree(dir_path)
-                logger.info("🗑 Removed folder: %s", dir_path)
-            except Exception as e:
-                logger.warning("Could not remove folder: %s (%s)", dir_path, e)
-
-    logger.info("✅ Cleanup complete. Kept code, models, and final zip: %s", zip_path)
+# def cleanup_generated_artifacts(root_dir=None, zip_path="PS-02_ISS_NLP_Submission.zip"):
+#     """
+#     Cleans up all intermediate files (CSVs, screenshots, evidence)
+#     after the final zip has been created.
+#     """
+#     import os, shutil, pathlib
+#     
+#     if root_dir is None:
+#         root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..")) # project root
+#     logger.info("🧹 Cleaning generated artifacts in %s (preserving code & models)...", root_dir)
+#
+#     project_root = pathlib.Path(root_dir)
+#     zip_path_abs = pathlib.Path(zip_path).resolve() # Use absolute path for comparison
+#
+#     # List of files/folders to delete
+#     # Note: We do *not* delete *.xlsx files, only the temporary one.
+#     patterns_to_delete = [
+#         "*.csv", # Deletes holdout.csv, features.csv, etc. from pipeline and root
+#     ]
+#     
+#     folders_to_delete = [
+#         SCREENS_DIR,  # The screenshot folder
+#         EVIDENCE_DIR, # The evidence folder
+#     ]
+#
+#     # Delete matching files in root and phishing_pipeline folder
+#     for pattern in patterns_to_delete:
+#         for p in project_root.glob(pattern):
+#             if p.is_file() and p.resolve() != zip_path_abs:
+#                 try:
+#                     p.unlink()
+#                     logger.info("🗑 Deleted file: %s", p)
+#                 except Exception as e:
+#                     logger.debug("Could not delete file: %s (%s)", p, e)
+#         
+#         for p in (project_root / "phishing_pipeline").glob(pattern):
+#              if p.is_file() and p.resolve() != zip_path_abs:
+#                 try:
+#                     p.unlink()
+#                     logger.info("🗑 Deleted file: %s", p)
+#                 except Exception as e:
+#                     logger.debug("Could not delete file: %s (%s)", p, e)
+#
+#     # Delete directories
+#     for dir_path_str in folders_to_delete:
+#         dir_path = pathlib.Path(dir_path_str)
+#             
+#         if dir_path.exists() and dir_path.is_dir():
+#             try:
+#                 shutil.rmtree(dir_path)
+#                 logger.info("🗑 Removed folder: %s", dir_path)
+#             except Exception as e:
+#                 logger.warning("Could not remove folder: %s (%s)", dir_path, e)
+#
+#     logger.info("✅ Cleanup complete. Kept code, models, and final zip: %s", zip_path)
 
 
 # -------------------- Main entry point --------------------
