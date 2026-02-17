@@ -62,9 +62,13 @@ def _get_optimal_concurrency():
 
     # 2. Apply Formulas
     
-    # OCR: 1.5GB VRAM per process (GPU) or 2 cores per process (CPU)
+    # OCR: 3.0GB VRAM per process (Safe buffer for RTX 2050/3050 class cards)
+    # If VRAM < 6GB, fast path is effectively serial (1 concurrent task) to prevent OOM.
     if vram_gb > 0:
-        max_ocr = max(1, int(vram_gb / 1.5))
+        if vram_gb < 6.0:
+            max_ocr = 1
+        else:
+            max_ocr = max(1, int(vram_gb / 3.0))
     else:
         max_ocr = max(1, int(cpu_cores / 2))
 

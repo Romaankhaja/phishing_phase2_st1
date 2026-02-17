@@ -1,4 +1,4 @@
-import os, re, base64, mimetypes, requests, asyncio, warnings, logging as _logging, socket
+import os, re, base64, mimetypes, requests, asyncio, warnings, logging as _logging, socket, threading
 import aiohttp  # For HEAD request pre-check
 # Suppress harmless PyTorch RNN warning from EasyOCR's LSTM
 warnings.filterwarnings("ignore", message="RNN module weights are not part of single contiguous chunk")
@@ -35,6 +35,7 @@ _context: BrowserContext | None = None
 # _async_* variables are now handled by AsyncBrowserManager class
 _ocr_reader: easyocr.Reader | None = None
 _ocr_call_count: int = 0  # Counter for periodic GPU cache cleanup
+_ocr_lock = threading.Lock()  # Global lock for thread-safe OCR access
 
 logger = logging.getLogger(__name__)
 
@@ -576,11 +577,13 @@ def extract_ocr_text(image_path: str) -> str:
     global _ocr_call_count
     
     def _do_ocr(img_np):
-        """Inner function to perform OCR (can be retried on OOM)."""
-        reader = _get_ocr_reader()
-        results = reader.readtext(img_np, detail=0)  # detail=0 → only text
-        txt = " ".join(results)
-        return re.sub(r"\s+", " ", txt).strip()
+        """Inner function to perform OCR (serialized check for thread safety)."""
+        # EasyOCR/PyTorch CUDA operations are not thread-safe on the same context
+        with _ocr_lock:
+            reader = _get_ocr_reader()
+            results = reader.readtext(img_np, detail=0)  # detail=0 → only text
+            txt = " ".join(results)
+            return re.sub(r"\s+", " ", txt).strip()
     
     try:
         if not os.path.exists(image_path):

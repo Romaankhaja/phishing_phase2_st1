@@ -25,8 +25,8 @@ We will use the following Python libraries:
 **Constraint**: GPU VRAM (highest priority) or CPU (fallback).
 
 - **GPU Mode**: Each OCR process (EasyOCR) loads a model into VRAM.
-  - _Formula_: `max(1, int(TOTAL_VRAM_GB / 1.5))`
-  - _Rationale_: A standard EasyOCR model + overhead takes ~1-1.5GB. On an RTX 2050 (4GB), this allows ~2-3 concurrent processes safely.
+  - _Formula_: `max(1, int(TOTAL_VRAM_GB / 3.0))` (If VRAM < 6GB, forced to 1)
+  - _Rationale_: A standard EasyOCR model + overhead takes ~1-1.5GB, but fragmentation on 4GB cards is severe. Therefore, we enforce stricter limits: 1 process for <6GB, scaling up only on 8GB+ cards.
 - **CPU Mode**: Compute heavy.
   - _Formula_: `max(1, int(CPU_CORES / 2))`
 
