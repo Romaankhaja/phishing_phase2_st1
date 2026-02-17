@@ -580,10 +580,17 @@ def extract_ocr_text(image_path: str) -> str:
         """Inner function to perform OCR (serialized check for thread safety)."""
         # EasyOCR/PyTorch CUDA operations are not thread-safe on the same context
         with _ocr_lock:
-            reader = _get_ocr_reader()
-            results = reader.readtext(img_np, detail=0)  # detail=0 → only text
-            txt = " ".join(results)
-            return re.sub(r"\s+", " ", txt).strip()
+            try:
+                reader = _get_ocr_reader()
+                results = reader.readtext(img_np, detail=0)  # detail=0 → only text
+                txt = " ".join(results)
+                return re.sub(r"\s+", " ", txt).strip()
+            finally:
+                # Aggressive Cleanup: Free VRAM immediately after use
+                # This prevents OOM when switching contexts or queuing multiple 4GB tasks
+                torch.cuda.empty_cache()
+                import gc
+                gc.collect()
     
     try:
         if not os.path.exists(image_path):
