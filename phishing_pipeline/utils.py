@@ -80,14 +80,22 @@ def _get_optimal_concurrency():
 
     return max_ocr, max_screenshots, max_image_proc, max_cpu
 
+
 # Calculate dynamic values
 MAX_CONCURRENT_OCR, MAX_CONCURRENT_SCREENSHOTS, \
 MAX_CONCURRENT_IMAGE_PROCESSING, MAX_CONCURRENT_CPU_TASKS = _get_optimal_concurrency()
 
+# Define CHUNK_SIZE dynamically
+# We want to process enough domains to keep all workers busy, but not so many that we
+# hold onto too much memory (PDFs, images) before flushing.
+# A good heuristic is 3-5x the screenshot concurrency (since that's the memory bottleneck).
+CHUNK_SIZE = MAX_CONCURRENT_SCREENSHOTS * 5
+
 logger.info(f"🚀 Dynamic Concurrency Limits: OCR={MAX_CONCURRENT_OCR}, "
             f"Screenshots={MAX_CONCURRENT_SCREENSHOTS}, "
             f"ImgProc={MAX_CONCURRENT_IMAGE_PROCESSING}, "
-            f"CPU={MAX_CONCURRENT_CPU_TASKS}")
+            f"CPU={MAX_CONCURRENT_CPU_TASKS}, "
+            f"CHUNK_SIZE={CHUNK_SIZE}")
 
 # ================== WHOIS/RDAP CONCURRENCY SETTINGS ==================
 # Adjust these to control parallel domain lookup throughput.

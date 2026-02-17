@@ -42,6 +42,7 @@ from .rate_limiter import RateLimiter
 from .utils import (
     MAX_CONCURRENT_RDAP, MAX_CONCURRENT_WHOIS, MAX_CONCURRENT_DNS_PREFILTER,
     _get_rdap_semaphore, _get_whois_semaphore, _get_dns_prefilter_semaphore,
+    CHUNK_SIZE,
 )
 
 # ------------------------------------------------------------------
@@ -343,7 +344,7 @@ def adjust_source(org_name, whitelisted_domain, ml_source="Unknown"):
 # ------------------------------------------------------------------
 # Feature extraction (Chunked Processing for GPU Safety)
 # ------------------------------------------------------------------
-CHUNK_SIZE = 100  # Process 50 domains at a time (tune for your system)
+# CHUNK_SIZE is imported from .utils (calculated dynamically)
 
 async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=None):
     """
