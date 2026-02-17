@@ -79,8 +79,8 @@ def _get_optimal_concurrency():
     # Image Processing (CPU bound but light): 2x CPU cores
     max_image_proc = cpu_cores * 2
 
-    # CPU Tasks (General): 2x CPU cores (async tasks usually wait on I/O)
-    max_cpu = cpu_cores * 5  # Increased multiplier for I/O bound tasks
+    # CPU Tasks (General): 10x CPU cores (async tasks usually wait on I/O)
+    max_cpu = cpu_cores * 10  # Increased multiplier for I/O bound tasks
 
     return max_ocr, max_screenshots, max_image_proc, max_cpu
 
