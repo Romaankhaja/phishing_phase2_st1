@@ -107,7 +107,7 @@ logger.info(f"🚀 Dynamic Concurrency Limits: OCR={MAX_CONCURRENT_OCR}, "
 # WHOIS: Port 43 fallback — strict per-IP rate limits (~1 req/sec most registries)
 # DNS: Pre-filter resolution — lightweight, high concurrency safe
 MAX_CONCURRENT_RDAP = 10           # Moderate (polite)
-MAX_CONCURRENT_WHOIS = 1           # Strict (1 per IP)
+MAX_CONCURRENT_WHOIS = 2           # Strict (1 per IP) but safe with parallel flow
 MAX_CONCURRENT_DNS_PREFILTER = 200  # Fast (network bound)
 
 _ocr_semaphore: asyncio.Semaphore | None = None

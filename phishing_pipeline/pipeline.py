@@ -697,160 +697,121 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
         host = host.split(':')[0]
         host_list.append(host)
 
-    # ======================== PASS 0: DNS Pre-filter ========================
-    logger.info("🔍 Pass 0: DNS Pre-filter (%d domains, concurrency=%d)...",
-                total_domains, MAX_CONCURRENT_DNS_PREFILTER)
-    dns_start = time.time()
-    dns_sem = _get_dns_prefilter_semaphore()
-
-    async def _dns_check(host):
-        """Quick DNS resolution check. Returns (host, ip_or_None)."""
-        async with dns_sem:
-            try:
-                loop = asyncio.get_running_loop()
-                ip = await asyncio.wait_for(
-                    loop.run_in_executor(None, socket.gethostbyname, host),
-                    timeout=3.0
-                )
-                return host, ip
-            except Exception:
-                return host, None
-
-    dns_tasks = [_dns_check(h) for h in host_list]
-    dns_results = []
-    for coro in tqdm(dns_tasks, desc="🔍 DNS Pre-filter", unit="domain",
-                     bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"):
-        dns_results.append(await coro)
-    dns_map = {host: ip for host, ip in dns_results}  # host → ip or None
-    live_hosts = {h for h, ip in dns_map.items() if ip is not None}
-    dead_hosts = {h for h, ip in dns_map.items() if ip is None}
-    dns_time = time.time() - dns_start
-    logger.info("   ✅ DNS done in %.1fs: %d live, %d dead (skipped)",
-                dns_time, len(live_hosts), len(dead_hosts))
-
-    # ======================== PASS 1: RDAP Batch ========================
-    # Only query live hosts; use direct RDAP URLs to bypass rdap.org rate limit
-    rdap_targets = [h for h in host_list if h in live_hosts]
-    logger.info("⚡ Pass 1: RDAP Batch (%d domains, concurrency=%d)...",
-                len(rdap_targets), MAX_CONCURRENT_RDAP)
-    rdap_start = time.time()
+    # ======================== PASS 1: Parallel Registration Data ========================
+    logger.info("⚡ Pass 1: Parallel Registration Data (%d domains)...", total_domains)
+    
+    # Semaphores
     rdap_sem = _get_rdap_semaphore()
-    rdap_results = {}  # host → dict of reg data
-    rdap_failures = []  # hosts that need WHOIS fallback
-
+    whois_sem = _get_whois_semaphore()
+    dns_sem = _get_dns_prefilter_semaphore()
+    
+    # helper for RDAP URL
     def _get_rdap_url(host):
-        """Map host to direct authoritative RDAP URL."""
         ext = tldextract.extract(host)
         tld = ext.suffix.split(".")[-1] if ext.suffix else ""
         return RDAP_DIRECT_URLS.get(tld, RDAP_FALLBACK_URL)
 
-    async def _rdap_one(host, client):
-        """Single RDAP lookup with semaphore control."""
-        async with rdap_sem:
-            start = time.time()
+    live_hosts = set()
+    
+    async def process_reg_data(host, client):
+        """
+        Single flow: DNS -> RDAP -> WHOIS
+        Returns: (host, status, data)
+        """
+        # 1. DNS Pre-check
+        async with dns_sem:
             try:
+                loop = asyncio.get_running_loop()
+                # Fast 3s timeout for DNS
+                await asyncio.wait_for(
+                    loop.run_in_executor(None, socket.gethostbyname, host),
+                    timeout=3.0
+                )
+            except Exception:
+                 return host, "DEAD", None
+
+        # 2. RDAP Lookup
+        async with rdap_sem:
+            try:
+                start = time.time()
                 base_url = _get_rdap_url(host)
+                # RDAP is just HTTP GET
                 resp = await client.get(f"{base_url}{host}")
                 if resp.status_code == 200:
-                    data = resp.json()
-                    result = _parse_rdap_to_fields(data)
-                    duration = time.time() - start
-                    rdap_times.append(duration)
-                    return host, result
+                    data_json = resp.json()
+                    # Use existing parser
+                    result = _parse_rdap_to_fields(data_json)
+                    rdap_times.append(time.time() - start)
+                    return host, "RDAP", result
                 elif resp.status_code == 429:
-                    logger.warning("⚠️ RDAP 429 for %s — rate limited", host)
-                    return host, None
-                else:
-                    return host, None
-            except Exception as e:
-                logger.debug("RDAP failed for %s: %s", host, e)
-                return host, None
+                    logger.warning("⚠️ RDAP 429 for %s", host)
+            except Exception:
+                pass
 
-    async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as rdap_client:
-        rdap_tasks = [_rdap_one(h, rdap_client) for h in rdap_targets]
-        rdap_raw = []
-        for coro in tqdm(asyncio.as_completed(rdap_tasks), total=len(rdap_tasks),
-                         desc="⚡ RDAP Batch", unit="domain",
-                         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"):
-            rdap_raw.append(await coro)
-
-    for item in rdap_raw:
-        if isinstance(item, Exception):
-            continue
-        host, data = item
-        if data:
-            rdap_results[host] = data
-        else:
-            rdap_failures.append(host)
-
-    rdap_time = time.time() - rdap_start
-    logger.info("   ✅ RDAP done in %.1fs: %d success, %d need WHOIS",
-                rdap_time, len(rdap_results), len(rdap_failures))
-
-    # ======================== PASS 2: WHOIS Fallback ========================
-    logger.info("🐢 Pass 2: WHOIS Fallback (%d domains, concurrency=%d)...",
-                len(rdap_failures), MAX_CONCURRENT_WHOIS)
-    whois_start_time = time.time()
-    whois_sem = _get_whois_semaphore()
-    whois_results = {}  # host → dict of reg data
-
-    async def _whois_one(host):
-        """Single WHOIS lookup with semaphore + rate limiter."""
+        # 3. WHOIS Fallback (if RDAP failed)
         async with whois_sem:
+            # Respect rate limits
             await whois_rate_limiter.acquire()
-            start = time.time()
-            max_retries = 1
-            for attempt in range(max_retries):
-                try:
-                    loop = asyncio.get_running_loop()
-                    w = await asyncio.wait_for(
-                        loop.run_in_executor(None, whois.whois, host),
-                        timeout=15
-                    )
-                    if w:
-                        result = {}
-                        creation_date = w.creation_date
-                        if isinstance(creation_date, list):
-                            creation_date = creation_date[0]
-                        result["reg_date"] = str(creation_date) if creation_date else "NA"
-                        result["registrar"] = w.registrar or "NA"
-                        result["registrant_name"] = w.name or w.org or getattr(w, 'registrant_name', None) or "NA"
-                        result["registrant_country"] = w.country or "NA"
-                        if w.name_servers:
-                            result["name_servers"] = ";".join(str(ns) for ns in w.name_servers)
-                        else:
-                            result["name_servers"] = "NA"
-                        duration = time.time() - start
-                        whois_times.append(duration)
-                        return host, result
-                except asyncio.TimeoutError:
-                    logger.warning("⚠️ WHOIS timeout for %s (attempt %d/%d)", host, attempt+1, max_retries)
-                except Exception as e:
-                    logger.warning("⚠️ WHOIS failed for %s: %s (attempt %d/%d)", host, e, attempt+1, max_retries)
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)
-            return host, None
+            try:
+                loop = asyncio.get_running_loop()
+                start = time.time()
+                
+                # Strict 5s timeout for WHOIS
+                w = await asyncio.wait_for(
+                    loop.run_in_executor(None, whois.whois, host),
+                    timeout=5.0
+                )
+                
+                if w:
+                    # Parse WHOIS result (adapted from previous code)
+                    result = {}
+                    creation_date = w.creation_date
+                    if isinstance(creation_date, list): 
+                        creation_date = creation_date[0]
+                    result["reg_date"] = str(creation_date) if creation_date else "NA"
+                    result["registrar"] = w.registrar or "NA"
+                    result["registrant_name"] = w.name or w.org or getattr(w, 'registrant_name', None) or "NA"
+                    result["registrant_country"] = w.country or "NA"
+                    
+                    if w.name_servers:
+                        result["name_servers"] = ";".join(str(ns) for ns in w.name_servers)
+                    else:
+                        result["name_servers"] = "NA"
+                        
+                    whois_times.append(time.time() - start)
+                    return host, "WHOIS", result
+            except asyncio.TimeoutError:
+                pass # Timeout = fail
+            except Exception:
+                pass # Other error = fail
+                
+        # If we got here, everything failed but DNS worked
+        return host, "FAIL", None
 
-    whois_tasks_list = [_whois_one(h) for h in rdap_failures]
-    whois_raw = []
-    if whois_tasks_list:
-        for coro in tqdm(asyncio.as_completed(whois_tasks_list), total=len(whois_tasks_list),
-                         desc="🐢 WHOIS Fallback", unit="domain",
-                         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"):
-            whois_raw.append(await coro)
-    else:
-        logger.info("   No WHOIS fallback needed.")
+    # Run the parallel batch
+    async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
+        tasks = [process_reg_data(h, client) for h in host_list]
+        
+        # Track progress
+        for f in tqdm(asyncio.as_completed(tasks), total=len(tasks), 
+                      desc="⚡ Reg Data", unit="domain",
+                      bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"):
+            host, status, data = await f
+            
+            if status == "DEAD":
+                continue # Dead domain, ignore
+                
+            live_hosts.add(host)
+            
+            if status == "RDAP":
+                rdap_results[host] = data
+            elif status == "WHOIS":
+                whois_results[host] = data
+            # FAIL means live but no reg data (will be NAs in output)
 
-    for item in whois_raw:
-        if isinstance(item, Exception):
-            continue
-        host, data = item
-        if data:
-            whois_results[host] = data
-
-    whois_time = time.time() - whois_start_time
-    logger.info("   ✅ WHOIS done in %.1fs: %d success, %d failed",
-                whois_time, len(whois_results), len(rdap_failures) - len(whois_results))
+    dns_time = 0 # Legacy var for logging
+    rdap_time = 0
+    whois_time = 0
 
     # ======================== PASS 2.5: DNS Records Batch ========================
     # NEW: Fetch DNS records (MX, NS, etc.) in parallel to speed up record building
@@ -997,13 +958,17 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
     whois_count = len(whois_times)
     failed_count = total_domains - rdap_count - whois_count
     rdap_avg = sum(rdap_times) / rdap_count if rdap_times else 0
-    whois_avg = sum(whois_times) / len(whois_times) if whois_times else 0
+    whois_avg = sum(whois_times) / whois_count if whois_times else 0
+    
+    dead_count = total_domains - len(live_hosts)
+    failed_count = len(live_hosts) - rdap_count - whois_count
+
     logger.info("")
-    logger.info("📊 Lookup Speed Summary (3-Pass Parallel):")
-    logger.info("   🏓 DNS Pre-filter:  %.1fs (%d live, %d dead)", dns_time, len(live_hosts), len(dead_hosts))
-    logger.info("   ⚡ RDAP Batch:      %.1fs, %d domains, avg %.2fs/domain", rdap_time, rdap_count, rdap_avg)
-    logger.info("   🐢 WHOIS Fallback:  %.1fs, %d domains, avg %.2fs/domain", whois_time, whois_count, whois_avg)
-    logger.info("   ❌ Total Failed:    %d domains", failed_count)
+    logger.info("📊 Lookup Speed Summary (Parallel Flow):")
+    logger.info("   ⚡ Processed:       %d live, %d dead", len(live_hosts), dead_count)
+    logger.info("   ✅ RDAP Matches:    %d (avg %.2fs)", rdap_count, rdap_avg)
+    logger.info("   🐢 WHOIS Fallback:  %d (avg %.2fs)", whois_count, whois_avg)
+    logger.info("   ❌ Reg Data Failed: %d", failed_count)
     logger.info("   ⏱️  Phase 2 Total:   %.1fs", phase2_time)
     logger.info("")
     
