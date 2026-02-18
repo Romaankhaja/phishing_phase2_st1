@@ -712,23 +712,28 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
         return RDAP_DIRECT_URLS.get(tld, RDAP_FALLBACK_URL)
 
     live_hosts = set()
+    rdap_times = []
+    live_hosts = set()
+    dns_map = {} # host -> ip or None
     
     async def process_reg_data(host, client):
         """
         Single flow: DNS -> RDAP -> WHOIS
-        Returns: (host, status, data)
+        Returns: (host, status, data, ip)
         """
+        resolved_ip = None
+        
         # 1. DNS Pre-check
         async with dns_sem:
             try:
                 loop = asyncio.get_running_loop()
                 # Fast 3s timeout for DNS
-                await asyncio.wait_for(
+                resolved_ip = await asyncio.wait_for(
                     loop.run_in_executor(None, socket.gethostbyname, host),
                     timeout=3.0
                 )
             except Exception:
-                 return host, "DEAD", None
+                 return host, "DEAD", None, None
 
         # 2. RDAP Lookup
         async with rdap_sem:
@@ -742,7 +747,7 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
                     # Use existing parser
                     result = _parse_rdap_to_fields(data_json)
                     rdap_times.append(time.time() - start)
-                    return host, "RDAP", result
+                    return host, "RDAP", result, resolved_ip
                 elif resp.status_code == 429:
                     logger.warning("⚠️ RDAP 429 for %s", host)
             except Exception:
@@ -779,16 +784,19 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
                         result["name_servers"] = "NA"
                         
                     whois_times.append(time.time() - start)
-                    return host, "WHOIS", result
+                    return host, "WHOIS", result, resolved_ip
             except asyncio.TimeoutError:
                 pass # Timeout = fail
             except Exception:
                 pass # Other error = fail
                 
         # If we got here, everything failed but DNS worked
-        return host, "FAIL", None
+        return host, "FAIL", None, resolved_ip
 
     # Run the parallel batch
+    rdap_results = {}
+    whois_results = {}
+
     async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
         tasks = [process_reg_data(h, client) for h in host_list]
         
@@ -796,12 +804,14 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
         for f in tqdm(asyncio.as_completed(tasks), total=len(tasks), 
                       desc="⚡ Reg Data", unit="domain",
                       bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"):
-            host, status, data = await f
+            host, status, data, ip = await f
             
             if status == "DEAD":
-                continue # Dead domain, ignore
+                dns_map[host] = None # Explicitly mark as dead
+                continue 
                 
             live_hosts.add(host)
+            dns_map[host] = ip # Store resolved IP
             
             if status == "RDAP":
                 rdap_results[host] = data
