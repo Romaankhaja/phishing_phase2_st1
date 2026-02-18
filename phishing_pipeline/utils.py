@@ -67,7 +67,7 @@ def _get_optimal_concurrency():
     # but they will obtain the GPU lock one-by-one.
     if vram_gb > 0:
         if vram_gb < 6.0:
-            max_ocr = 1
+            max_ocr = 3
         else:
             max_ocr = max(1, int(vram_gb / 3.0))
     else:
