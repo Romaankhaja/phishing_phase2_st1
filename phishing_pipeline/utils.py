@@ -31,6 +31,8 @@ from .visual_features import (
     capture_screenshot_async,
     branding_guidelines_features,
     extract_ocr_text,
+    preprocess_image_for_ocr,   # Phase A: CPU image prep, lockless
+    run_ocr_inference,           # Phase B: GPU inference, minimal lock hold
     laplacian_variance,
     get_favicon_features_async,
 )
@@ -160,6 +162,40 @@ def _get_dns_prefilter_semaphore() -> asyncio.Semaphore:
     if _dns_prefilter_semaphore is None:
         _dns_prefilter_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DNS_PREFILTER)
     return _dns_prefilter_semaphore
+
+# ================== VRAM-AWARE OCR GATE ==================
+
+async def wait_for_vram(min_free_gb: float = 1.5, poll_interval: float = 0.5):
+    """
+    Block asynchronously until the GPU has at least `min_free_gb` of free VRAM.
+    Used by Stage 2 OCR workers in the two-stage pipeline to prevent OOM.
+    Falls through instantly if CUDA is not available (CPU-only mode).
+    """
+    if not TORCH_AVAILABLE:
+        return
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return
+        while True:
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            free_gb = free_bytes / (1024 ** 3)
+            if free_gb >= min_free_gb:
+                return
+            logger.debug(
+                "[VRAM Gate] Only %.2fGB free (need %.1fGB). Waiting...",
+                free_gb, min_free_gb
+            )
+            torch.cuda.empty_cache()
+            gc.collect()
+            await asyncio.sleep(poll_interval)
+    except Exception as e:
+        logger.warning("wait_for_vram check failed: %s — proceeding anyway", e)
+
+# ================== RESOURCE MONITOR SINGLETON ==================
+# Imported here so pipeline.py can use it without a separate import chain.
+from .resource_manager import ResourceMonitor
+_resource_monitor = ResourceMonitor()
 
 def cleanup_gpu_cache():
     if TORCH_AVAILABLE:
@@ -426,26 +462,46 @@ def _safe_extract_branding(path: str) -> dict:
 
 def _safe_extract_ocr(path: str) -> str:
     """
-    Safely extract OCR text with fallback.
-    
-    Args:
-        path: Path to screenshot file
-    
-    Returns:
-        Extracted text string or empty string if extraction fails
+    Combined OCR wrapper (backward compat / single-threaded use).
+    For the two-stage pipeline, call _safe_preprocess_image + _safe_run_ocr separately.
     """
     try:
         if not os.path.exists(path):
             logger.warning("Screenshot file not found for OCR: %s", path)
             return ""
-        
         return extract_ocr_text(path)
-    
     except FileNotFoundError:
         logger.warning("Screenshot file not found for OCR: %s", path)
         return ""
     except Exception as e:
         logger.error("OCR extraction failed for %s: %s", path, e)
+        return ""
+
+
+def _safe_preprocess_image(path: str):
+    """
+    Phase A wrapper — CPU only, no lock.
+    Returns numpy array or None. Run this in parallel while GPU is busy.
+    """
+    try:
+        if not os.path.exists(path):
+            logger.warning("Screenshot not found for preprocess: %s", path)
+            return None
+        return preprocess_image_for_ocr(path)
+    except Exception as e:
+        logger.error("Image preprocess failed for %s: %s", path, e)
+        return None
+
+
+def _safe_run_ocr(img_np) -> str:
+    """
+    Phase B wrapper — GPU serialized, minimal lock scope.
+    Pass the numpy array from _safe_preprocess_image().
+    """
+    try:
+        return run_ocr_inference(img_np)
+    except Exception as e:
+        logger.error("OCR inference failed: %s", e)
         return ""
 
 

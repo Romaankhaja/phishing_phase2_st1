@@ -43,6 +43,10 @@ from .utils import (
     MAX_CONCURRENT_RDAP, MAX_CONCURRENT_WHOIS, MAX_CONCURRENT_DNS_PREFILTER,
     _get_rdap_semaphore, _get_whois_semaphore, _get_dns_prefilter_semaphore,
     CHUNK_SIZE,
+    extract_network_features_async, extract_visual_features_async,
+    wait_for_vram, _resource_monitor,
+    _get_screenshot_semaphore, _get_ocr_semaphore,
+    MAX_CONCURRENT_OCR, MAX_CONCURRENT_SCREENSHOTS,
 )
 
 # ------------------------------------------------------------------
@@ -348,98 +352,207 @@ def adjust_source(org_name, whitelisted_domain, ml_source="Unknown"):
 
 async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=None):
     """
-    Extract features using Chunked Processing Pipeline.
-    
-    Processes domains in chunks to prevent GPU memory fragmentation and OOM errors.
-    Each chunk: Network + Screenshots in parallel, then OCR sequentially.
+    Two-Stage Producer-Consumer Feature Extraction Pipeline.
+
+    Stage 1 — Screenshot Workers  (parallelism = MAX_CONCURRENT_SCREENSHOTS)
+        - Runs network features + browser screenshot in parallel
+        - Frees browser page slot immediately after screenshot is saved
+        - Pushes (net_feats, screenshot_path, row_meta) into a bounded asyncio.Queue
+
+    Stage 2 — OCR Workers         (parallelism = MAX_CONCURRENT_OCR, VRAM-gated)
+        - Pulls from Queue one item at a time per worker
+        - Checks available VRAM before dispatching via wait_for_vram()
+        - Runs OCR + branding + laplacian in executor (truly serialized by _ocr_lock)
+        - Appends merged result to shared results list
+
+    This decoupling means fast stages never idle-wait on slow GPU stages.
     """
     import csv
     import gc
     import torch
-    from .utils import extract_network_features_async, extract_visual_features_async
-    
+    from .utils import (
+        _safe_extract_ocr, _safe_extract_branding, _safe_extract_laplacian,
+    )
+    from .visual_features import get_favicon_features_async
+
     df = pd.read_csv(input_csv)
     total_domains = len(df)
-    logger.info("⚙️ Starting Chunked Pipeline for %d domains (chunk size: %d)...", total_domains, CHUNK_SIZE)
-    
+    logger.info(
+        "⚙️  Starting Two-Stage Pipeline for %d domains "
+        "(Stage1 workers=%d, Stage2 OCR workers=%d)...",
+        total_domains, MAX_CONCURRENT_SCREENSHOTS, MAX_CONCURRENT_OCR
+    )
+
     if df.empty:
         with open(output_csv, mode="w", newline="", encoding="utf-8") as f:
             pass
         return output_csv
-    
-    # Use provided semaphore or create new one
+
     if network_semaphore is None:
         network_semaphore = asyncio.Semaphore(50)
-    
-    # Convert DataFrame to list of dicts for chunking
+
     rows = df.to_dict('records')
-    total_chunks = (total_domains + CHUNK_SIZE - 1) // CHUNK_SIZE
-    
-    # Open output file for writing
     all_results = []
-    
-    # Progress bar for chunks
-    with tqdm(total=total_domains, desc="🌐 Phase 1: Features", unit="domain", 
-              bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]") as pbar:
-        
-        for chunk_idx in range(total_chunks):
-            start = chunk_idx * CHUNK_SIZE
-            end = min(start + CHUNK_SIZE, total_domains)
-            chunk_rows = rows[start:end]
-            
-            logger.info(f"📦 Processing chunk {chunk_idx + 1}/{total_chunks} ({len(chunk_rows)} domains)")
-            
-            # ============ STAGE A: Network + Screenshots in PARALLEL ============
-            async def process_single_domain(row):
-                domain = row["Identified Phishing/Suspected Domain Name"]
-                
-                # Network features (fast, CPU)
-                try:
-                    net_feats = await extract_network_features_async(domain, network_semaphore)
-                except Exception as e:
-                    logger.error(f"Network failed for {domain}: {e}")
-                    net_feats = {}
-                
-                # Visual features (screenshot + OCR + branding)
-                try:
-                    vis_feats, _ = await extract_visual_features_async(domain)
-                except Exception as e:
-                    logger.error(f"Visual failed for {domain}: {e}")
-                    vis_feats = {}
-                
-                # Merge results
-                final_url = vis_feats.get("url", domain)
-                return {
-                    "Cooresponding CSE": row.get("Cooresponding CSE", ""),
-                    "Legitimate Domains": row.get("Legitimate Domains", ""),
-                    **net_feats,
-                    **vis_feats,
-                    "url": final_url
-                }
-            
-            # Process all domains in this chunk
-            chunk_tasks = [process_single_domain(row) for row in chunk_rows]
-            chunk_results = await asyncio.gather(*chunk_tasks, return_exceptions=True)
-            
-            # Filter out exceptions and collect valid results
-            for result in chunk_results:
-                if isinstance(result, Exception):
-                    logger.error(f"Chunk domain error: {result}")
-                else:
-                    all_results.append(result)
-            
-            pbar.update(len(chunk_rows))
-            
-            # ============ GPU CLEANUP BETWEEN CHUNKS ============
+    results_lock = asyncio.Lock()  # Protects concurrent appends to all_results
+
+    # -----------------------------------------------------------------------
+    # Shared queue between Stage 1 and Stage 2.
+    # max size = OCR_workers * 2  so Stage 1 doesn't race far ahead and eat RAM.
+    # -----------------------------------------------------------------------
+    OCR_QUEUE_DEPTH = MAX_CONCURRENT_OCR * 2
+    queue: asyncio.Queue = asyncio.Queue(maxsize=OCR_QUEUE_DEPTH)
+    DONE_SENTINEL = None  # Tells OCR workers to stop
+
+    screenshot_sem = _get_screenshot_semaphore()
+
+    # -----------------------------------------------------------------------
+    # Stage 1 Worker — one per domain (gated by screenshot_sem)
+    # -----------------------------------------------------------------------
+    async def stage1_worker(row, pbar):
+        """Network features + screenshot, then enqueue for Stage 2."""
+        domain = row.get("Identified Phishing/Suspected Domain Name", "")
+
+        # --- Network features (fast, CPU-bound, async I/O) ---
+        try:
+            net_feats = await extract_network_features_async(domain, network_semaphore)
+        except Exception as e:
+            logger.error("[Stage1] Network failed for %s: %s", domain, e)
+            net_feats = {}
+
+        # --- Screenshot (gated by screenshot_sem) ---
+        ext = tldextract.extract(domain)
+        domain_full = ".".join(p for p in [ext.domain, ext.suffix] if p) or domain
+        screenshot_path = os.path.join(SCREENS_DIR, f"{domain_full}.png")
+
+        from .visual_features import capture_screenshot_async
+        async with screenshot_sem:
             try:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                gc.collect()
-                logger.debug(f"🧹 GPU cleanup after chunk {chunk_idx + 1}")
-            except Exception:
-                pass
-    
-    # Write all results to CSV
+                target_url, capture_ok = await capture_screenshot_async(domain, screenshot_path)
+            except Exception as e:
+                logger.error("[Stage1] Screenshot failed for %s: %s", domain, e)
+                target_url, capture_ok = domain, False
+
+        if not capture_ok:
+            # Write a placeholder so Stage 2 still has a file to process
+            await asyncio.to_thread(_create_dummy_image, domain, screenshot_path)
+            target_url = domain
+
+        row_meta = {
+            "Cooresponding CSE": row.get("Cooresponding CSE", ""),
+            "Legitimate Domains": row.get("Legitimate Domains", ""),
+        }
+
+        # Put into Stage 2 queue (will block if queue is full — natural backpressure)
+        await queue.put((net_feats, screenshot_path, target_url, row_meta))
+        pbar.update(1)
+
+    # -----------------------------------------------------------------------
+    # Stage 2 Worker — OCR-gated consumer (MAX_CONCURRENT_OCR instances)
+    # -----------------------------------------------------------------------
+    async def stage2_worker():
+        """OCR + branding + laplacian, one domain at a time per worker."""
+        from .utils import (
+            _safe_preprocess_image, _safe_run_ocr,
+            _safe_extract_branding, _safe_extract_laplacian,
+        )
+        loop = asyncio.get_running_loop()
+        while True:
+            item = await queue.get()
+            if item is DONE_SENTINEL:
+                queue.task_done()
+                break
+
+            net_feats, screenshot_path, target_url, row_meta = item
+            try:
+                # ── Phase A: CPU preprocess + branding + laplacian in PARALLEL ──
+                # All three are CPU-only — no GPU, no lock needed.
+                # While a different worker holds _ocr_lock and runs GPU inference,
+                # THIS worker preprocesses its next image concurrently.
+                img_np, branding_feats, lap_var = await asyncio.gather(
+                    loop.run_in_executor(None, _safe_preprocess_image, screenshot_path),
+                    loop.run_in_executor(None, _safe_extract_branding, screenshot_path),
+                    loop.run_in_executor(None, _safe_extract_laplacian, screenshot_path),
+                )
+
+                # ── Phase B: GPU inference — minimal lock scope ──────────────
+                # _ocr_lock is held ONLY inside reader.readtext(img_np).
+                # While this worker waits for the lock, other workers run Phase A.
+                await wait_for_vram(min_free_gb=1.5)
+                ocr_text = await loop.run_in_executor(None, _safe_run_ocr, img_np)
+
+                # ── Favicon (async network, runs after GPU is free) ──────────
+                try:
+                    fav_feats = await get_favicon_features_async(target_url)
+                    if fav_feats:
+                        fav_feats.pop("favicon_path", None)
+                    else:
+                        fav_feats = {}
+                except Exception:
+                    fav_feats = {}
+
+                merged = {
+                    **row_meta,
+                    **net_feats,
+                    "url": target_url,
+                    "ocr_text": ocr_text or "",
+                    "laplacian_variance": lap_var,
+                    **(branding_feats or {}),
+                    **fav_feats,
+                }
+
+                async with results_lock:
+                    all_results.append(merged)
+
+            except Exception as e:
+                logger.error("[Stage2] Unexpected error for %s: %s", target_url, e)
+            finally:
+                queue.task_done()
+                try:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    gc.collect()
+                except Exception:
+                    pass
+
+    # -----------------------------------------------------------------------
+    # Orchestrate: launch both stages concurrently
+    # -----------------------------------------------------------------------
+    with tqdm(
+        total=total_domains,
+        desc="📦 Stage1: Screenshots",
+        unit="domain",
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+        position=1,
+        leave=False,
+    ) as pbar:
+        # Launch Stage 2 OCR workers first (they wait on the queue)
+        stage2_tasks = [
+            asyncio.create_task(stage2_worker())
+            for _ in range(MAX_CONCURRENT_OCR)
+        ]
+
+        # Launch Stage 1: all domains, but gated by screenshot_sem
+        stage1_coros = [stage1_worker(row, pbar) for row in rows]
+        await asyncio.gather(*stage1_coros, return_exceptions=True)
+
+    # Signal Stage 2 workers to stop (one sentinel per worker)
+    for _ in range(MAX_CONCURRENT_OCR):
+        await queue.put(DONE_SENTINEL)
+
+    # Wait for all Stage 2 workers to finish draining the queue
+    logger.info("⏳ Stage 1 complete. Waiting for %d OCR workers to finish...", MAX_CONCURRENT_OCR)
+    await asyncio.gather(*stage2_tasks, return_exceptions=True)
+
+    # Final GPU cleanup after all OCR is done
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+        logger.debug("🧹 Final GPU cleanup complete")
+    except Exception:
+        pass
+
+    # Write results to CSV
     if all_results:
         with open(output_csv, mode="w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=list(all_results[0].keys()))
@@ -448,8 +561,8 @@ async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=Non
     else:
         with open(output_csv, mode="w", newline="", encoding="utf-8") as f:
             pass
-    
-    logger.info(f"✅ Phase 1 complete: {len(all_results)} domains processed")
+
+    logger.info("✅ Phase 1 complete: %d / %d domains processed", len(all_results), total_domains)
     return output_csv
 
 # ------------------------------------------------------------------

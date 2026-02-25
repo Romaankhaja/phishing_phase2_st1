@@ -34,8 +34,9 @@ _context: BrowserContext | None = None
 
 # _async_* variables are now handled by AsyncBrowserManager class
 _ocr_reader: easyocr.Reader | None = None
-_ocr_call_count: int = 0  # Counter for periodic GPU cache cleanup
-_ocr_lock = threading.Lock()  # Global lock for thread-safe OCR access
+_ocr_call_count: int = 0  # Counter for periodic GPU cache cleanup & reader reset
+_OCR_RESET_INTERVAL: int = 20  # Re-init OCR reader every N calls to prevent VRAM fragmentation
+_ocr_lock = threading.Lock()  # Global lock for thread-safe OCR access (MUST wrap ALL CUDA ops)
 
 logger = logging.getLogger(__name__)
 
@@ -154,24 +155,31 @@ class AsyncBrowserManager:
         
     async def get_context(self) -> AsyncBrowserContext:
         """
-        Returns a valid, open browser context. 
-        Restarts the browser if the current context is closed or missing.
+        Returns a valid, open browser context.
+        Uses a fast path (no lock) when browser is healthy to avoid serializing
+        all concurrent screenshot tasks through a single asyncio.Lock.
+        Restarts the browser if it has crashed or disconnected.
         """
+        # ── Fast path (lock-free): most calls land here ──
+        try:
+            if self._context and self._browser and self._browser.is_connected():
+                return self._context
+        except Exception:
+            pass  # Fall through to slow path
+
+        # ── Slow path: serialized restart under lock ──
         async with self._lock:
-            # Check if current context exists and is open
+            # Re-check inside lock — another coroutine may have already restarted it
+            try:
+                if self._context and self._browser and self._browser.is_connected():
+                    return self._context
+            except Exception:
+                pass
+
             if self._context:
-                try:
-                    # There is no direct .is_closed() on AsyncBrowserContext in all versions, 
-                    # but if browser is connected, context is likely fine.
-                    if self._browser and self._browser.is_connected():
-                        return self._context
-                except Exception:
-                    pass
-                
-                logger.warning("⚠️ Found closed or disconnected browser context. Restarting...")
+                logger.warning("⚠️ Browser context closed/disconnected. Restarting...")
                 await self._force_close()
 
-            # Initialize new one
             return await self._start_new_session()
 
     async def _start_new_session(self) -> AsyncBrowserContext:
@@ -560,89 +568,94 @@ async def get_favicon_features_async(url):
         pass
     return feats
 
-# ------------------ OCR (EasyOCR) ------------------
-def extract_ocr_text(image_path: str) -> str:
+# ─────────────────────────────────────────────────────────────────────────────
+# OCR is split into two phases to maximise GPU utilisation:
+#
+#  Phase A: preprocess_image_for_ocr()  ← CPU only, NO lock, runs in parallel
+#           Load image → grayscale → downscale → numpy array
+#
+#  Phase B: run_ocr_inference()         ← GPU, holds _ocr_lock for minimum time
+#           Only reader.readtext() is inside the lock
+#
+# pipeline.py Stage 2 calls A in parallel (executor), then B serially (executor).
+# While GPU is busy for worker A, workers B and C are already running Phase A.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def preprocess_image_for_ocr(image_path: str):
     """
-    Extract visible text from screenshot using EasyOCR.
-    
-    Performs text recognition on full page screenshot.
-    Results are normalized and whitespace-cleaned.
-    
-    Args:
-        image_path: Path to screenshot file
-    
-    Returns:
-        Extracted text string (empty if extraction fails)
+    Phase A — CPU only, NO GPU lock required.
+    Loads, converts to grayscale, and downscales the screenshot.
+    Returns a numpy array ready for EasyOCR, or None on failure.
     """
-    global _ocr_call_count
-    
-    def _do_ocr(img_np):
-        """Inner function to perform OCR (serialized check for thread safety)."""
-        # EasyOCR/PyTorch CUDA operations are not thread-safe on the same context
-        with _ocr_lock:
-            try:
-                reader = _get_ocr_reader()
-                results = reader.readtext(img_np, detail=0)  # detail=0 → only text
-                txt = " ".join(results)
-                return re.sub(r"\s+", " ", txt).strip()
-            finally:
-                # Aggressive Cleanup: Free VRAM immediately after use
-                # This prevents OOM when switching contexts or queuing multiple 4GB tasks
-                torch.cuda.empty_cache()
-                import gc
-                gc.collect()
-    
     try:
         if not os.path.exists(image_path):
-            logger.warning("Image file not found for OCR: %s", image_path)
-            return ""
-        
-        # Optimize image for OCR to save VRAM
-        img = Image.open(image_path).convert('L') # Convert to grayscale
-        
-        # Downscale if too large (limit width to 800px for 2GB VRAM)
+            logger.warning("Image not found for OCR preprocess: %s", image_path)
+            return None
+        img = Image.open(image_path).convert('L')  # Grayscale
         max_width = 800
         if img.width > max_width:
             ratio = max_width / img.width
-            new_height = int(img.height * ratio)
-            img = img.resize((max_width, new_height), Image.Resampling.LANCZOS)
-        
-        # Force cleanup BEFORE OCR if counter is high
-        if _ocr_call_count > 0 and _ocr_call_count % 3 == 0:
-            torch.cuda.empty_cache()
-            import gc
-            gc.collect()
-            
-        img_np = np.array(img)
-        
-        # Try OCR with OOM retry safeguard
-        try:
-            txt = _do_ocr(img_np)
-        except torch.cuda.OutOfMemoryError:
-            logger.warning("⚠️ CUDA OOM during OCR, clearing cache and retrying...")
-            torch.cuda.empty_cache()
-            import gc
-            gc.collect()
-            txt = _do_ocr(img_np)  # Retry after cleanup
-        
-        return txt
-        
-    except FileNotFoundError:
-        logger.warning("Image file not found for OCR: %s", image_path)
-        return ""
+            img = img.resize((max_width, int(img.height * ratio)), Image.Resampling.LANCZOS)
+        return np.array(img)
     except Exception as e:
-        logger.error("OCR extraction failed for %s: %s", image_path, e)
+        logger.error("OCR preprocess failed for %s: %s", image_path, e)
+        return None
+
+
+def run_ocr_inference(img_np) -> str:
+    """
+    Phase B — GPU serialized. Holds _ocr_lock ONLY for reader.readtext().
+    Call this after preprocess_image_for_ocr() has already returned img_np.
+    """
+    global _ocr_call_count, _ocr_reader
+    import gc
+
+    if img_np is None:
         return ""
-    finally:
-        # Aggressive GPU cleanup (every 3 OCR calls)
-        _ocr_call_count += 1
-        if _ocr_call_count % 3 == 0:
-            try:
-                torch.cuda.empty_cache()
-                import gc
-                gc.collect()
-            except Exception:
-                pass
+
+    with _ocr_lock:
+        # Periodic reader reset to clear VRAM fragmentation
+        if _ocr_call_count > 0 and _ocr_call_count % _OCR_RESET_INTERVAL == 0:
+            logger.info("🔄 OCR reader reset (call #%d) to clear VRAM fragmentation", _ocr_call_count)
+            _ocr_reader = None
+            torch.cuda.empty_cache()
+            gc.collect()
+
+        # Log VRAM state for debugging
+        if torch.cuda.is_available():
+            free_mb, total_mb = torch.cuda.mem_get_info()
+            logger.debug("[OCR #%d] VRAM free: %.0fMB / %.0fMB",
+                         _ocr_call_count, free_mb / 1e6, total_mb / 1e6)
+
+        try:
+            reader = _get_ocr_reader()
+            results = reader.readtext(img_np, detail=0)
+            txt = " ".join(results)
+            return re.sub(r"\s+", " ", txt).strip()
+        except torch.cuda.OutOfMemoryError:
+            logger.warning("⚠️ CUDA OOM during OCR inference (call #%d). Clearing cache and retrying...",
+                           _ocr_call_count)
+            torch.cuda.empty_cache()
+            gc.collect()
+            _ocr_reader = None
+            reader = _get_ocr_reader()
+            results = reader.readtext(img_np, detail=0)
+            txt = " ".join(results)
+            return re.sub(r"\s+", " ", txt).strip()
+        finally:
+            # Flush VRAM inside the lock — safe, serialized
+            torch.cuda.empty_cache()
+            gc.collect()
+            _ocr_call_count += 1
+
+
+def extract_ocr_text(image_path: str) -> str:
+    """
+    Combined convenience wrapper (single-threaded / backward compat).
+    For the two-stage pipeline, call preprocess_image_for_ocr() + run_ocr_inference() separately.
+    """
+    img_np = preprocess_image_for_ocr(image_path)
+    return run_ocr_inference(img_np)
 
 # ------------------ Sharpness ------------------
 def laplacian_variance(image_path: str, min_size: int = 50) -> float:
