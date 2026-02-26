@@ -113,6 +113,14 @@ MAX_CONCURRENT_RDAP = 10           # Moderate (polite)
 MAX_CONCURRENT_WHOIS = 2           # Strict (1 per IP) but safe with parallel flow
 MAX_CONCURRENT_DNS_PREFILTER = 200  # Fast (network bound)
 
+# ================== STAGE-1 LAUNCH THROTTLE ==================
+# Limits how many Stage-1 domain tasks (network feats + screenshot) start
+# simultaneously. Without this, all N asyncio tasks launch at once, causing
+# a CPU burst before Stage-2 OCR workers can consume anything.
+# Set to 2× screenshot concurrency so Stage-1 always keeps OCR workers fed
+# without drowning them.
+STAGE1_LAUNCH_CONCURRENCY = MAX_CONCURRENT_SCREENSHOTS * 2
+
 _ocr_semaphore: asyncio.Semaphore | None = None
 _screenshot_semaphore: asyncio.Semaphore | None = None
 _image_semaphore: asyncio.Semaphore | None = None
@@ -120,6 +128,7 @@ _cpu_semaphore: asyncio.Semaphore | None = None
 _rdap_semaphore: asyncio.Semaphore | None = None
 _whois_semaphore: asyncio.Semaphore | None = None
 _dns_prefilter_semaphore: asyncio.Semaphore | None = None
+_stage1_launch_semaphore: asyncio.Semaphore | None = None
 
 def _get_ocr_semaphore() -> asyncio.Semaphore:
     global _ocr_semaphore
@@ -162,6 +171,13 @@ def _get_dns_prefilter_semaphore() -> asyncio.Semaphore:
     if _dns_prefilter_semaphore is None:
         _dns_prefilter_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DNS_PREFILTER)
     return _dns_prefilter_semaphore
+
+def _get_stage1_launch_semaphore() -> asyncio.Semaphore:
+    """Returns the semaphore that throttles Stage-1 task launches."""
+    global _stage1_launch_semaphore
+    if _stage1_launch_semaphore is None:
+        _stage1_launch_semaphore = asyncio.Semaphore(STAGE1_LAUNCH_CONCURRENCY)
+    return _stage1_launch_semaphore
 
 # ================== VRAM-AWARE OCR GATE ==================
 

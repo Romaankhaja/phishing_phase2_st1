@@ -43,10 +43,13 @@ from .utils import (
     MAX_CONCURRENT_RDAP, MAX_CONCURRENT_WHOIS, MAX_CONCURRENT_DNS_PREFILTER,
     _get_rdap_semaphore, _get_whois_semaphore, _get_dns_prefilter_semaphore,
     CHUNK_SIZE,
-    extract_network_features_async, extract_visual_features_async,
-    wait_for_vram, _resource_monitor,
-    _get_screenshot_semaphore, _get_ocr_semaphore,
     MAX_CONCURRENT_OCR, MAX_CONCURRENT_SCREENSHOTS,
+    _get_screenshot_semaphore,
+    wait_for_vram,
+    extract_network_features_async,
+    _create_dummy_image,
+    STAGE1_LAUNCH_CONCURRENCY,
+    _get_stage1_launch_semaphore,
 )
 
 # ------------------------------------------------------------------
@@ -350,22 +353,21 @@ def adjust_source(org_name, whitelisted_domain, ml_source="Unknown"):
 # ------------------------------------------------------------------
 # CHUNK_SIZE is imported from .utils (calculated dynamically)
 
-async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=None):
+async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=None, phase2_queue=None):
     """
-    Two-Stage Producer-Consumer Feature Extraction Pipeline.
+    Three-Stage Producer-Consumer Feature Extraction Pipeline.
 
     Stage 1 — Screenshot Workers  (parallelism = MAX_CONCURRENT_SCREENSHOTS)
+        - Throttled by stage1_launch_sem so network tasks don't all fire at once
         - Runs network features + browser screenshot in parallel
-        - Frees browser page slot immediately after screenshot is saved
-        - Pushes (net_feats, screenshot_path, row_meta) into a bounded asyncio.Queue
+        - Pushes (net_feats, screenshot_path, row_meta) into Queue-1
 
     Stage 2 — OCR Workers         (parallelism = MAX_CONCURRENT_OCR, VRAM-gated)
-        - Pulls from Queue one item at a time per worker
-        - Checks available VRAM before dispatching via wait_for_vram()
-        - Runs OCR + branding + laplacian in executor (truly serialized by _ocr_lock)
-        - Appends merged result to shared results list
+        - Pulls from Queue-1, runs OCR/branding/laplacian
+        - Pushes merged feature dict into phase2_queue (Queue-2)
 
-    This decoupling means fast stages never idle-wait on slow GPU stages.
+    The caller (run_pipeline) provides phase2_queue and runs Phase 2 workers
+    against it concurrently, so WHOIS/RDAP starts as soon as first OCR finishes.
     """
     import csv
     import gc
@@ -378,15 +380,15 @@ async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=Non
     df = pd.read_csv(input_csv)
     total_domains = len(df)
     logger.info(
-        "⚙️  Starting Two-Stage Pipeline for %d domains "
-        "(Stage1 workers=%d, Stage2 OCR workers=%d)...",
-        total_domains, MAX_CONCURRENT_SCREENSHOTS, MAX_CONCURRENT_OCR
+        "⚙️  Starting 3-Stage Pipeline for %d domains "
+        "(Stage1=%d, OCR=%d, Phase2=%d)...",
+        total_domains, MAX_CONCURRENT_SCREENSHOTS, MAX_CONCURRENT_OCR, MAX_CONCURRENT_RDAP
     )
 
     if df.empty:
         with open(output_csv, mode="w", newline="", encoding="utf-8") as f:
             pass
-        return output_csv
+        return
 
     if network_semaphore is None:
         network_semaphore = asyncio.Semaphore(50)
@@ -410,47 +412,52 @@ async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=Non
     # -----------------------------------------------------------------------
     async def stage1_worker(row, pbar):
         """Network features + screenshot, then enqueue for Stage 2."""
-        domain = row.get("Identified Phishing/Suspected Domain Name", "")
+        async with _get_stage1_launch_semaphore():   # Throttle launch burst
+            domain = row.get("Identified Phishing/Suspected Domain Name", "")
 
-        # --- Network features (fast, CPU-bound, async I/O) ---
-        try:
-            net_feats = await extract_network_features_async(domain, network_semaphore)
-        except Exception as e:
-            logger.error("[Stage1] Network failed for %s: %s", domain, e)
-            net_feats = {}
-
-        # --- Screenshot (gated by screenshot_sem) ---
-        ext = tldextract.extract(domain)
-        domain_full = ".".join(p for p in [ext.domain, ext.suffix] if p) or domain
-        screenshot_path = os.path.join(SCREENS_DIR, f"{domain_full}.png")
-
-        from .visual_features import capture_screenshot_async
-        async with screenshot_sem:
+            # --- Network features (fast, CPU-bound, async I/O) ---
             try:
-                target_url, capture_ok = await capture_screenshot_async(domain, screenshot_path)
+                net_feats = await extract_network_features_async(domain, network_semaphore)
             except Exception as e:
-                logger.error("[Stage1] Screenshot failed for %s: %s", domain, e)
-                target_url, capture_ok = domain, False
+                logger.error("[Stage1] Network failed for %s: %s", domain, e)
+                net_feats = {}
 
-        if not capture_ok:
-            # Write a placeholder so Stage 2 still has a file to process
-            await asyncio.to_thread(_create_dummy_image, domain, screenshot_path)
-            target_url = domain
+            # --- Screenshot (gated by screenshot_sem) ---
+            ext = tldextract.extract(domain)
+            domain_full = ".".join(p for p in [ext.domain, ext.suffix] if p) or domain
+            screenshot_path = os.path.join(SCREENS_DIR, f"{domain_full}.png")
 
-        row_meta = {
-            "Cooresponding CSE": row.get("Cooresponding CSE", ""),
-            "Legitimate Domains": row.get("Legitimate Domains", ""),
-        }
+            from .visual_features import capture_screenshot_async
+            async with screenshot_sem:
+                try:
+                    target_url, capture_ok = await capture_screenshot_async(domain, screenshot_path)
+                except Exception as e:
+                    logger.error("[Stage1] Screenshot failed for %s: %s", domain, e)
+                    target_url, capture_ok = domain, False
 
-        # Put into Stage 2 queue (will block if queue is full — natural backpressure)
-        await queue.put((net_feats, screenshot_path, target_url, row_meta))
-        pbar.update(1)
+            if not capture_ok:
+                # Write a placeholder so Stage 2 still has a file to process
+                await asyncio.to_thread(_create_dummy_image, domain, screenshot_path)
+                target_url = domain
+
+            row_meta = {
+                "Cooresponding CSE": row.get("Cooresponding CSE", ""),
+                "Legitimate Domains": row.get("Legitimate Domains", ""),
+            }
+
+            # Put into OCR queue (will block if queue is full — natural backpressure)
+            await queue.put((net_feats, screenshot_path, target_url, row_meta))
+            pbar.update(1)
 
     # -----------------------------------------------------------------------
     # Stage 2 Worker — OCR-gated consumer (MAX_CONCURRENT_OCR instances)
     # -----------------------------------------------------------------------
-    async def stage2_worker():
-        """OCR + branding + laplacian, one domain at a time per worker."""
+    async def stage2_worker(queue2):
+        """OCR + branding + laplacian, one domain at a time per worker.
+        
+        Pushes the fully-merged feature dict into queue2 so Phase 2
+        (WHOIS/RDAP/DNS/classify) can stream it immediately.
+        """
         from .utils import (
             _safe_preprocess_image, _safe_run_ocr,
             _safe_extract_branding, _safe_extract_laplacian,
@@ -465,18 +472,13 @@ async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=Non
             net_feats, screenshot_path, target_url, row_meta = item
             try:
                 # ── Phase A: CPU preprocess + branding + laplacian in PARALLEL ──
-                # All three are CPU-only — no GPU, no lock needed.
-                # While a different worker holds _ocr_lock and runs GPU inference,
-                # THIS worker preprocesses its next image concurrently.
                 img_np, branding_feats, lap_var = await asyncio.gather(
                     loop.run_in_executor(None, _safe_preprocess_image, screenshot_path),
                     loop.run_in_executor(None, _safe_extract_branding, screenshot_path),
                     loop.run_in_executor(None, _safe_extract_laplacian, screenshot_path),
                 )
 
-                # ── Phase B: GPU inference — minimal lock scope ──────────────
-                # _ocr_lock is held ONLY inside reader.readtext(img_np).
-                # While this worker waits for the lock, other workers run Phase A.
+                # ── Phase B: GPU inference ──────────────────────────────────
                 await wait_for_vram(min_free_gb=1.5)
                 ocr_text = await loop.run_in_executor(None, _safe_run_ocr, img_np)
 
@@ -500,8 +502,8 @@ async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=Non
                     **fav_feats,
                 }
 
-                async with results_lock:
-                    all_results.append(merged)
+                # Push into Phase 2 queue for immediate WHOIS/RDAP processing
+                await queue2.put(merged)
 
             except Exception as e:
                 logger.error("[Stage2] Unexpected error for %s: %s", target_url, e)
@@ -515,7 +517,9 @@ async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=Non
                     pass
 
     # -----------------------------------------------------------------------
-    # Orchestrate: launch both stages concurrently
+    # Orchestrate: launch all 3 stages concurrently
+    #   Stage 1  → queue  → Stage 2 (OCR)  → phase2_queue  → Phase 2 (WHOIS/RDAP)
+    # phase2_queue is passed in by run_pipeline, which also manages Phase 2 workers.
     # -----------------------------------------------------------------------
     with tqdm(
         total=total_domains,
@@ -525,22 +529,21 @@ async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=Non
         position=1,
         leave=False,
     ) as pbar:
-        # Launch Stage 2 OCR workers first (they wait on the queue)
+        # Launch Stage 2 OCR workers first (they wait on queue; push into phase2_queue)
         stage2_tasks = [
-            asyncio.create_task(stage2_worker())
+            asyncio.create_task(stage2_worker(phase2_queue))
             for _ in range(MAX_CONCURRENT_OCR)
         ]
 
-        # Launch Stage 1: all domains, but gated by screenshot_sem
+        # Launch Stage 1: all domains, throttled by stage1_launch_sem
         stage1_coros = [stage1_worker(row, pbar) for row in rows]
         await asyncio.gather(*stage1_coros, return_exceptions=True)
 
-    # Signal Stage 2 workers to stop (one sentinel per worker)
+    # Signal Stage 2 (OCR) workers to stop
     for _ in range(MAX_CONCURRENT_OCR):
         await queue.put(DONE_SENTINEL)
 
-    # Wait for all Stage 2 workers to finish draining the queue
-    logger.info("⏳ Stage 1 complete. Waiting for %d OCR workers to finish...", MAX_CONCURRENT_OCR)
+    logger.info("⏳ Screenshots done. Waiting for %d OCR workers to flush → Phase 2...", MAX_CONCURRENT_OCR)
     await asyncio.gather(*stage2_tasks, return_exceptions=True)
 
     # Final GPU cleanup after all OCR is done
@@ -552,18 +555,7 @@ async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=Non
     except Exception:
         pass
 
-    # Write results to CSV
-    if all_results:
-        with open(output_csv, mode="w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(all_results[0].keys()))
-            writer.writeheader()
-            writer.writerows(all_results)
-    else:
-        with open(output_csv, mode="w", newline="", encoding="utf-8") as f:
-            pass
-
-    logger.info("✅ Phase 1 complete: %d / %d domains processed", len(all_results), total_domains)
-    return output_csv
+    logger.info("✅ Phase 1 complete: %d domains through OCR. Phase 2 may still be running.", total_domains)
 
 # ------------------------------------------------------------------
 # Visual feature extraction (REMOVED)
@@ -743,417 +735,297 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
         position=0
     )
     
-    # ================== PHASE 1: Feature Extraction (60% of total work) ==================
-    logger.info("\n" + "="*60)
-    logger.info("📊 PHASE 1: Feature Extraction")
-    logger.info("="*60)
-    
-    phase1_start = time.time()
-    await process_urls(temp_csv_path, FEATURES_CSV, network_semaphore)
-    df_features = pd.read_csv(FEATURES_CSV)
-    df_features = enrich_with_geoip(df_features, ASN_DB_PATH, CITY_DB_PATH)
-    df_features.to_csv(FEATURES_ENRICH, index=False, encoding="utf-8")
-    phase1_time = time.time() - phase1_start
-    
-    master_pbar.update(60)  # Phase 1 = 60% of work
-    logger.info("✅ Phase 1 Complete: %d domains in %.1f seconds", len(df_features), phase1_time)
-
-    # ---------------- Load models ----------------
+    # ================== PRE-LOAD MODELS (batch, fast) ==================
+    logger.info("🔧 Pre-loading ML models...")
     model_label, model_source, le_label, source_classes, feature_cols, scaler, imputer = load_models_and_preproc()
 
-    # ---------------- Numeric features ----------------
-    # Fill NaN in ocr_text before selection, just in case
-    df_features['ocr_text'] = df_features['ocr_text'].fillna("")
-    
-    X_num = df_features.reindex(columns=feature_cols, fill_value=0)
-    X_num_imputed = imputer.transform(X_num)
-    X_num_scaled = scaler.transform(X_num_imputed)
+    # ================== PHASE 1 + PHASE 2 STREAMING (fully overlapped) ==================
+    logger.info("\n" + "="*70)
+    logger.info("📊 STREAMING PIPELINE: Phase 1 (OCR) ↔ Phase 2 (WHOIS/RDAP) overlapped")
+    logger.info("="*70)
 
-    # ---------------- Text TF-IDF features (if you had them) ----------------
-    # (Assuming no TF-IDF based on your model_utils.py)
-    X_all = X_num_scaled
+    phase1_start = time.time()
 
-    # ---------------- Predict labels ----------------
-    # We still need to *predict* the label to use it, even if we don't save it.
-    y_pred_label = model_label.predict(X_all)
-    predicted_labels = le_label.inverse_transform(y_pred_label)
-    # df_features["Predicted Label"] = predicted_labels # We no longer save this
+    # ── Shared state for Phase 2 workers ──────────────────────────────────
+    all_records = []      # Final assembled submission rows
+    records_lock = asyncio.Lock()
+    rdap_times: list = []
+    whois_times: list = []
+    live_hosts: set = set()
+    dns_map: dict = {}
+    serial_counter = [0]  # mutable int for evidence serial numbers
 
-    # ---------------- Predict sources ----------------
-    y_pred_source = model_source.predict(X_all)
-    predicted_sources = [source_classes[i] for i in y_pred_source]
-    df_features["Predicted Source"] = predicted_sources
-
-    # ---------------- Adjust sources (heuristic) ----------------
-    adjusted_sources = [
-        adjust_source(org, dom, ml_source)
-        # --- Use the new column names ---
-        for org, dom, ml_source in zip(df_features["Cooresponding CSE"], df_features["Legitimate Domains"], df_features["Predicted Source"])
-    ]
-
-    # ================== PHASE 2: WHOIS & Classification (35% of total work) ==================
-    phase2_start = time.time()
-    logger.info("\n" + "="*60)
-    logger.info("📊 PHASE 2: WHOIS & Classification (3-Pass Parallel)")
-    logger.info("="*60)
-    
-    records = []
-    rdap_times = []   # Track RDAP lookup durations
-    whois_times = []  # Track WHOIS fallback durations
-    total_domains = len(df_features)
-
-    # --- Build host list from feature URLs ---
-    host_list = []
-    for idx, row in df_features.iterrows():
-        domain_url = row["url"]
-        host = urlparse(domain_url).hostname or domain_url
-        host = host.split(':')[0]
-        host_list.append(host)
-
-    # ======================== PASS 1: Parallel Registration Data ========================
-    logger.info("⚡ Pass 1: Parallel Registration Data (%d domains)...", total_domains)
-    
-    # Semaphores
-    rdap_sem = _get_rdap_semaphore()
+    # Semaphores for Phase 2 lookups (reuse the singletons from utils)
+    rdap_sem  = _get_rdap_semaphore()
     whois_sem = _get_whois_semaphore()
-    dns_sem = _get_dns_prefilter_semaphore()
-    
-    # helper for RDAP URL
+    dns_sem   = _get_dns_prefilter_semaphore()
+
     def _get_rdap_url(host):
         ext = tldextract.extract(host)
         tld = ext.suffix.split(".")[-1] if ext.suffix else ""
         return RDAP_DIRECT_URLS.get(tld, RDAP_FALLBACK_URL)
 
-    live_hosts = set()
-    rdap_times = []
-    live_hosts = set()
-    dns_map = {} # host -> ip or None
-    
-    async def process_reg_data(host, client):
+    # ── Phase 2 per-domain coroutine ─────────────────────────────────────
+    async def _process_single_domain_phase2(feat_row: dict, client: httpx.AsyncClient):
         """
-        Single flow: DNS -> RDAP -> WHOIS
-        Returns: (host, status, data, ip)
+        RDAP → WHOIS → DNS records → GeoIP → ML classify → evidence PDF → record.
+        Runs concurrently for up to MAX_CONCURRENT_RDAP = 10 domains at a time.
         """
+        domain_url = feat_row.get("url", "")
+        host = urlparse(domain_url).hostname or domain_url
+        host = host.split(":")[0]
+
+        # ── 1. DNS Pre-check ──────────────────────────────────────────────
         resolved_ip = None
-        
-        # 1. DNS Pre-check
         async with dns_sem:
             try:
                 loop = asyncio.get_running_loop()
-                # Fast 3s timeout for DNS
                 resolved_ip = await asyncio.wait_for(
                     loop.run_in_executor(None, socket.gethostbyname, host),
                     timeout=3.0
                 )
             except Exception:
-                 return host, "DEAD", None, None
+                # Dead host — still assemble a record with NAs
+                pass
 
-        # 2. RDAP Lookup
+        # ── 2. RDAP lookup ────────────────────────────────────────────────
+        reg_data = None
+        lookup_method = "NONE"
         async with rdap_sem:
             try:
-                start = time.time()
+                t0 = time.time()
                 base_url = _get_rdap_url(host)
-                # RDAP is just HTTP GET
                 resp = await client.get(f"{base_url}{host}")
                 if resp.status_code == 200:
-                    data_json = resp.json()
-                    # Use existing parser
-                    result = _parse_rdap_to_fields(data_json)
-                    rdap_times.append(time.time() - start)
-                    return host, "RDAP", result, resolved_ip
+                    reg_data = _parse_rdap_to_fields(resp.json())
+                    lookup_method = "RDAP"
+                    async with records_lock:
+                        rdap_times.append(time.time() - t0)
                 elif resp.status_code == 429:
                     logger.warning("⚠️ RDAP 429 for %s", host)
             except Exception:
                 pass
 
-        # 3. WHOIS Fallback (if RDAP failed)
-        async with whois_sem:
-            # Respect rate limits
-            await whois_rate_limiter.acquire()
+        # ── 3. WHOIS fallback (only if RDAP failed and host resolves) ─────
+        if reg_data is None and resolved_ip is not None:
+            async with whois_sem:
+                await whois_rate_limiter.acquire()
+                try:
+                    loop = asyncio.get_running_loop()
+                    t0 = time.time()
+                    w = await asyncio.wait_for(
+                        loop.run_in_executor(None, whois.whois, host),
+                        timeout=5.0
+                    )
+                    if w:
+                        cd = w.creation_date
+                        if isinstance(cd, list): cd = cd[0]
+                        reg_data = {
+                            "reg_date": str(cd) if cd else "NA",
+                            "registrar": w.registrar or "NA",
+                            "registrant_name": w.name or w.org or getattr(w, "registrant_name", None) or "NA",
+                            "registrant_country": w.country or "NA",
+                            "name_servers": ";".join(str(ns) for ns in w.name_servers) if w.name_servers else "NA",
+                        }
+                        lookup_method = "WHOIS"
+                        async with records_lock:
+                            whois_times.append(time.time() - t0)
+                except Exception:
+                    pass
+
+        # ── 4. DNS records batch ──────────────────────────────────────────
+        dns_records = "NA"
+        if resolved_ip is not None:
+            async with dns_sem:
+                try:
+                    loop = asyncio.get_running_loop()
+                    def _resolve_sync():
+                        results = []
+                        for qtype in ["A", "NS", "MX", "CNAME"]:
+                            try:
+                                answers = dns.resolver.resolve(host, qtype, lifetime=2.0)
+                                results.extend([f"{qtype}:{r.to_text()}" for r in answers])
+                            except Exception:
+                                pass
+                        return ";".join(results) if results else "NA"
+                    dns_records = await loop.run_in_executor(None, _resolve_sync)
+                except Exception:
+                    pass
+
+        # ── 5. Resolve registration fields ────────────────────────────────
+        rd = reg_data or {}
+        reg_date            = rd.get("reg_date", "NA")
+        registrar           = rd.get("registrar", "NA")
+        registrant_name     = rd.get("registrant_name", "NA")
+        registrant_country  = rd.get("registrant_country", "NA")
+        name_servers        = rd.get("name_servers", "NA")
+
+        # ── 6. IP / GeoIP from feature dict (already enriched) ───────────
+        ip = "NA"
+        ip_from_feats = feat_row.get("ip_address")
+        if ip_from_feats and not pd.isna(ip_from_feats):
+            ip = str(ip_from_feats)
+        elif resolved_ip:
+            ip = resolved_ip
+
+        hosting_isp     = str(feat_row.get("asn_org", "NA")) if feat_row.get("asn_org") and not pd.isna(feat_row.get("asn_org")) else "NA"
+        hosting_country = str(feat_row.get("country", "NA"))  if feat_row.get("country")  and not pd.isna(feat_row.get("country"))  else "NA"
+
+        # ── 7. ML source prediction (per-domain, using pre-loaded models) ─
+        ml_source = "Unknown"
+        try:
+            row_series = pd.Series(feat_row)
+            X_row = row_series.reindex(feature_cols, fill_value=0).values.reshape(1, -1)
+            X_imp = imputer.transform(X_row)
+            X_sc  = scaler.transform(X_imp)
+            src_idx = model_source.predict(X_sc)[0]
+            ml_source = source_classes[src_idx]
+        except Exception:
+            pass
+
+        adjusted_src = adjust_source(
+            feat_row.get("Cooresponding CSE", ""),
+            feat_row.get("Legitimate Domains", ""),
+            ml_source,
+        )
+
+        # ── 8. Classification ─────────────────────────────────────────────
+        classification = reclassify_label(
+            domain_url, registrar, hosting_isp, dns_records,
+            feat_row.get("ocr_text", "")
+        )
+
+        # ── 9. Evidence PDF ───────────────────────────────────────────────
+        async with records_lock:
+            serial_counter[0] += 1
+            serial_no = serial_counter[0]
+
+        evidence_path, evidence_name = format_evidence_filename(
+            feat_row.get("Cooresponding CSE", "Unknown"),
+            domain_url, serial_no, application_id=APPLICATION_ID
+        )
+        await asyncio.to_thread(move_screenshot_to_evidence, domain_url, evidence_path)
+
+        detection_date = datetime.now().strftime("%d-%m-%Y")
+        detection_time_str = datetime.now().strftime("%H:%M:%S")
+
+        record = {
+            "Application_ID": APPLICATION_ID,
+            "Source of detection": adjusted_src,
+            "Identified Phishing/Suspected Domain Name": domain_url,
+            "Corresponding CSE Domain Name": feat_row.get("Legitimate Domains", ""),
+            "Critical Sector Entity Name": feat_row.get("Cooresponding CSE", ""),
+            "Phishing/Suspected Domains (i.e. Class Label)": classification,
+            "Domain Registration Date": reg_date,
+            "Registrar Name": registrar,
+            "Registrant Name or Registrant Organisation": registrant_name,
+            "Registrant Country": registrant_country,
+            "Name Servers": name_servers,
+            "Hosting IP": ip,
+            "Hosting ISP": hosting_isp,
+            "Hosting Country": hosting_country,
+            "DNS Records (if any)": dns_records,
+            "Evidence file name": evidence_name,
+            "Date of detection (DD-MM-YYYY)": detection_date,
+            "Time of detection (HH-MM-SS)": detection_time_str,
+            "Date of Post (If detection is from Source: social media)": "NA",
+            "Remarks": "NA values are due to privacy issues.",
+        }
+        async with records_lock:
+            all_records.append(record)
+        logger.debug("✅ Phase 2 done for %s [%s]", host, lookup_method)
+
+    # ── Phase 2 worker: drains queue2, one domain at a time per slot ─────
+    DONE_P2 = object()  # Sentinel to stop Phase 2 workers
+
+    async def phase2_worker(queue2: asyncio.Queue, client: httpx.AsyncClient):
+        while True:
+            item = await queue2.get()
+            if item is DONE_P2:
+                queue2.task_done()
+                break
             try:
-                loop = asyncio.get_running_loop()
-                start = time.time()
-                
-                # Strict 5s timeout for WHOIS
-                w = await asyncio.wait_for(
-                    loop.run_in_executor(None, whois.whois, host),
-                    timeout=5.0
-                )
-                
-                if w:
-                    # Parse WHOIS result (adapted from previous code)
-                    result = {}
-                    creation_date = w.creation_date
-                    if isinstance(creation_date, list): 
-                        creation_date = creation_date[0]
-                    result["reg_date"] = str(creation_date) if creation_date else "NA"
-                    result["registrar"] = w.registrar or "NA"
-                    result["registrant_name"] = w.name or w.org or getattr(w, 'registrant_name', None) or "NA"
-                    result["registrant_country"] = w.country or "NA"
-                    
-                    if w.name_servers:
-                        result["name_servers"] = ";".join(str(ns) for ns in w.name_servers)
-                    else:
-                        result["name_servers"] = "NA"
-                        
-                    whois_times.append(time.time() - start)
-                    return host, "WHOIS", result, resolved_ip
-            except asyncio.TimeoutError:
-                pass # Timeout = fail
-            except Exception:
-                pass # Other error = fail
-                
-        # If we got here, everything failed but DNS worked
-        return host, "FAIL", None, resolved_ip
-
-    # Run the parallel batch
-    rdap_results = {}
-    whois_results = {}
-
-    async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
-        tasks = [process_reg_data(h, client) for h in host_list]
-        
-        # Track progress
-        for f in tqdm(asyncio.as_completed(tasks), total=len(tasks), 
-                      desc="⚡ Reg Data", unit="domain",
-                      bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"):
-            host, status, data, ip = await f
-            
-            if status == "DEAD":
-                dns_map[host] = None # Explicitly mark as dead
-                continue 
-                
-            live_hosts.add(host)
-            dns_map[host] = ip # Store resolved IP
-            
-            if status == "RDAP":
-                rdap_results[host] = data
-            elif status == "WHOIS":
-                whois_results[host] = data
-            # FAIL means live but no reg data (will be NAs in output)
-
-    dns_time = 0 # Legacy var for logging
-    rdap_time = 0
-    whois_time = 0
-
-    # ======================== PASS 2.5: DNS Records Batch ========================
-    # NEW: Fetch DNS records (MX, NS, etc.) in parallel to speed up record building
-    logger.info("⚡ Pass 2.5: DNS Records Batch (%d domains)...", len(live_hosts))
-    dns_records_map = {} # host -> ";".join(records)
-
-    dns_sem_recs = _get_dns_prefilter_semaphore() # Re-use the high concurrency semaphore
-
-    async def _get_dns_records_async(host):
-        """Fetch A, NS, MX, CNAME records concurrently."""
-        if host not in live_hosts:
-            return host, "NA"
-        
-        async with dns_sem_recs:
-            try:
-                loop = asyncio.get_running_loop()
-                # Run resolver in thread pool to avoid blocking
-                def _resolve_sync():
-                    results = []
-                    for qtype in ["A", "NS", "MX", "CNAME"]:
-                        try:
-                            # shorter timeout for these checks
-                            answers = dns.resolver.resolve(host, qtype, lifetime=2.0)
-                            results.extend([f"{qtype}:{r.to_text()}" for r in answers])
-                        except:
-                            pass
-                    return ";".join(results) if results else "NA"
-
-                records_str = await loop.run_in_executor(None, _resolve_sync)
-                return host, records_str
+                # GeoIP enrichment inline (fast, CPU-only, no I/O)
+                feat_row = dict(item)
+                host_url = feat_row.get("url", "")
+                h = urlparse(host_url).hostname or host_url
+                h = h.split(":")[0]
+                feat_row = enrich_with_geoip(pd.DataFrame([feat_row]), ASN_DB_PATH, CITY_DB_PATH).iloc[0].to_dict()
+                await _process_single_domain_phase2(feat_row, client)
             except Exception as e:
-                return host, "NA"
+                logger.error("[Phase2 worker] Error for %s: %s", item.get("url", "?"), e)
+            finally:
+                queue2.task_done()
 
-    # Tasks for all live hosts
-    dns_rec_tasks = [_get_dns_records_async(h) for h in host_list]
-    
-    # Run in parallel
-    for coro in tqdm(asyncio.as_completed(dns_rec_tasks), total=len(dns_rec_tasks),
-                     desc="📡 DNS Records", unit="domain",
-                     bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"):
-        host, recs = await coro
-        dns_records_map[host] = recs
+    # ── Create queue2, start Phase 2 workers and Phase 1 concurrently ────
+    # queue2 is created HERE so phase2_workers can wait on it before Phase 1
+    # even produces any items. They'll block on queue2.get() until OCR arrives.
+    PHASE2_QUEUE_DEPTH = MAX_CONCURRENT_RDAP * 2
+    queue2: asyncio.Queue = asyncio.Queue(maxsize=PHASE2_QUEUE_DEPTH)
+    DONE_P2 = object()  # Sentinel for phase2_workers
 
-    # ======================== Merge results into records ========================
-    from tqdm import tqdm as tqdm_sync
-    with tqdm_sync(total=total_domains, desc="📝 Building Records", unit="domain",
-                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]") as rec_pbar:
-        for idx, row in df_features.iterrows():
-            domain_url = row["url"]
-            host = host_list[idx]
+    logger.info("🚀 Launching %d Phase 2 workers + Phase 1 concurrently...", MAX_CONCURRENT_RDAP)
 
-            # --- Defaults ---
-            reg_date = "NA"
-            registrar = "NA"
-            registrant_name = "NA"
-            registrant_country = "NA"
-            name_servers = "NA"
-            lookup_method = "NONE"
+    async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as p2_client:
+        # Launch Phase 2 workers BEFORE process_urls — they wait on queue2
+        p2_tasks = [
+            asyncio.create_task(phase2_worker(queue2, p2_client))
+            for _ in range(MAX_CONCURRENT_RDAP)
+        ]
 
-            # --- Pull from RDAP or WHOIS results ---
-            if host in rdap_results:
-                d = rdap_results[host]
-                lookup_method = "RDAP"
-                reg_date = d.get("reg_date", "NA")
-                registrar = d.get("registrar", "NA")
-                registrant_name = d.get("registrant_name", "NA")
-                registrant_country = d.get("registrant_country", "NA")
-                name_servers = d.get("name_servers", "NA")
-            elif host in whois_results:
-                d = whois_results[host]
-                lookup_method = "WHOIS"
-                reg_date = d.get("reg_date", "NA")
-                registrar = d.get("registrar", "NA")
-                registrant_name = d.get("registrant_name", "NA")
-                registrant_country = d.get("registrant_country", "NA")
-                name_servers = d.get("name_servers", "NA")
+        # Run Phase 1 (screenshots + OCR); feeds into queue2 as it goes
+        await process_urls(temp_csv_path, FEATURES_CSV, network_semaphore, phase2_queue=queue2)
 
-            # --- IP (from DNS pre-filter or features) ---
-            ip = "NA"
-            ip_from_features = row.get("ip_address", None)
-            if ip_from_features and not pd.isna(ip_from_features):
-                ip = str(ip_from_features)
-            elif dns_map.get(host):
-                ip = dns_map[host]
+        # Phase 1 done — signal Phase 2 workers to stop after draining queue2
+        for _ in range(MAX_CONCURRENT_RDAP):
+            await queue2.put(DONE_P2)
 
-            # --- DNS records lookup (Instant now) ---
-            dns_records = dns_records_map.get(host, "NA")
+        logger.info("⏳ Waiting for Phase 2 workers to complete...")
+        await asyncio.gather(*p2_tasks, return_exceptions=True)
 
-            # --- GeoIP/ISP lookup (from features file) ---
-            hosting_isp = "NA"
-            hosting_country = "NA"
-            isp_from_features = row.get("asn_org", None)
-            if isp_from_features and not pd.isna(isp_from_features):
-                hosting_isp = str(isp_from_features)
-            country_from_features = row.get("country", None)
-            if country_from_features and not pd.isna(country_from_features):
-                hosting_country = str(country_from_features)
+    phase1_time = time.time() - phase1_start
+    master_pbar.update(95)  # 95% done after both phases
+    logger.info("✅ Both phases complete in %.1f seconds (%d records)", phase1_time, len(all_records))
 
-            # --- Evidence and screenshot ---
-            evidence_path, evidence_name = format_evidence_filename(
-                row["Cooresponding CSE"], domain_url, idx+1, application_id=APPLICATION_ID
-            )
-            move_screenshot_to_evidence(domain_url, evidence_path)
-
-            # --- Classification ---
-            ocr_text_from_csv = row.get("ocr_text", "")
-            classification = reclassify_label(
-                domain_url, registrar, hosting_isp, dns_records, ocr_text_from_csv
-            )
-
-            detection_date = datetime.now().strftime("%d-%m-%Y")
-            detection_time = datetime.now().strftime("%H:%M:%S")
-
-            records.append({
-                "Application_ID": APPLICATION_ID,
-                "Source of detection": adjusted_sources[idx],
-                "Identified Phishing/Suspected Domain Name": domain_url,
-                "Corresponding CSE Domain Name": row["Legitimate Domains"],
-                "Critical Sector Entity Name": row["Cooresponding CSE"],
-                "Phishing/Suspected Domains (i.e. Class Label)": classification,
-                "Domain Registration Date": reg_date,
-                "Registrar Name": registrar,
-                "Registrant Name or Registrant Organisation": registrant_name,
-                "Registrant Country": registrant_country,
-                "Name Servers": name_servers,
-                "Hosting IP": ip,
-                "Hosting ISP": hosting_isp,
-                "Hosting Country": hosting_country,
-                "DNS Records (if any)": dns_records,
-                "Evidence file name": evidence_name,
-                "Date of detection (DD-MM-YYYY)": detection_date,
-                "Time of detection (HH-MM-SS)": detection_time,
-                "Date of Post (If detection is from Source: social media)": "NA",
-                "Remarks": "NA values are due to privacy issues."
-            })
-            rec_pbar.update(1)
-
-    phase2_time = time.time() - phase2_start
-    master_pbar.update(35)  # Phase 2 = 35% of work
-    logger.info("✅ Phase 2 Complete: %d records in %.1f seconds", len(records), phase2_time)
-    
-    # --- Speed summary ---
-    rdap_count = len(rdap_times)
+    # ── Speed summary ─────────────────────────────────────────────────────
+    rdap_count  = len(rdap_times)
     whois_count = len(whois_times)
-    failed_count = total_domains - rdap_count - whois_count
-    rdap_avg = sum(rdap_times) / rdap_count if rdap_times else 0
-    whois_avg = sum(whois_times) / whois_count if whois_times else 0
-    
-    dead_count = total_domains - len(live_hosts)
-    failed_count = len(live_hosts) - rdap_count - whois_count
+    dead_count  = total_domains - len(live_hosts)
+    rdap_avg    = sum(rdap_times)  / rdap_count  if rdap_times  else 0
+    whois_avg   = sum(whois_times) / whois_count if whois_times else 0
 
-    logger.info("")
-    logger.info("📊 Lookup Speed Summary (Parallel Flow):")
-    logger.info("   ⚡ Processed:       %d live, %d dead", len(live_hosts), dead_count)
-    logger.info("   ✅ RDAP Matches:    %d (avg %.2fs)", rdap_count, rdap_avg)
-    logger.info("   🐢 WHOIS Fallback:  %d (avg %.2fs)", whois_count, whois_avg)
-    logger.info("   ❌ Reg Data Failed: %d", failed_count)
-    logger.info("   ⏱️  Phase 2 Total:   %.1fs", phase2_time)
-    logger.info("")
-    
-    df_out = pd.DataFrame(records)
-    # Save to CSV
+    logger.info("📊 Lookup Speed Summary (Streaming):")
+    logger.info("   ✅ RDAP:     %d (avg %.2fs)", rdap_count, rdap_avg)
+    logger.info("   🐢 WHOIS:    %d (avg %.2fs)", whois_count, whois_avg)
+    logger.info("   ❌ Failed:   %d", total_domains - rdap_count - whois_count)
+    logger.info("   ⏱️  Total:    %.1fs (%.2fs/domain)", phase1_time,
+                phase1_time / total_domains if total_domains else 0)
+
+    # ── Write final output ────────────────────────────────────────────────
+    df_out = pd.DataFrame(all_records)
     df_out.to_csv(FINAL_OUTPUT, index=False, encoding="utf-8")
-    logger.info("✅ Final output written to %s", FINAL_OUTPUT)
+    logger.info("✅ Final output written to %s (%d records)", FINAL_OUTPUT, len(all_records))
 
-    # # ---------------- Filtering step (DISABLED) ----------------
-    # To re-enable, uncomment the block below and set appropriate start/end dates.
-    # start = datetime(2025, 10, 1).date()
-    # end   = datetime(2025, 10, 15).date()
-    #
-    # def parse_date(val):
-    #     if not val or pd.isna(val) or val == "NA":
-    #         return None
-    #     try:
-    #         dt = parser.parse(str(val), fuzzy=True)
-    #         return dt.date()
-    #     except:
-    #         return None
-    #
-    # df_temp = df_out.copy()
-    # df_temp["_parsed_reg_date"] = df_temp["Domain Registration Date"].apply(parse_date)
-    # mask = df_temp["_parsed_reg_date"].notna() & df_temp["_parsed_reg_date"].between(start, end)
-    # df_filtered = df_temp.loc[mask].drop(columns=["_parsed_reg_date"])
-    #
-    # if not df_filtered.empty:
-    #     df_filtered = df_filtered[df_out.columns]
-    #
-    # filtered_path = FINAL_OUTPUT.replace(".csv", "_filtered.csv")
-    # df_filtered.to_csv(filtered_path, index=False, encoding="utf-8")
-    #
-    # logger.info("✅ Filtered %d domains registered between %s and %s",
-    #             len(df_filtered), start.isoformat(), end.isoformat())
-    # logger.info("📄 Filtered output written to %s", filtered_path)
-
-    # Remove the temporary holdout_temp.csv file
+    # ── Clean up temp file ────────────────────────────────────────────────
     try:
         os.remove(temp_csv_path)
         logger.info("🗑 Removed temporary file: %s", temp_csv_path)
     except Exception as e:
         logger.warning("⚠ Could not remove temporary file: %s", e)
 
-    # Final progress update and timing
-    master_pbar.update(5)  # Phase 3 (filtering/cleanup) = 5%
+    master_pbar.update(5)  # cleanup = last 5%
     master_pbar.close()
-    
+
     total_time = time.time() - start_time
     print("\n" + "="*70)
     print(f"✅ PIPELINE COMPLETE")
     print(f"   Total domains: {total_domains}")
     print(f"   Total time: {total_time/60:.1f} minutes ({total_time:.0f} seconds)")
-    print(f"   Average: {total_time/total_domains:.2f} seconds/domain")
+    print(f"   Average: {total_time/total_domains:.2f} seconds/domain" if total_domains else "")
     print("="*70 + "\n")
-    
+
     return df_out
-    
-    # Note: run_pipeline does NOT close the browser context automatically here anymore
-    # because we might want to keep it open? No, we should close it.
-    # actually better to do it in the finally block of the caller or here.
-    # close_browser() will be called by the outer wrapper.
+
 
 # ------------------------------------------------------------------
 # Package results
