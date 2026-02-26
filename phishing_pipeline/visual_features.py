@@ -96,13 +96,13 @@ def _get_ocr_reader() -> easyocr.Reader:
             # Check GPU availability
             gpu_available = torch.cuda.is_available()
             if gpu_available:
-                logger.info("🚀 GPU detected: %s", torch.cuda.get_device_name(0))
+                logger.debug("🚀 GPU detected: %s", torch.cuda.get_device_name(0))
             else:
                 logger.warning("⚠️ GPU not available, using CPU (will be slower)")
             
             # Use GPU if available, otherwise CPU
             _ocr_reader = easyocr.Reader(['en'], gpu=gpu_available)
-            logger.info("✅ EasyOCR initialized successfully (GPU: %s)", gpu_available)
+            logger.debug("✅ EasyOCR initialized successfully (GPU: %s)", gpu_available)
         
         except ImportError as e:
             logger.error("❌ EasyOCR not installed. Install with: pip install easyocr")
@@ -616,7 +616,7 @@ def run_ocr_inference(img_np) -> str:
     with _ocr_lock:
         # Periodic reader reset to clear VRAM fragmentation
         if _ocr_call_count > 0 and _ocr_call_count % _OCR_RESET_INTERVAL == 0:
-            logger.info("🔄 OCR reader reset (call #%d) to clear VRAM fragmentation", _ocr_call_count)
+            logger.debug("🔄 OCR reader reset (call #%d) to clear VRAM fragmentation", _ocr_call_count)
             _ocr_reader = None
             torch.cuda.empty_cache()
             gc.collect()

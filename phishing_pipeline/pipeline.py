@@ -48,8 +48,7 @@ from .utils import (
     wait_for_vram,
     extract_network_features_async,
     _create_dummy_image,
-    STAGE1_LAUNCH_CONCURRENCY,
-    _get_stage1_launch_semaphore,
+
 )
 
 # ------------------------------------------------------------------
@@ -359,7 +358,6 @@ async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=Non
     Three-Stage Producer-Consumer Feature Extraction Pipeline.
 
     Stage 1 — Screenshot Workers  (parallelism = MAX_CONCURRENT_SCREENSHOTS)
-        - Throttled by stage1_launch_sem so network tasks don't all fire at once
         - Runs network features + browser screenshot in parallel
         - Pushes (net_feats, screenshot_path, row_meta) into Queue-1
 
@@ -413,43 +411,42 @@ async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=Non
     # -----------------------------------------------------------------------
     async def stage1_worker(row, pbar):
         """Network features + screenshot, then enqueue for Stage 2."""
-        async with _get_stage1_launch_semaphore():   # Throttle launch burst
-            domain = row.get("Identified Phishing/Suspected Domain Name", "")
+        domain = row.get("Identified Phishing/Suspected Domain Name", "")
 
-            # --- Network features (fast, CPU-bound, async I/O) ---
+        # --- Network features (fast, CPU-bound, async I/O) ---
+        try:
+            net_feats = await extract_network_features_async(domain, network_semaphore)
+        except Exception as e:
+            logger.error("[Stage1] Network failed for %s: %s", domain, e)
+            net_feats = {}
+
+        # --- Screenshot (gated by screenshot_sem) ---
+        ext = tldextract.extract(domain)
+        domain_full = ".".join(p for p in [ext.domain, ext.suffix] if p) or domain
+        screenshot_path = os.path.join(SCREENS_DIR, f"{domain_full}.png")
+
+        from .visual_features import capture_screenshot_async
+        async with screenshot_sem:
             try:
-                net_feats = await extract_network_features_async(domain, network_semaphore)
+                target_url, capture_ok = await capture_screenshot_async(domain, screenshot_path)
             except Exception as e:
-                logger.error("[Stage1] Network failed for %s: %s", domain, e)
-                net_feats = {}
+                logger.error("[Stage1] Screenshot failed for %s: %s", domain, e)
+                target_url, capture_ok = domain, False
 
-            # --- Screenshot (gated by screenshot_sem) ---
-            ext = tldextract.extract(domain)
-            domain_full = ".".join(p for p in [ext.domain, ext.suffix] if p) or domain
-            screenshot_path = os.path.join(SCREENS_DIR, f"{domain_full}.png")
+        if not capture_ok:
+            # Write a placeholder so Stage 2 still has a file to process
+            await asyncio.to_thread(_create_dummy_image, domain, screenshot_path)
+            target_url = domain
 
-            from .visual_features import capture_screenshot_async
-            async with screenshot_sem:
-                try:
-                    target_url, capture_ok = await capture_screenshot_async(domain, screenshot_path)
-                except Exception as e:
-                    logger.error("[Stage1] Screenshot failed for %s: %s", domain, e)
-                    target_url, capture_ok = domain, False
+        row_meta = {
+            "Cooresponding CSE": row.get("Cooresponding CSE", ""),
+            "Legitimate Domains": row.get("Legitimate Domains", ""),
+        }
 
-            if not capture_ok:
-                # Write a placeholder so Stage 2 still has a file to process
-                await asyncio.to_thread(_create_dummy_image, domain, screenshot_path)
-                target_url = domain
-
-            row_meta = {
-                "Cooresponding CSE": row.get("Cooresponding CSE", ""),
-                "Legitimate Domains": row.get("Legitimate Domains", ""),
-            }
-
-            # Put into OCR queue (will block if queue is full — natural backpressure)
-            await queue.put((net_feats, screenshot_path, target_url, row_meta))
-            if screenshot_pbar:
-                screenshot_pbar.update(1)
+        # Put into OCR queue (will block if queue is full — natural backpressure)
+        await queue.put((net_feats, screenshot_path, target_url, row_meta))
+        if screenshot_pbar:
+            screenshot_pbar.update(1)
 
     # -----------------------------------------------------------------------
     # Stage 2 Worker — OCR-gated consumer (MAX_CONCURRENT_OCR instances)
@@ -532,7 +529,7 @@ async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=Non
         for _ in range(MAX_CONCURRENT_OCR)
     ]
 
-    # Launch Stage 1: all domains, throttled by stage1_launch_sem
+    # Launch Stage 1: all domains (backpressure from bounded OCR queue)
     stage1_coros = [stage1_worker(row, None) for row in rows]  # pbar=None, using screenshot_pbar directly
     await asyncio.gather(*stage1_coros, return_exceptions=True)
 
@@ -737,21 +734,22 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
     screenshot_pbar = tqdm_sync(
         total=total_domains, desc="📸 Screenshots", unit="dom",
         bar_format=BAR_FMT, position=0, leave=True,
-        dynamic_ncols=True, mininterval=0.5,
+        dynamic_ncols=True, mininterval=5.0,
     )
     ocr_pbar = tqdm_sync(
         total=total_domains, desc="🔍 OCR        ", unit="dom",
         bar_format=BAR_FMT, position=1, leave=True,
-        dynamic_ncols=True, mininterval=0.5,
+        dynamic_ncols=True, mininterval=5.0,
     )
     p2_pbar = tqdm_sync(
         total=total_domains, desc="⚡ WHOIS/RDAP ", unit="dom",
         bar_format=BAR_FMT, position=2, leave=True,
-        dynamic_ncols=True, mininterval=0.5,
+        dynamic_ncols=True, mininterval=5.0,
     )
 
-    # Install tqdm-safe logging so bars don't get disrupted by logger output
+    # Install tqdm-safe logging — only WARNING+ to avoid bar redraws on every log line
     _tqdm_handler = _TqdmHandler()
+    _tqdm_handler.setLevel(logging.WARNING)
     _tqdm_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
     _root_logger = logging.getLogger()
     _original_handlers = _root_logger.handlers[:]
