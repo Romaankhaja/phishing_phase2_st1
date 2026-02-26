@@ -428,10 +428,11 @@ async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=Non
         from .visual_features import capture_screenshot_async
         async with screenshot_sem:
             try:
-                target_url, capture_ok = await capture_screenshot_async(domain, screenshot_path)
+                target_url, capture_ok, sandbox_report = await capture_screenshot_async(domain, screenshot_path)
             except Exception as e:
                 logger.error("[Stage1] Screenshot failed for %s: %s", domain, e)
                 target_url, capture_ok = domain, False
+                sandbox_report = {"sandbox_verdict": "INCONCLUSIVE", "sandbox_reason": "Screenshot failed"}
 
         if not capture_ok:
             # Write a placeholder so Stage 2 still has a file to process
@@ -441,6 +442,8 @@ async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=Non
         row_meta = {
             "Cooresponding CSE": row.get("Cooresponding CSE", ""),
             "Legitimate Domains": row.get("Legitimate Domains", ""),
+            "Sandbox Verdict": sandbox_report.get("sandbox_verdict", "INCONCLUSIVE"),
+            "Sandbox Reason": sandbox_report.get("sandbox_reason", "Not scanned"),
         }
 
         # Put into OCR queue (will block if queue is full — natural backpressure)
@@ -950,6 +953,8 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
             "Date of detection (DD-MM-YYYY)": detection_date,
             "Time of detection (HH-MM-SS)": detection_time_str,
             "Date of Post (If detection is from Source: social media)": "NA",
+            "Sandbox Verdict": feat_row.get("Sandbox Verdict", "INCONCLUSIVE"),
+            "Sandbox Reason": feat_row.get("Sandbox Reason", "Not scanned"),
             "Remarks": "NA values are due to privacy issues.",
         }
         async with records_lock:

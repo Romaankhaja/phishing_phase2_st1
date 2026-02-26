@@ -7,13 +7,13 @@ UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
 DOMAIN_COL   = "Legitimate Domains"
 ORG_COL      = "Cooresponding CSE"
  
+# Root (go one level up)
+ROOT_DIR = os.path.dirname(BASE_DIR)
+
 # Core CSVs
 FEATURES_CSV     = os.path.join(BASE_DIR, "blacklist_features.csv")
 FEATURES_ENRICH  = os.path.join(BASE_DIR, "features_enriched.csv")
-FINAL_OUTPUT     = os.path.join(BASE_DIR, "output_file.csv")
-
-# Root (go one level up)
-ROOT_DIR = os.path.dirname(BASE_DIR)
+FINAL_OUTPUT     = os.path.join(ROOT_DIR, "output", "output_file.csv")
 
 # ML Models + Preprocessors
 MODELS_DIR           = os.path.join(ROOT_DIR, "models")
