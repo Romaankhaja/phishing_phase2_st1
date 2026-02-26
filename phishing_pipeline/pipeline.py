@@ -353,7 +353,8 @@ def adjust_source(org_name, whitelisted_domain, ml_source="Unknown"):
 # ------------------------------------------------------------------
 # CHUNK_SIZE is imported from .utils (calculated dynamically)
 
-async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=None, phase2_queue=None):
+async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=None,
+                       phase2_queue=None, screenshot_pbar=None, ocr_pbar=None):
     """
     Three-Stage Producer-Consumer Feature Extraction Pipeline.
 
@@ -366,8 +367,8 @@ async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=Non
         - Pulls from Queue-1, runs OCR/branding/laplacian
         - Pushes merged feature dict into phase2_queue (Queue-2)
 
-    The caller (run_pipeline) provides phase2_queue and runs Phase 2 workers
-    against it concurrently, so WHOIS/RDAP starts as soon as first OCR finishes.
+    Progress bars (screenshot_pbar, ocr_pbar) are managed by the caller
+    (run_pipeline) and shared across this function.
     """
     import csv
     import gc
@@ -447,7 +448,8 @@ async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=Non
 
             # Put into OCR queue (will block if queue is full — natural backpressure)
             await queue.put((net_feats, screenshot_path, target_url, row_meta))
-            pbar.update(1)
+            if screenshot_pbar:
+                screenshot_pbar.update(1)
 
     # -----------------------------------------------------------------------
     # Stage 2 Worker — OCR-gated consumer (MAX_CONCURRENT_OCR instances)
@@ -504,6 +506,8 @@ async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=Non
 
                 # Push into Phase 2 queue for immediate WHOIS/RDAP processing
                 await queue2.put(merged)
+                if ocr_pbar:
+                    ocr_pbar.update(1)
 
             except Exception as e:
                 logger.error("[Stage2] Unexpected error for %s: %s", target_url, e)
@@ -520,24 +524,17 @@ async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=Non
     # Orchestrate: launch all 3 stages concurrently
     #   Stage 1  → queue  → Stage 2 (OCR)  → phase2_queue  → Phase 2 (WHOIS/RDAP)
     # phase2_queue is passed in by run_pipeline, which also manages Phase 2 workers.
+    # Progress bars are passed in from run_pipeline.
     # -----------------------------------------------------------------------
-    with tqdm(
-        total=total_domains,
-        desc="📦 Stage1: Screenshots",
-        unit="domain",
-        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
-        position=1,
-        leave=False,
-    ) as pbar:
-        # Launch Stage 2 OCR workers first (they wait on queue; push into phase2_queue)
-        stage2_tasks = [
-            asyncio.create_task(stage2_worker(phase2_queue))
-            for _ in range(MAX_CONCURRENT_OCR)
-        ]
+    # Launch Stage 2 OCR workers first (they wait on queue; push into phase2_queue)
+    stage2_tasks = [
+        asyncio.create_task(stage2_worker(phase2_queue))
+        for _ in range(MAX_CONCURRENT_OCR)
+    ]
 
-        # Launch Stage 1: all domains, throttled by stage1_launch_sem
-        stage1_coros = [stage1_worker(row, pbar) for row in rows]
-        await asyncio.gather(*stage1_coros, return_exceptions=True)
+    # Launch Stage 1: all domains, throttled by stage1_launch_sem
+    stage1_coros = [stage1_worker(row, None) for row in rows]  # pbar=None, using screenshot_pbar directly
+    await asyncio.gather(*stage1_coros, return_exceptions=True)
 
     # Signal Stage 2 (OCR) workers to stop
     for _ in range(MAX_CONCURRENT_OCR):
@@ -718,23 +715,49 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
     
     total_domains = len(df_filtered)
     
-    # ================== MASTER PROGRESS TRACKER ==================
+    # ================== PROGRESS BARS ==================
+    # TqdmLoggingHandler routes ALL log output through tqdm.write()
+    # so the 3 progress bars stay pinned at fixed screen positions.
+    class _TqdmHandler(logging.Handler):
+        def emit(self, record):
+            try:
+                msg = self.format(record)
+                tqdm_sync.write(msg)
+            except Exception:
+                pass
+
+    BAR_FMT = "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
     print("\n" + "="*70)
-    print(f"📊 PIPELINE OVERVIEW: {total_domains} domains")
+    print(f"📊 STREAMING PIPELINE: {total_domains} domains")
     print("="*70)
-    print("  Phase 1: Feature Extraction (Network + Screenshots + OCR)")
-    print("  Phase 2: WHOIS Lookup & Classification")
-    print("  Phase 3: Evidence Generation & Export")
+    print("  📸 Screenshots + Network  →  🔍 OCR (GPU)  →  ⚡ WHOIS/RDAP + Classify")
+    print("  All 3 stages run CONCURRENTLY (streaming)")
     print("="*70 + "\n")
-    
-    master_pbar = tqdm_sync(
-        total=100,
-        desc="🔄 Overall Progress",
-        unit="%",
-        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}% [{elapsed}<{remaining}]",
-        position=0
+
+    screenshot_pbar = tqdm_sync(
+        total=total_domains, desc="📸 Screenshots", unit="dom",
+        bar_format=BAR_FMT, position=0, leave=True,
+        dynamic_ncols=True, mininterval=0.5,
     )
+    ocr_pbar = tqdm_sync(
+        total=total_domains, desc="🔍 OCR        ", unit="dom",
+        bar_format=BAR_FMT, position=1, leave=True,
+        dynamic_ncols=True, mininterval=0.5,
+    )
+    p2_pbar = tqdm_sync(
+        total=total_domains, desc="⚡ WHOIS/RDAP ", unit="dom",
+        bar_format=BAR_FMT, position=2, leave=True,
+        dynamic_ncols=True, mininterval=0.5,
+    )
+
+    # Install tqdm-safe logging so bars don't get disrupted by logger output
+    _tqdm_handler = _TqdmHandler()
+    _tqdm_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    _root_logger = logging.getLogger()
+    _original_handlers = _root_logger.handlers[:]
+    _root_logger.handlers = [_tqdm_handler]
     
+
     # ================== PRE-LOAD MODELS (batch, fast) ==================
     logger.info("🔧 Pre-loading ML models...")
     model_label, model_source, le_label, source_classes, feature_cols, scaler, imputer = load_models_and_preproc()
@@ -936,7 +959,6 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
         logger.debug("✅ Phase 2 done for %s [%s]", host, lookup_method)
 
     # ── Phase 2 worker: drains queue2, one domain at a time per slot ─────
-    DONE_P2 = object()  # Sentinel to stop Phase 2 workers
 
     async def phase2_worker(queue2: asyncio.Queue, client: httpx.AsyncClient):
         while True:
@@ -952,8 +974,10 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
                 h = h.split(":")[0]
                 feat_row = enrich_with_geoip(pd.DataFrame([feat_row]), ASN_DB_PATH, CITY_DB_PATH).iloc[0].to_dict()
                 await _process_single_domain_phase2(feat_row, client)
+                p2_pbar.update(1)
             except Exception as e:
                 logger.error("[Phase2 worker] Error for %s: %s", item.get("url", "?"), e)
+                p2_pbar.update(1)  # Still count failed domains
             finally:
                 queue2.task_done()
 
@@ -974,7 +998,9 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
         ]
 
         # Run Phase 1 (screenshots + OCR); feeds into queue2 as it goes
-        await process_urls(temp_csv_path, FEATURES_CSV, network_semaphore, phase2_queue=queue2)
+        await process_urls(temp_csv_path, FEATURES_CSV, network_semaphore,
+                           phase2_queue=queue2,
+                           screenshot_pbar=screenshot_pbar, ocr_pbar=ocr_pbar)
 
         # Phase 1 done — signal Phase 2 workers to stop after draining queue2
         for _ in range(MAX_CONCURRENT_RDAP):
@@ -983,14 +1009,21 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
         logger.info("⏳ Waiting for Phase 2 workers to complete...")
         await asyncio.gather(*p2_tasks, return_exceptions=True)
 
-    phase1_time = time.time() - phase1_start
-    master_pbar.update(95)  # 95% done after both phases
-    logger.info("✅ Both phases complete in %.1f seconds (%d records)", phase1_time, len(all_records))
+    total_time = time.time() - phase1_start
+
+    # ── Close progress bars and restore logging ──────────────────────────
+    screenshot_pbar.close()
+    ocr_pbar.close()
+    p2_pbar.close()
+
+    # Restore original logging handlers
+    _root_logger.handlers = _original_handlers
+
+    logger.info("✅ Both phases complete in %.1f seconds (%d records)", total_time, len(all_records))
 
     # ── Speed summary ─────────────────────────────────────────────────────
     rdap_count  = len(rdap_times)
     whois_count = len(whois_times)
-    dead_count  = total_domains - len(live_hosts)
     rdap_avg    = sum(rdap_times)  / rdap_count  if rdap_times  else 0
     whois_avg   = sum(whois_times) / whois_count if whois_times else 0
 
@@ -998,8 +1031,8 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
     logger.info("   ✅ RDAP:     %d (avg %.2fs)", rdap_count, rdap_avg)
     logger.info("   🐢 WHOIS:    %d (avg %.2fs)", whois_count, whois_avg)
     logger.info("   ❌ Failed:   %d", total_domains - rdap_count - whois_count)
-    logger.info("   ⏱️  Total:    %.1fs (%.2fs/domain)", phase1_time,
-                phase1_time / total_domains if total_domains else 0)
+    logger.info("   ⏱️  Total:    %.1fs (%.2fs/domain)", total_time,
+                total_time / total_domains if total_domains else 0)
 
     # ── Write final output ────────────────────────────────────────────────
     df_out = pd.DataFrame(all_records)
@@ -1013,15 +1046,12 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
     except Exception as e:
         logger.warning("⚠ Could not remove temporary file: %s", e)
 
-    master_pbar.update(5)  # cleanup = last 5%
-    master_pbar.close()
-
-    total_time = time.time() - start_time
+    pipeline_time = time.time() - start_time
     print("\n" + "="*70)
     print(f"✅ PIPELINE COMPLETE")
     print(f"   Total domains: {total_domains}")
-    print(f"   Total time: {total_time/60:.1f} minutes ({total_time:.0f} seconds)")
-    print(f"   Average: {total_time/total_domains:.2f} seconds/domain" if total_domains else "")
+    print(f"   Total time: {pipeline_time/60:.1f} minutes ({pipeline_time:.0f} seconds)")
+    print(f"   Average: {pipeline_time/total_domains:.2f} seconds/domain" if total_domains else "")
     print("="*70 + "\n")
 
     return df_out
