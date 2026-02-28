@@ -1,0 +1,56 @@
+['Cooresponding CSE', 'Legitimate Domains', 'ip_address', 'url_length', 'num_dots', 'has_repeated_digits', 'num_special_chars', 'num_hyphens', 'num_slashes', 'num_underscores', 'num_question_marks', 'num_equal_signs', 'num_dollar_signs', 'num_exclamations', 'num_hashtags', 'num_percent', 'domain_length', 'num_hyphens_domain', 'has_special_chars_domain', 'num_special_chars_domain', 'num_subdomains', 'avg_subdomain_length', 'subdomain_length', 'subdomain_has_hyphen', 'subdomain_has_repeated_digits', 'path_length', 'has_query', 'has_fragment', 'has_anchor', 'entropy_url', 'entropy_domain', 'ssl_present', 'ssl_valid', 'ssl_days_to_expiry', 'ssl_issuer', 'ocr_text', 'screenshot_path', 'visual_hash', 'url', 'asn', 'asn_org', 'country', 'region', 'city', 'favicon_detected', 'favicon_url', 'favicon_size', 'favicon_hash', 'favicon_colors']
+
+Cooresponding CSE                 object
+Legitimate Domains                object
+ip_address                        object
+url_length                         int64
+num_dots                           int64
+has_repeated_digits                 bool
+num_special_chars                  int64
+num_hyphens                        int64
+num_slashes                        int64
+num_underscores                    int64
+num_question_marks                 int64
+num_equal_signs                    int64
+num_dollar_signs                   int64
+num_exclamations                   int64
+num_hashtags                       int64
+num_percent                        int64
+domain_length                      int64
+num_hyphens_domain                 int64
+has_special_chars_domain            bool
+num_special_chars_domain           int64
+num_subdomains                     int64
+avg_subdomain_length             float64
+subdomain_length                   int64
+subdomain_has_hyphen                bool
+subdomain_has_repeated_digits       bool
+path_length                        int64
+has_query                           bool
+has_fragment                        bool
+has_anchor                          bool
+entropy_url                      float64
+entropy_domain                   float64
+ssl_present                        int64
+ssl_valid                          int64
+ssl_days_to_expiry                 int64
+ssl_issuer                        object
+ocr_text                         float64
+screenshot_path                  float64
+visual_hash                      float64
+url                               object
+asn                              float64
+asn_org                           object
+country                           object
+region                            object
+city                              object
+favicon_detected                    bool
+favicon_url                       object
+favicon_size                      object
+favicon_hash                      object
+favicon_colors                    object
+dtype: object
+
+           Cooresponding CSE           Legitimate Domains ip_address  url_length  num_dots  has_repeated_digits  num_special_chars  num_hyphens  num_slashes  num_underscores  num_question_marks  num_equal_signs  num_dollar_signs  num_exclamations  num_hashtags  num_percent  domain_length  num_hyphens_domain  has_special_chars_domain  num_special_chars_domain  num_subdomains  avg_subdomain_length  subdomain_length  subdomain_has_hyphen  subdomain_has_repeated_digits  path_length  has_query  has_fragment  has_anchor  entropy_url  entropy_domain  ssl_present  ssl_valid  ssl_days_to_expiry ssl_issuer  ocr_text  screenshot_path  visual_hash                        url  asn asn_org country region city  favicon_detected favicon_url favicon_size favicon_hash favicon_colors
+0  State Bank Of India (SBI)   yono-sbi-registration.link        NaN          33         1                False                  6            2            2                0                   0                0                 0                 0             0            0             25                   2                     False                         0               0                   0.0                 0                 False                          False            0      False         False       False     3.623465        3.623465            0          0                  -1        NaN       NaN              NaN          NaN  yono-sbi-registration.top  NaN     NaN     NaN    NaN  NaN             False         NaN           -1          NaN             []
+1                  HDFC Bank  hdfccampaign.credithorse.in        NaN          28         2                False                  5            0            2                0                   0                0                 0                 0             0            0             20                   0                     False                         0               1                   5.0                 5                 False                          False            0      False         False       False     3.321928        3.321928            0          0                  -1        NaN       NaN              NaN          NaN       icici.crediwatch.org  NaN     NaN     NaN    NaN  NaN             False         NaN           -1          NaN             []

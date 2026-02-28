@@ -1,11 +1,7 @@
+import os
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import StratifiedKFold, RandomizedSearchCV, cross_val_predict
-from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, f1_score,
-    classification_report, confusion_matrix, roc_auc_score,
-    cohen_kappa_score
-)
+from sklearn.model_selection import StratifiedKFold, RandomizedSearchCV
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -14,36 +10,46 @@ from xgboost import XGBClassifier
 import joblib
 
 # ==========================
+# Paths
+# ==========================
+SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR     = os.path.dirname(SCRIPT_DIR)
+DATA_DIR     = os.path.join(ROOT_DIR, "data", "training")
+MODELS_DIR   = os.path.join(ROOT_DIR, "models")
+
+os.makedirs(MODELS_DIR, exist_ok=True)
+
+file_path = os.path.join(DATA_DIR, "training_dataset_features.csv")
+
+# ==========================
 # 1. Load Dataset
 # ==========================
-import os
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODELS_DIR = os.path.join(ROOT, "models")
-os.makedirs(MODELS_DIR, exist_ok=True)
-file_path = os.path.join(ROOT, "data", "training", "final_training_dataset_with_source.xlsx")
-data = pd.read_excel(file_path, sheet_name="final_training_dataset_with_sou")
+data = pd.read_csv(file_path)
 print(f"✅ Loaded dataset with {len(data)} rows and {data.shape[1]} columns")
 
 # ==========================
 # 2. Auto Feature Selection
 # ==========================
+# Columns to exclude from numeric features
 exclude_cols = [
-    "url", "ip_address", "ssl_issuer", "brand_colors", "logo_hash",
+    "url", "ip_address", "ssl_issuer",
     "favicon_url", "favicon_size", "favicon_hash", "favicon_colors",
-    "ocr_text", "asn_org", "country", "region", "city",
-    "label", "source_of_detection"
+    "ocr_text", "screenshot_path", "visual_hash",
+    "asn_org", "country", "region", "city",
+    "Cooresponding CSE", "Legitimate Domains",
 ]
 
 # Keep numeric + boolean features
 candidate_features = [
     col for col in data.columns
-    if col not in exclude_cols and (pd.api.types.is_numeric_dtype(data[col]) or pd.api.types.is_bool_dtype(data[col]))
+    if col not in exclude_cols
+    and (pd.api.types.is_numeric_dtype(data[col]) or pd.api.types.is_bool_dtype(data[col]))
 ]
 
 X_num = data[candidate_features]
 print(f"🔍 Selected {len(candidate_features)} numeric/boolean features: {candidate_features}")
 
-# One-hot encode SSL issuer separately if needed
+# One-hot encode SSL issuer if present
 if "ssl_issuer" in data.columns:
     ssl_issuer_dummies = pd.get_dummies(data["ssl_issuer"], prefix="ssl_issuer")
     X_num = pd.concat([X_num, ssl_issuer_dummies], axis=1)
@@ -65,32 +71,14 @@ X_num_scaled = scaler.fit_transform(X_num_imputed)
 # ==========================
 text_features = []
 
-# OCR Text
-if "ocr_text" in data.columns:
-    data["ocr_text"] = data["ocr_text"].fillna("")
-    tfidf_ocr = TfidfVectorizer(max_features=300)  # limit features
-    X_ocr = tfidf_ocr.fit_transform(data["ocr_text"])
-    text_features.append(X_ocr)
-    joblib.dump(tfidf_ocr, os.path.join(MODELS_DIR, "tfidf_ocr.joblib"))
-    print("📝 Added OCR text features (300 TF-IDF dims)")
-
-# ASN Org
-if "asn_org" in data.columns:
+# ASN Org  (partially available)
+if "asn_org" in data.columns and data["asn_org"].notna().sum() > 0:
     data["asn_org"] = data["asn_org"].fillna("")
-    tfidf_asn = TfidfVectorizer(max_features=100)  # smaller vocab
+    tfidf_asn = TfidfVectorizer(max_features=100)
     X_asn = tfidf_asn.fit_transform(data["asn_org"])
     text_features.append(X_asn)
     joblib.dump(tfidf_asn, os.path.join(MODELS_DIR, "tfidf_asn.joblib"))
     print("🌐 Added ASN Org text features (100 TF-IDF dims)")
-
-# Brand Colors (stringified) if you want to try
-if "brand_colors" in data.columns:
-    data["brand_colors"] = data["brand_colors"].astype(str).fillna("")
-    tfidf_colors = TfidfVectorizer(max_features=100)
-    X_colors = tfidf_colors.fit_transform(data["brand_colors"])
-    text_features.append(X_colors)
-    joblib.dump(tfidf_colors, os.path.join(MODELS_DIR, "tfidf_colors.joblib"))
-    print("🎨 Added Brand Colors text features (100 TF-IDF dims)")
 
 # Merge numeric + text
 if text_features:
@@ -103,26 +91,29 @@ print(f"✅ Final feature matrix shape: {X_all.shape}")
 # ==========================
 # 6. Prepare Targets
 # ==========================
+# --- Label model: predict brand / organisation (Cooresponding CSE) ---
 le_label = LabelEncoder()
-y_label = le_label.fit_transform(data["label"])
-print(f"🎯 Label Classes: {list(le_label.classes_)}")
+y_label = le_label.fit_transform(data["Cooresponding CSE"])
+print(f"🎯 Label (brand) classes ({len(le_label.classes_)}): {list(le_label.classes_)}")
 
-y_source, source_classes = pd.factorize(data["source_of_detection"])
-print(f"🌍 Source Classes: {list(source_classes)}")
-print("📊 Source Distribution:\n", pd.Series(y_source).value_counts())
+# --- Source model: predict phishing domain (Legitimate Domains) ---
+# Keep only domains that appear >= 5 times so the model can learn meaningful patterns
+domain_counts = data["Legitimate Domains"].value_counts()
+frequent_domains = domain_counts[domain_counts >= 5].index
+data_source = data[data["Legitimate Domains"].isin(frequent_domains)].copy()
+X_source = X_all[data["Legitimate Domains"].isin(frequent_domains).values]
+
+y_source, source_classes = pd.factorize(data_source["Legitimate Domains"])
+print(f"🌍 Source (domain) classes ({len(source_classes)}): showing top 10 → {list(source_classes[:10])}")
+print(f"📊 Source model trained on {len(data_source)} rows (domains with >= 5 occurrences)")
 
 # ==========================
 # 7. Hyperparameter Tuning Function
 # ==========================
-def tune_xgb(y, task_name):
+def tune_xgb(X, y, task_name):
     class_counts = pd.Series(y).value_counts()
-    n_classes = len(class_counts)
-    
-    if n_classes < 2:
-        print(f"❌ {task_name} SKIPPED: Only 1 class found {list(class_counts.index)}. Need at least 2 classes (e.g. Phishing vs Legitimate) to train.")
-        return None
 
-    if n_classes == 2:  
+    if len(class_counts) == 2:
         scale_pos_weight = class_counts[0] / class_counts[1]
     else:
         scale_pos_weight = 1.0
@@ -136,24 +127,20 @@ def tune_xgb(y, task_name):
         "min_child_weight": [1, 5, 10],
         "gamma": [0, 0.1, 0.3],
         "reg_lambda": [1, 5, 10],
-        "reg_alpha": [0, 0.1, 1]
+        "reg_alpha": [0, 0.1, 1],
     }
 
-    # Remove scale_pos_weight for multiclass to avoid warnings
-    xgb_params = {
-        "objective": "multi:softprob" if len(pd.unique(y)) > 2 else "binary:logistic",
-        "eval_metric": "mlogloss",
-        "random_state": 42,
-    }
-    
-    # Only add scale_pos_weight if binary
-    if len(pd.unique(y)) == 2:
-        xgb_params["scale_pos_weight"] = scale_pos_weight
-
-    xgb = XGBClassifier(**xgb_params)
+    xgb = XGBClassifier(
+        objective="multi:softprob" if len(np.unique(y)) > 2 else "binary:logistic",
+        eval_metric="mlogloss",
+        random_state=42,
+        scale_pos_weight=scale_pos_weight,
+        use_label_encoder=False,
+    )
 
     min_class_count = class_counts.min()
     n_splits = 5 if min_class_count >= 5 else 3
+
     cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
 
     search = RandomizedSearchCV(
@@ -164,125 +151,40 @@ def tune_xgb(y, task_name):
         n_jobs=-1,
         cv=cv,
         verbose=1,
-        random_state=42
+        random_state=42,
     )
 
-    search.fit(X_all, y)
+    search.fit(X, y)
     print(f"🏆 {task_name} Best Params: {search.best_params_}")
     print(f"✅ {task_name} CV F1 Macro: {search.best_score_:.4f}")
     return search.best_estimator_
 
 # ==========================
-# 8. Evaluation Function (Approach A)
+# 8. Train Both Models
 # ==========================
-def evaluate_with_cv(model, X, y, class_names, task_name, n_splits=5):
-    """Full cross-validated evaluation with all metrics."""
-    
-    print(f"\n{'='*70}")
-    print(f"📊 EVALUATION: {task_name}")
-    print(f"{'='*70}")
-    
-    min_class = pd.Series(y).value_counts().min()
-    actual_splits = min(n_splits, min_class)
-    if actual_splits < n_splits:
-        print(f"⚠️ Reduced folds from {n_splits} to {actual_splits} (smallest class has {min_class} samples)")
-    
-    cv = StratifiedKFold(n_splits=actual_splits, shuffle=True, random_state=42)
-    
-    # Get cross-validated predictions
-    # Note: cross_val_predict clones the estimator, so we use the best params from input model
-    y_pred = cross_val_predict(model, X, y, cv=cv, n_jobs=-1)
-    
-    # If we need probabilities for ROC-AUC
-    try:
-        y_proba = cross_val_predict(model, X, y, cv=cv, method='predict_proba', n_jobs=-1)
-    except:
-        y_proba = None
-    
-    # --- METRICS ---
-    acc = accuracy_score(y, y_pred)
-    prec_macro = precision_score(y, y_pred, average='macro', zero_division=0)
-    rec_macro = recall_score(y, y_pred, average='macro', zero_division=0)
-    f1_mac = f1_score(y, y_pred, average='macro', zero_division=0)
-    f1_weighted = f1_score(y, y_pred, average='weighted', zero_division=0)
-    kappa = cohen_kappa_score(y, y_pred)
-    
-    print(f"\n📈 OVERALL METRICS:")
-    print(f"   Accuracy:         {acc:.4f}  ({acc*100:.2f}%)")
-    print(f"   Precision (macro): {prec_macro:.4f}")
-    print(f"   Recall (macro):    {rec_macro:.4f}")
-    print(f"   F1-Score (macro):  {f1_mac:.4f}")
-    print(f"   F1-Score (weighted): {f1_weighted:.4f}")
-    print(f"   Cohen's Kappa:    {kappa:.4f}")
-    
-    # ROC-AUC
-    if y_proba is not None:
-        try:
-            n_classes = len(np.unique(y))
-            if n_classes == 2:
-                auc = roc_auc_score(y, y_proba[:, 1])
-            else:
-                auc = roc_auc_score(y, y_proba, multi_class='ovr', average='macro')
-            print(f"   ROC-AUC (macro):  {auc:.4f}")
-        except Exception as e:
-            print(f"   ROC-AUC: Could not compute ({e})")
-    
-    # Per-class report
-    print(f"\n📋 PER-CLASS CLASSIFICATION REPORT:")
-    print(classification_report(y, y_pred, target_names=class_names, zero_division=0))
-    
-    # Confusion Matrix
-    cm = confusion_matrix(y, y_pred)
-    print(f"🔢 CONFUSION MATRIX:")
-    print(f"   (rows = actual, columns = predicted)")
-    
-    # Header
-    header = "            " + "  ".join(f"{c:>12}" for c in class_names)
-    print(header)
-    for i, row in enumerate(cm):
-        row_str = f"   {class_names[i]:>8}  " + "  ".join(f"{v:>12}" for v in row)
-        print(row_str)
-    
-    print()
-    return {
-        "accuracy": acc, "precision_macro": prec_macro,
-        "recall_macro": rec_macro, "f1_macro": f1_mac,
-        "f1_weighted": f1_weighted, "kappa": kappa
-    }
+print("\n🔹 Training Label (Brand) Model...")
+best_model_label = tune_xgb(X_all, y_label, "Label (Brand)")
+
+print("\n🔹 Training Source (Domain) Model...")
+best_model_source = tune_xgb(X_source, y_source, "Source (Domain)")
 
 # ==========================
-# 9. Train Both Models & Evaluate
+# 9. Save Everything
 # ==========================
-print("\n🔹 Training Label Model...")
-best_model_label = tune_xgb(y_label, "Label")
-if best_model_label:
-    evaluate_with_cv(
-        best_model_label, X_all, y_label, 
-        class_names=list(le_label.classes_), 
-        task_name="LABEL MODEL (Phishing vs Legitimate)"
-    )
-
-print("\n🔹 Training Source Model...")
-best_model_source = tune_xgb(y_source, "Source of Detection")
-if best_model_source:
-    evaluate_with_cv(
-        best_model_source, X_all, y_source, 
-        class_names=list(source_classes), 
-        task_name="SOURCE OF DETECTION MODEL"
-    )
-
-# ==========================
-# 10. Save Everything
-# ==========================
-MODELS_DIR = os.path.join(ROOT, "models")
-os.makedirs(MODELS_DIR, exist_ok=True)
-
-joblib.dump(best_model_label, os.path.join(MODELS_DIR, "xgb_label_model.joblib"))
+joblib.dump(best_model_label,  os.path.join(MODELS_DIR, "xgb_label_model.joblib"))
 joblib.dump(best_model_source, os.path.join(MODELS_DIR, "xgb_source_model.joblib"))
-joblib.dump(le_label, os.path.join(MODELS_DIR, "label_encoder_label.joblib"))
+joblib.dump(le_label,          os.path.join(MODELS_DIR, "label_encoder_label.joblib"))
 joblib.dump(source_classes.tolist(), os.path.join(MODELS_DIR, "source_classes.joblib"))
-joblib.dump(scaler, os.path.join(MODELS_DIR, "scaler.joblib"))
-joblib.dump(imputer, os.path.join(MODELS_DIR, "imputer.joblib"))
+joblib.dump(scaler,            os.path.join(MODELS_DIR, "scaler.joblib"))
+joblib.dump(imputer,           os.path.join(MODELS_DIR, "imputer.joblib"))
+joblib.dump(candidate_features, os.path.join(MODELS_DIR, "feature_columns.joblib"))
+# Also keep backward-compat copy
 joblib.dump(candidate_features, os.path.join(MODELS_DIR, "numeric_feature_columns.joblib"))
 
-print("✅ Saved models, encoders, scaler, imputer & features.")
+print(f"\n✅ Saved all artifacts to {MODELS_DIR}")
+print("   Models:       xgb_label_model.joblib, xgb_source_model.joblib")
+print("   Encoders:     label_encoder_label.joblib, source_classes.joblib")
+print("   Preprocessors: scaler.joblib, imputer.joblib")
+print("   Features:     feature_columns.joblib, numeric_feature_columns.joblib")
+if "asn_org" in data.columns and data["asn_org"].notna().sum() > 0:
+    print("   TF-IDF:       tfidf_asn.joblib")

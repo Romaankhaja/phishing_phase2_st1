@@ -77,7 +77,7 @@ def _get_optimal_concurrency():
 
     # Screenshots: ~500MB RAM per headless browser instance
     # Cap at 20 to avoid CPU thrashing on consumer hardware
-    max_screenshots = min(20, max(1, int(ram_gb / 0.5)))
+    max_screenshots = min(25, max(1, int(ram_gb / 0.35)))
 
     # Image Processing (CPU bound but light): 2x CPU cores
     max_image_proc = cpu_cores * 2
@@ -109,8 +109,8 @@ logger.info(f"🚀 Dynamic Concurrency Limits: OCR={MAX_CONCURRENT_OCR}, "
 # RDAP: Direct to authoritative registries (Verisign, etc.) — no published rate limit
 # WHOIS: Port 43 fallback — strict per-IP rate limits (~1 req/sec most registries)
 # DNS: Pre-filter resolution — lightweight, high concurrency safe
-MAX_CONCURRENT_RDAP = 10           # Moderate (polite)
-MAX_CONCURRENT_WHOIS = 2           # Strict (1 per IP) but safe with parallel flow
+MAX_CONCURRENT_RDAP = 15           # HTTP GET to registries, no hard rate limit
+MAX_CONCURRENT_WHOIS = 3           # 3 concurrent, still gated by rate_limiter
 MAX_CONCURRENT_DNS_PREFILTER = 200  # Fast (network bound)
 
 _ocr_semaphore: asyncio.Semaphore | None = None
