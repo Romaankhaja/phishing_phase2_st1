@@ -14,6 +14,7 @@ ROOT_DIR = os.path.dirname(BASE_DIR)
 FEATURES_CSV     = os.path.join(BASE_DIR, "blacklist_features.csv")
 FEATURES_ENRICH  = os.path.join(BASE_DIR, "features_enriched.csv")
 FINAL_OUTPUT     = os.path.join(ROOT_DIR, "output", "output_file.csv")
+CHECKPOINT_CSV   = os.path.join(ROOT_DIR, "output", "checkpoint_records.csv")
 
 # ML Models + Preprocessors
 MODELS_DIR           = os.path.join(ROOT_DIR, "models")

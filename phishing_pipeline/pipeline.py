@@ -29,7 +29,7 @@ from PIL import Image
 # EasyOCR in visual_features.py handles all text extraction now.
 
 from .config import (
-    FEATURES_CSV, FEATURES_ENRICH, FINAL_OUTPUT,
+    FEATURES_CSV, FEATURES_ENRICH, FINAL_OUTPUT, CHECKPOINT_CSV,
     ASN_DB_PATH, CITY_DB_PATH, SCREENS_DIR,
     EVIDENCE_DIR, APPLICATION_ID
 )
@@ -347,6 +347,20 @@ def adjust_source(org_name, whitelisted_domain, ml_source="Unknown"):
         if key in org_norm or key in whitelisted_domain.lower():
             return mapped
     return ml_source
+
+# ------------------------------------------------------------------
+# Checkpoint helper — survives Kaggle kills
+# ------------------------------------------------------------------
+def _append_record_to_checkpoint(record: dict, checkpoint_path: str):
+    """Append a single record as one CSV row. Write header if file is new."""
+    import csv as _csv
+    file_exists = os.path.exists(checkpoint_path) and os.path.getsize(checkpoint_path) > 0
+    with open(checkpoint_path, mode="a", newline="", encoding="utf-8") as f:
+        writer = _csv.DictWriter(f, fieldnames=record.keys())
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(record)
+
 # ------------------------------------------------------------------
 # Feature extraction (Chunked Processing for GPU Safety)
 # ------------------------------------------------------------------
@@ -708,7 +722,27 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
 
     # --- Use the new column name ---
     df_filtered = df_holdout[df_holdout["Legitimate Domains"].isin(ps02_df["Legitimate Domains"])]
-    
+
+    # ── Resume from checkpoint if a previous run was interrupted ──────────
+    done_domains = set()
+    if os.path.exists(CHECKPOINT_CSV):
+        try:
+            df_ckpt = pd.read_csv(CHECKPOINT_CSV)
+            done_domains = set(
+                df_ckpt["Identified Phishing/Suspected Domain Name"]
+                .astype(str).str.strip().str.lower()
+            )
+            logger.info("♻️  Resuming: %d domains already in checkpoint", len(done_domains))
+        except Exception as e:
+            logger.warning("⚠️ Could not read checkpoint, starting fresh: %s", e)
+
+    if done_domains:
+        df_filtered = df_filtered[
+            ~df_filtered["Identified Phishing/Suspected Domain Name"]
+             .astype(str).str.strip().str.lower().isin(done_domains)
+        ]
+        logger.info("📋 %d domains remaining after checkpoint resume", len(df_filtered))
+
     # Define a temp file path inside the phishing_pipeline folder
     temp_csv_path = os.path.join(os.path.dirname(__file__), "holdout_temp.csv")
     df_filtered.to_csv(temp_csv_path, index=False, encoding="utf-8")
@@ -778,6 +812,17 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
     live_hosts: set = set()
     dns_map: dict = {}
     serial_counter = [0]  # mutable int for evidence serial numbers
+
+    # Pre-populate from checkpoint if resuming
+    if done_domains:
+        try:
+            df_ckpt = pd.read_csv(CHECKPOINT_CSV)
+            all_records.extend(df_ckpt.to_dict("records"))
+            serial_counter[0] = len(all_records)
+            logger.info("♻️  Pre-loaded %d records from checkpoint (serial starts at %d)",
+                        len(all_records), serial_counter[0])
+        except Exception as e:
+            logger.warning("⚠️ Could not pre-load checkpoint records: %s", e)
 
     # Semaphores for Phase 2 lookups (reuse the singletons from utils)
     rdap_sem  = _get_rdap_semaphore()
@@ -959,6 +1004,8 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
         }
         async with records_lock:
             all_records.append(record)
+            # Flush to disk immediately — survives Kaggle kills
+            await asyncio.to_thread(_append_record_to_checkpoint, record, CHECKPOINT_CSV)
         logger.debug("✅ Phase 2 done for %s [%s]", host, lookup_method)
 
     # ── Phase 2 worker: drains queue2, one domain at a time per slot ─────
@@ -1041,6 +1088,14 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
     df_out = pd.DataFrame(all_records)
     df_out.to_csv(FINAL_OUTPUT, index=False, encoding="utf-8")
     logger.info("✅ Final output written to %s (%d records)", FINAL_OUTPUT, len(all_records))
+
+    # Clean up checkpoint — pipeline completed successfully
+    if os.path.exists(CHECKPOINT_CSV):
+        try:
+            os.remove(CHECKPOINT_CSV)
+            logger.info("🗑 Removed checkpoint file (pipeline completed successfully)")
+        except Exception as e:
+            logger.warning("⚠ Could not remove checkpoint file: %s", e)
 
     # ── Clean up temp file ────────────────────────────────────────────────
     try:
