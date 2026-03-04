@@ -64,7 +64,7 @@ def _get_browser_context() -> BrowserContext:
         _play = sync_playwright().start()
         _browser = _play.chromium.launch(headless=True)
         _default_viewport = {"width": 1280, "height": 900}
-        _context = _browser.new_context(viewport=_default_viewport)
+        _context = _browser.new_context(viewport=_default_viewport, accept_downloads=False)
         logger.info("✅ Playwright browser context is ready.")
         return _context
     
@@ -188,7 +188,7 @@ class AsyncBrowserManager:
             logger.info("🚀 Launching new Async Playwright session...")
             self._play = await async_playwright().start()
             self._browser = await self._play.chromium.launch(headless=True)
-            self._context = await self._browser.new_context(viewport={"width": 1280, "height": 900})
+            self._context = await self._browser.new_context(viewport={"width": 1280, "height": 900}, accept_downloads=False)
             logger.info("✅ New Async Browser Context Ready.")
             return self._context
         except Exception as e:
@@ -324,28 +324,17 @@ def capture_screenshot(url: str, out_file: str, width: int = 1280, height: int =
         logger.error("Screenshot capture error for %s: %s", url, e)
         return url, False
 
-async def capture_screenshot_async(url: str, out_file: str, width: int = 1280, height: int = 900) -> tuple[str, bool, dict]:
+async def capture_screenshot_async(url: str, out_file: str, width: int = 1280, height: int = 900) -> tuple[str, bool]:
     """
     Capture screenshot asynchronously with automatic retry and browser recovery.
     
     Includes:
     1. DNS resolution check (2s timeout) - skips dead domains
     2. HEAD request check (1.5s timeout) - skips unreachable sites
-    3. 🔬 Sandbox malware detection — listens for malicious downloads/MIME
-       types during the same browser visit used for the screenshot.
 
     Returns:
-        Tuple of (normalized_url, success_flag, sandbox_report_dict)
+        Tuple of (normalized_url, success_flag)
     """
-    from .sandbox import attach_sandbox_listeners, finalize_sandbox_report
-
-    _default_sandbox = {
-        "sandbox_verdict": "INCONCLUSIVE",
-        "sandbox_reason": "Not scanned (unreachable)",
-        "sandbox_status_code": 0,
-        "sandbox_details": [],
-    }
-
     if not url.startswith("http"):
         try_urls = [f"https://{url}", f"http://{url}"]
     else:
@@ -362,7 +351,7 @@ async def capture_screenshot_async(url: str, out_file: str, width: int = 1280, h
     # 1. Quick DNS check - skip if domain doesn't resolve
     if host and not await quick_dns_check(host, timeout=2.0):
         logger.debug(f"⚡ DNS failed for {host}, skipping screenshot")
-        return url, False, _default_sandbox
+        return url, False
     
     # 2. Quick HEAD check - skip if site doesn't respond
     for target_url in try_urls:
@@ -373,13 +362,12 @@ async def capture_screenshot_async(url: str, out_file: str, width: int = 1280, h
     else:
         # Neither https nor http responded
         logger.debug(f"⚡ HEAD check failed for {url}, skipping screenshot")
-        return url, False, _default_sandbox
+        return url, False
     
-    # ============ BROWSER SCREENSHOT + SANDBOX (only if pre-checks pass) ============
+    # ============ BROWSER SCREENSHOT (only if pre-checks pass) ============
     
     # Retry logic for the entire operation (in case browser crashes mid-op)
     MAX_RETRIES = 2
-    sandbox_report = _default_sandbox  # fallback if all retries fail
 
     for attempt in range(MAX_RETRIES):
         try:
@@ -392,36 +380,19 @@ async def capture_screenshot_async(url: str, out_file: str, width: int = 1280, h
             # 3. Try URLs
             for target in try_urls:
                 try:
-                    # 🔬 Attach sandbox listeners BEFORE navigating
-                    sandbox_report = attach_sandbox_listeners(page, target)
-
                     await page.goto(target, timeout=5000, wait_until='domcontentloaded')
-
-                    # 🔬 Wait 3s for delayed download triggers (e.g. JS-initiated)
-                    await page.wait_for_timeout(3000)
-
                     await page.screenshot(path=out_file, full_page=True)
-
-                    # 🔬 Finalize sandbox verdict (check HTTP status codes)
-                    finalize_sandbox_report(sandbox_report)
-
                     await page.close()
-                    return target, True, sandbox_report
+                    return target, True
                 except Exception as nav_error:
                     # If it's a "Target closed" error, it might be the browser dying
                     if "closed" in str(nav_error).lower() or "context" in str(nav_error).lower():
                         raise nav_error # Re-raise to trigger the outer retry loop
                     logger.debug(f"Attempt {attempt}: Nav failed for {target}: {nav_error}")
-
-                    # 🔬 Navigation failed — mark sandbox as inconclusive
-                    if sandbox_report["sandbox_verdict"] == "SAFE":
-                        sandbox_report["sandbox_verdict"] = "INCONCLUSIVE"
-                        sandbox_report["sandbox_reason"] = "Navigation failed"
                     continue
             
             await page.close()
-            finalize_sandbox_report(sandbox_report)
-            return try_urls[-1], False, sandbox_report
+            return try_urls[-1], False
 
         except Exception as e:
             err_msg = str(e).lower()
@@ -434,9 +405,9 @@ async def capture_screenshot_async(url: str, out_file: str, width: int = 1280, h
                     continue
             
             logger.error(f"❌ Async screenshot error for {url}: {e}")
-            return url, False, sandbox_report
+            return url, False
     
-    return url, False, sandbox_report
+    return url, False
 
 
 
@@ -617,7 +588,9 @@ async def get_favicon_features_async(url):
 def preprocess_image_for_ocr(image_path: str):
     """
     Phase A — CPU only, NO GPU lock required.
-    Loads, converts to grayscale, and downscales the screenshot.
+    Loads, converts to grayscale, downscales, applies adaptive
+    thresholding and sharpening for better OCR accuracy on
+    gradient/dark-background phishing pages.
     Returns a numpy array ready for EasyOCR, or None on failure.
     """
     try:
@@ -629,22 +602,39 @@ def preprocess_image_for_ocr(image_path: str):
         if img.width > max_width:
             ratio = max_width / img.width
             img = img.resize((max_width, int(img.height * ratio)), Image.Resampling.LANCZOS)
-        return np.array(img)
+        img_np = np.array(img)
+
+        # Adaptive thresholding — handles gradient/watermark backgrounds
+        img_np = cv2.adaptiveThreshold(
+            img_np, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 11, 2
+        )
+
+        # Mild sharpening — crispens text boundaries
+        sharpen_kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
+        img_np = cv2.filter2D(img_np, -1, sharpen_kernel)
+
+        return img_np
     except Exception as e:
         logger.error("OCR preprocess failed for %s: %s", image_path, e)
         return None
 
 
-def run_ocr_inference(img_np) -> str:
+def run_ocr_inference(img_np) -> tuple:
     """
     Phase B — GPU serialized. Holds _ocr_lock ONLY for reader.readtext().
     Call this after preprocess_image_for_ocr() has already returned img_np.
+
+    Returns:
+        tuple[str, list]: (flat_text, raw_results)
+            flat_text   — concatenated text string (backward-compatible)
+            raw_results — list of (bbox, text, confidence) tuples from EasyOCR detail=1
     """
     global _ocr_call_count, _ocr_reader
     import gc
 
     if img_np is None:
-        return ""
+        return "", []
 
     with _ocr_lock:
         # Periodic reader reset to clear VRAM fragmentation
@@ -662,9 +652,11 @@ def run_ocr_inference(img_np) -> str:
 
         try:
             reader = _get_ocr_reader()
-            results = reader.readtext(img_np, detail=0)
-            txt = " ".join(results)
-            return re.sub(r"\s+", " ", txt).strip()
+            results = reader.readtext(img_np, detail=1)  # detail=1: (bbox, text, conf)
+            # Filter low-confidence results
+            results = [(bbox, text, conf) for bbox, text, conf in results if conf >= 0.40]
+            txt = " ".join(text for _, text, _ in results)
+            return re.sub(r"\s+", " ", txt).strip(), results
         except torch.cuda.OutOfMemoryError:
             logger.warning("⚠️ CUDA OOM during OCR inference (call #%d). Clearing cache and retrying...",
                            _ocr_call_count)
@@ -672,9 +664,10 @@ def run_ocr_inference(img_np) -> str:
             gc.collect()
             _ocr_reader = None
             reader = _get_ocr_reader()
-            results = reader.readtext(img_np, detail=0)
-            txt = " ".join(results)
-            return re.sub(r"\s+", " ", txt).strip()
+            results = reader.readtext(img_np, detail=1)
+            results = [(bbox, text, conf) for bbox, text, conf in results if conf >= 0.40]
+            txt = " ".join(text for _, text, _ in results)
+            return re.sub(r"\s+", " ", txt).strip(), results
         finally:
             # Flush VRAM inside the lock — safe, serialized
             torch.cuda.empty_cache()
@@ -686,9 +679,59 @@ def extract_ocr_text(image_path: str) -> str:
     """
     Combined convenience wrapper (single-threaded / backward compat).
     For the two-stage pipeline, call preprocess_image_for_ocr() + run_ocr_inference() separately.
+    Returns only the flat text string for backward compatibility.
     """
     img_np = preprocess_image_for_ocr(image_path)
-    return run_ocr_inference(img_np)
+    text, _raw = run_ocr_inference(img_np)
+    return text
+
+
+def extract_spatial_ocr_features(img_np, ocr_raw_results: list, img_height: int = 900) -> dict:
+    """
+    Post-process EasyOCR detail=1 results to split text into three vertical zones:
+      - Header (top 20%) — brand/logo area
+      - Body   (middle 60%) — login form, instructions
+      - Footer (bottom 20%) — copyright/legal text
+
+    Args:
+        img_np:           numpy array of the preprocessed image (used for height fallback)
+        ocr_raw_results:  list of (bbox, text, confidence) from run_ocr_inference()
+        img_height:       image height in pixels (default 900)
+
+    Returns:
+        dict with spatial OCR features
+    """
+    # Use actual image height if numpy array is available
+    if img_np is not None and hasattr(img_np, 'shape') and len(img_np.shape) >= 2:
+        img_height = img_np.shape[0]
+
+    HEADER_ZONE = 0.20  # top 20%
+    FOOTER_ZONE = 0.80  # bottom 20%
+
+    header_texts, body_texts, footer_texts = [], [], []
+
+    for (bbox, text, confidence) in ocr_raw_results:
+        if not text or not text.strip():
+            continue
+        # Bounding box: [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
+        ys = [pt[1] for pt in bbox]
+        centroid_y = np.mean(ys) / img_height
+
+        if centroid_y < HEADER_ZONE:
+            header_texts.append(text.strip())
+        elif centroid_y > FOOTER_ZONE:
+            footer_texts.append(text.strip())
+        else:
+            body_texts.append(text.strip())
+
+    return {
+        "ocr_header_text": " ".join(header_texts),
+        "ocr_body_text": " ".join(body_texts),
+        "ocr_footer_text": " ".join(footer_texts),
+        "ocr_header_word_count": len(header_texts),
+        "ocr_footer_word_count": len(footer_texts),
+        "ocr_total_word_count": len(ocr_raw_results),
+    }
 
 # ------------------ Sharpness ------------------
 def laplacian_variance(image_path: str, min_size: int = 50) -> float:

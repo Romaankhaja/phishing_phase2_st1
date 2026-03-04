@@ -33,6 +33,7 @@ from .visual_features import (
     extract_ocr_text,
     preprocess_image_for_ocr,   # Phase A: CPU image prep, lockless
     run_ocr_inference,           # Phase B: GPU inference, minimal lock hold
+    extract_spatial_ocr_features,# Spatial zone segmentation (CPU-only post-process)
     laplacian_variance,
     get_favicon_features_async,
 )
@@ -495,16 +496,19 @@ def _safe_preprocess_image(path: str):
         return None
 
 
-def _safe_run_ocr(img_np) -> str:
+def _safe_run_ocr(img_np) -> tuple:
     """
     Phase B wrapper — GPU serialized, minimal lock scope.
     Pass the numpy array from _safe_preprocess_image().
+
+    Returns:
+        tuple[str, list]: (flat_text, raw_results)
     """
     try:
         return run_ocr_inference(img_np)
     except Exception as e:
         logger.error("OCR inference failed: %s", e)
-        return ""
+        return "", []
 
 
 def _safe_extract_laplacian(path: str) -> float:
@@ -530,4 +534,92 @@ def _safe_extract_laplacian(path: str) -> float:
     except Exception as e:
         logger.error("Laplacian variance extraction failed for %s: %s", path, e)
         return float("nan")
+
+
+# =====================================================================
+# Textual-Visual Consistency (TVC) Features
+# =====================================================================
+
+# Brand → known legitimate domains mapping
+BRAND_DOMAIN_MAP = {
+    "sbi":       ["sbi.co.in", "onlinesbi.com", "onlinesbi.sbi"],
+    "icici":     ["icicibank.com"],
+    "hdfc":      ["hdfcbank.com"],
+    "axis":      ["axisbank.com"],
+    "kotak":     ["kotak.com", "kotakbank.com"],
+    "pnb":       ["pnbindia.in"],
+    "canara":    ["canarabank.com"],
+    "bob":       ["bankofbaroda.in", "bankofbaroda.com"],
+    "airtel":    ["airtel.in", "airtel.com"],
+    "irctc":     ["irctc.co.in"],
+    "nic":       ["nic.in", "gov.in"],
+    "iocl":      ["iocl.com"],
+    "lic":       ["licindia.in"],
+    "google":    ["google.com", "google.co.in"],
+    "facebook":  ["facebook.com", "fb.com"],
+    "instagram": ["instagram.com"],
+    "microsoft": ["microsoft.com", "live.com", "outlook.com", "microsoftonline.com"],
+    "paypal":    ["paypal.com"],
+    "amazon":    ["amazon.com", "amazon.in"],
+    "whatsapp":  ["whatsapp.com"],
+    "telegram":  ["telegram.org"],
+}
+
+
+def extract_tvc_features(url: str, ocr_header_text: str, ocr_footer_text: str) -> dict:
+    """
+    Textual-Visual Consistency: checks if visual brand signals match the actual domain.
+
+    Compares brand names found in OCR header/footer text against the website's
+    actual domain using the BRAND_DOMAIN_MAP lookup table.
+
+    Args:
+        url:             The URL being analyzed
+        ocr_header_text: OCR text from the header zone (brand/logo area)
+        ocr_footer_text: OCR text from the footer zone (legal/copyright area)
+
+    Returns:
+        dict with TVC features:
+            tvc_brand_detected  (bool)  — any known brand found in visual text
+            tvc_detected_brand  (str)   — which brand was detected (or "none")
+            tvc_domain_match    (bool)  — actual domain is a legitimate domain for the brand
+            tvc_fuzzy_score     (float) — fuzzy string similarity (0.0—1.0)
+            tvc_brand_spoofed   (bool)  — brand detected but domain DOESN'T match (phishing signal)
+    """
+    from rapidfuzz import fuzz
+
+    ext = tldextract.extract(url)
+    actual_domain = f"{ext.domain}.{ext.suffix}".lower()
+
+    # Combine header + footer as primary brand surface
+    brand_surface = re.sub(r"[^a-z0-9\s]", " ", (ocr_header_text + " " + ocr_footer_text).lower())
+
+    best_brand_hit = None
+    best_match_score = 0.0
+    domain_matches_brand = False
+
+    for brand, legit_domains in BRAND_DOMAIN_MAP.items():
+        if brand in brand_surface:
+            # Check if actual domain is a known legitimate domain
+            is_legit = any(
+                actual_domain == ld or actual_domain.endswith("." + ld)
+                for ld in legit_domains
+            )
+
+            # Fuzzy match: how similar is actual_domain to expected domains?
+            fuzzy_scores = [fuzz.ratio(actual_domain, ld) for ld in legit_domains]
+            score = max(fuzzy_scores) / 100.0
+
+            if score > best_match_score:
+                best_match_score = score
+                best_brand_hit = brand
+                domain_matches_brand = is_legit
+
+    return {
+        "tvc_brand_detected": best_brand_hit is not None,
+        "tvc_detected_brand": best_brand_hit or "none",
+        "tvc_domain_match": domain_matches_brand,
+        "tvc_fuzzy_score": round(best_match_score, 4),
+        "tvc_brand_spoofed": (best_brand_hit is not None) and (not domain_matches_brand),
+    }
 

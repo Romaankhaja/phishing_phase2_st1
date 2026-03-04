@@ -1,7 +1,12 @@
 import asyncio
 import logging
 import psutil
-import torch
+
+try:
+    import torch
+    TORCH_AVAILABLE = torch.cuda.is_available()
+except ImportError:
+    TORCH_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -11,7 +16,7 @@ class ResourceMonitor:
         self.ram_threshold = ram_threshold
         self.gpu_threshold = gpu_threshold
         self.check_interval = check_interval
-        self.gpu_available = torch.cuda.is_available()
+        self.gpu_available = TORCH_AVAILABLE
         if self.gpu_available:
             self.device_name = torch.cuda.get_device_name(0)
             logger.info(f"ResourceMonitor: GPU detected: {self.device_name}")
@@ -35,20 +40,18 @@ class ResourceMonitor:
             logger.debug(f"Throttling: High RAM usage ({ram_usage}%)")
             return False
 
-        # 3. Check GPU (if available)
+        # 3. Check GPU (if available via PyTorch)
         if self.gpu_available:
             try:
-                # torch.cuda.mem_get_info() returns (free, total)
-                free_mem, total_mem = torch.cuda.mem_get_info()
+                free_mem, total_mem = torch.cuda.mem_get_info(0)
                 used_mem_pct = ((total_mem - free_mem) / total_mem) * 100
                 if used_mem_pct > self.gpu_threshold:
                     logger.debug(f"Throttling: High GPU memory usage ({used_mem_pct:.1f}%)")
                     return False
             except RuntimeError as e:
-                # CUDA OOM during check means we should definitely throttle
                 if "out of memory" in str(e).lower():
                     logger.warning("GPU exhausted during resource check, forcing throttle")
-                    torch.cuda.empty_cache()  # Try to recover
+                    torch.cuda.empty_cache()
                     return False
                 logger.warning(f"Error checking GPU resources: {e}")
             except Exception as e:
@@ -64,7 +67,6 @@ class ResourceMonitor:
         wait_count = 0
         while not self.check_resources():
             wait_count += 1
-            # Actively try to free GPU memory while waiting
             if self.gpu_available and wait_count % 3 == 0:
                 try:
                     torch.cuda.empty_cache()
