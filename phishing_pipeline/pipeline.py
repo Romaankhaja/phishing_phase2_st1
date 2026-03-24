@@ -982,15 +982,18 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
         )
 
         # ── 9. Evidence PDF ───────────────────────────────────────────────
-        async with records_lock:
-            serial_counter[0] += 1
-            serial_no = serial_counter[0]
+        if classification.lower() == "phishing":
+            async with records_lock:
+                serial_counter[0] += 1
+                serial_no = serial_counter[0]
 
-        evidence_path, evidence_name = format_evidence_filename(
-            feat_row.get("Cooresponding CSE", "Unknown"),
-            domain_url, serial_no, application_id=APPLICATION_ID
-        )
-        await asyncio.to_thread(move_screenshot_to_evidence, domain_url, evidence_path)
+            evidence_path, evidence_name = format_evidence_filename(
+                feat_row.get("Cooresponding CSE", "Unknown"),
+                domain_url, serial_no, application_id=APPLICATION_ID
+            )
+            await asyncio.to_thread(move_screenshot_to_evidence, domain_url, evidence_path)
+        else:
+            evidence_name = "NA"
 
         detection_date = datetime.now().strftime("%d-%m-%Y")
         detection_time_str = datetime.now().strftime("%H:%M:%S")

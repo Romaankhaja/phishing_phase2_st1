@@ -53,19 +53,19 @@ venv\Scripts\python.exe main_controller.py
 
 This adds these columns to the output CSV:
 
-| Column | Type | Source |
-|---|---|---|
-| `ocr_header_text` | string | Top 20% of page (brand zone) |
-| `ocr_body_text` | string | Middle 60% |
-| `ocr_footer_text` | string | Bottom 20% (legal zone) |
-| `ocr_header_word_count` | int | Word count in header zone |
-| `ocr_footer_word_count` | int | Word count in footer zone |
-| `ocr_total_word_count` | int | Total OCR words |
-| `tvc_brand_detected` | bool | Any known brand in OCR text? |
-| `tvc_detected_brand` | string | Which brand (e.g., "sbi") |
-| `tvc_domain_match` | bool | Domain matches the brand? |
-| `tvc_fuzzy_score` | float | Fuzzy similarity score (0–1) |
-| `tvc_brand_spoofed` | bool | **Key signal**: brand present but wrong domain |
+| Column                    | Type   | Source                                               |
+| ------------------------- | ------ | ---------------------------------------------------- |
+| `ocr_header_text`       | string | Top 20% of page (brand zone)                         |
+| `ocr_body_text`         | string | Middle 60%                                           |
+| `ocr_footer_text`       | string | Bottom 20% (legal zone)                              |
+| `ocr_header_word_count` | int    | Word count in header zone                            |
+| `ocr_footer_word_count` | int    | Word count in footer zone                            |
+| `ocr_total_word_count`  | int    | Total OCR words                                      |
+| `tvc_brand_detected`    | bool   | Any known brand in OCR text?                         |
+| `tvc_detected_brand`    | string | Which brand (e.g., "sbi")                            |
+| `tvc_domain_match`      | bool   | Domain matches the brand?                            |
+| `tvc_fuzzy_score`       | float  | Fuzzy similarity score (0–1)                        |
+| `tvc_brand_spoofed`     | bool   | **Key signal**: brand present but wrong domain |
 
 > [!TIP]
 > If you can't re-run the pipeline right now, the training script will zero-fill missing columns and still train. The meta-learner will just rely on base model probs until real data is available.
@@ -143,12 +143,12 @@ dir models\meta\
 
 Expected files:
 
-| File | Purpose |
-|---|---|
-| `meta_label_model.joblib` | The meta-learner XGBoost model |
-| `meta_imputer.joblib` | Imputer for meta-feature NaN handling |
-| `meta_scaler.joblib` | StandardScaler for meta-features |
-| `meta_feature_names.joblib` | Ordered list of feature names |
+| File                             | Purpose                               |
+| -------------------------------- | ------------------------------------- |
+| `meta_label_model.joblib`      | The meta-learner XGBoost model        |
+| `meta_imputer.joblib`          | Imputer for meta-feature NaN handling |
+| `meta_scaler.joblib`           | StandardScaler for meta-features      |
+| `meta_feature_names.joblib`    | Ordered list of feature names         |
 | `tfidf_ocr_header_text.joblib` | TF-IDF vectorizer for header OCR text |
 | `tfidf_ocr_footer_text.joblib` | TF-IDF vectorizer for footer OCR text |
 
@@ -184,9 +184,9 @@ final_label = meta_model.predict(meta_feats)
 
 ## Troubleshooting
 
-| Issue | Solution |
-|---|---|
-| "Missing columns" warning during training | Re-run the pipeline over training URLs first (Step 1) |
-| Low F1 score | Need more training data with actual TVC features (not zero-filled) |
-| `ModuleNotFoundError: rapidfuzz` | `pip install rapidfuzz` (should already be in requirements.txt) |
-| CUDA OOM during base model prediction | Reduce training CSV size or switch to CPU: `CUDA_VISIBLE_DEVICES="" python -m scripts.train_with_ocr_features` |
+| Issue                                     | Solution                                                                                                        |
+| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| "Missing columns" warning during training | Re-run the pipeline over training URLs first (Step 1)                                                           |
+| Low F1 score                              | Need more training data with actual TVC features (not zero-filled)                                              |
+| `ModuleNotFoundError: rapidfuzz`        | `pip install rapidfuzz` (should already be in requirements.txt)                                               |
+| CUDA OOM during base model prediction     | Reduce training CSV size or switch to CPU:`CUDA_VISIBLE_DEVICES="" python -m scripts.train_with_ocr_features` |
