@@ -1,0 +1,2 @@
+data/data/holdout_sets/**/*.xlsx filter=lfs diff=lfs merge=lfs -text
+*.xlsx filter=lfs diff=lfs merge=lfs -text
