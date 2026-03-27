@@ -76,11 +76,11 @@ except ImportError as e:
     shortlisting = None
 
 try:
-    from hashing_ml.comparison import run_hashing_shortlist
-    logger.info("Imported run_hashing_shortlist from hashing_ml.comparison")
+    from hashing_ml.comparison import run_hashing_shortlist_async
+    logger.info("Imported run_hashing_shortlist_async from hashing_ml.comparison")
 except ImportError as e:
     logger.warning("Could not import hashing_ml.comparison: %s", e)
-    run_hashing_shortlist = None
+    run_hashing_shortlist_async = None
 
 
 def clear_gpu_memory():
@@ -106,9 +106,9 @@ async def main():
     # ---
     # --- FIX 1: Updated default paths to match your new system
     # ---
-    parser.add_argument("--whitelist", type=str, default=r"data\whitelists\Stage_2_Legitimate_Domains_80.xlsx",
+    parser.add_argument("--whitelist", type=str, default=os.path.join("data", "whitelists", "Stage_2_Legitimate_Domains_80.xlsx"),
                         help="Path to whitelist Excel file")
-    parser.add_argument("--shortlisting", type=str, default=r"data\holdout_sets\PS-02_hold-out_Set_2",
+    parser.add_argument("--shortlisting", type=str, default=os.path.join("data", "holdout_sets", "PS-02_hold-out_Set_2"),
                         help="Folder containing shortlisting .xlsx files")
     # --- (End of Fix 1) ---
     
@@ -140,12 +140,12 @@ async def main():
         df_out = None
 
         # Try the new-style orchestration (controller -> hashing_ml -> pipeline)
-        if run_hashing_shortlist and shortlisting:
+        if run_hashing_shortlist_async and shortlisting:
             # 1. Run Shortlisting using hashing_ml
             logger.info("--- Starting Step 1: Running Hashing-based Shortlisting ---")
             urls = shortlisting.load_urls_from_excel_folder(args.shortlisting)
             
-            holdout_df = run_hashing_shortlist(list(urls), threshold=65)
+            holdout_df = await run_hashing_shortlist_async(list(urls), threshold=65)
             
             # Save output to holdout.csv
             out_csv = os.path.join("output", "holdout.csv")

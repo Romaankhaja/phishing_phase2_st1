@@ -716,12 +716,14 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
     if not use_existing_holdout or not os.path.exists(holdout_csv_path):
         logger.info("Generating new holdout.csv via hashing_ml...")
         from .shortlisting import load_urls_from_excel_folder
+        import sys
+        import os
         # Ensure parent module is in path
         sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
         try:
-            from hashing_ml.comparison import run_hashing_shortlist
+            from hashing_ml.comparison import run_hashing_shortlist_async
             urls = load_urls_from_excel_folder(holdout_folder)
-            holdout_df = run_hashing_shortlist(list(urls), threshold=65)
+            holdout_df = await run_hashing_shortlist_async(list(urls), threshold=65)
             
             os.makedirs(os.path.dirname(holdout_csv_path), exist_ok=True)
             holdout_df.to_csv(holdout_csv_path, index=False)
