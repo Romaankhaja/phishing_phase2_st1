@@ -1,0 +1,15 @@
+playwright
+requests
+aiohttp
+beautifulsoup4
+pillow
+imagehash
+tldextract
+rapidfuzz
+pandas
+openpyxl
+ultralytics
+opencv-python
+numpy
+torch
+transformers
