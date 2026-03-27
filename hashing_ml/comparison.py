@@ -227,7 +227,8 @@ def load_domains(csv_file):
 BASE_DIR = os.path.dirname(__file__)
 URLS_PATH = os.path.join(BASE_DIR, "urls.csv")
 
-url_list = load_domains(URLS_PATH)
+# Only load test URLs if running standalone; do not crash module import.
+# url_list = load_domains(URLS_PATH)
 
 WEIGHTS = {
     "domain": 20,
