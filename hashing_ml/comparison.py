@@ -1,4 +1,5 @@
 import json
+import ray
 import hashlib
 import tldextract
 from urllib.parse import urlparse
@@ -26,9 +27,9 @@ except ImportError:
 _clip_logger = _logging.getLogger(__name__)
 
 # ── Parallelism tuning (AMD EPYC 9654 + NVIDIA H100) ──
-MAX_CONCURRENT_PAGES = 64       # Scale up Playwright pages for AMD EPYC
+MAX_CONCURRENT_PAGES =  120# Scale up Playwright pages for AMD EPYC
 DOMAIN_SIM_WORKERS   = 40       # More ProcessPoolExecutor workers for CPU-bound scoring
-CLIP_BATCH_SIZE      = 128      # Massive VRAM allows huge batch pass
+CLIP_BATCH_SIZE      = 3000  # Massive VRAM allows huge batch pass
 
 # transformers and CLIP are optional; use fallback for environments without these deps.
 try:
@@ -63,14 +64,9 @@ def _get_model():
     try:
         _clip_logger.info("🚀 Loading CLIP model (%s) on %s...", _MODEL_NAME, device)
         m = CLIPModel.from_pretrained(_MODEL_NAME)
-        # FP16 + torch.compile on CUDA for massive throughput
+        # FP16 on CUDA for massive throughput
         if device == "cuda":
             m = m.half()
-            try:
-                m = torch.compile(m)
-                _clip_logger.info("⚡ CLIP model successfully compiled via torch.compile")
-            except Exception as e:
-                _clip_logger.warning("torch.compile not available: %s", e)
         m = m.to(device).eval()
         p = CLIPProcessor.from_pretrained(_MODEL_NAME, use_fast=True)
         _model, _processor = m, p
@@ -287,8 +283,10 @@ def favicon_hash(domain):
 
 
 def domain_similarity(d1, d2):
-    e1 = tldextract.extract(d1)
-    e2 = tldextract.extract(d2)
+    if isinstance(d1, list): d1 = d1[0] if d1 else ""
+    if isinstance(d2, list): d2 = d2[0] if d2 else ""
+    e1 = tldextract.extract(str(d1))
+    e2 = tldextract.extract(str(d2))
 
     if e1.domain == e2.domain:
         return 1.0
@@ -465,97 +463,171 @@ async def fetch_features(target_url, browser, semaphore, aio_session):
 # RUN (parallel)
 ###############################################
 
-async def run_hashing_shortlist_async(url_list, threshold=65):
-    import pandas as pd
-    t0 = time.perf_counter()
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_PAGES)
+###############################################
+# RAY DISTRIBUTED DETECTION
+###############################################
 
-    # Create a shared aiohttp session (connection pooling)
-    connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT_PAGES * 2) if _has_aiohttp else None
+@ray.remote(num_gpus=1)
+class GPUInferenceActor:
+    def __init__(self, clip_matrix_np):
+        import torch
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.gpu_clip_matrix = torch.tensor(clip_matrix_np, dtype=torch.float32, device=self.device)
+
+    def score_batch(self, images, cpu_scores_batch):
+        import torch
+        import numpy as np
+        if not images:
+            return []
+        
+        clip_embeddings = get_clip_embeddings_batch(images, batch_size=len(images))
+        sv = torch.tensor(clip_embeddings, dtype=torch.float32, device=self.device)
+        sv = sv / sv.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        
+        all_sims = torch.mm(self.gpu_clip_matrix, sv.T).cpu().numpy()
+        
+        n_entities = len(_entity_index["names"])
+        results = []
+        for b in range(len(images)):
+            scores = cpu_scores_batch[b].copy()
+            
+            # all_sims is shape (M, B)
+            if all_sims.ndim > 1:
+                all_sims_b = all_sims[:, b]
+            else:
+                all_sims_b = all_sims
+            
+            for i in range(n_entities):
+                mask = _entity_index["clip_entity_idx"] == i
+                if mask.any():
+                    scores[i] += float(all_sims_b[mask].max()) * WEIGHTS["screenshot"]
+            
+            scores = (scores / _TOTAL_WEIGHT) * 100
+            best_idx = int(np.argmax(scores))
+            results.append({
+                "entity": _entity_index["names"][best_idx], 
+                "score": float(scores[best_idx])
+            })
+        return results
+
+@ray.remote(num_cpus=1)
+def process_url_chunk_ray(chunk_urls, gpu_actor_handle):
+    import asyncio
+    return asyncio.run(_async_process_chunk(chunk_urls, gpu_actor_handle))
+
+async def _async_process_chunk(chunk_urls, gpu_actor_handle):
+    import asyncio
+    import aiohttp
+    from playwright.async_api import async_playwright
+    from PIL import Image
+    from io import BytesIO
+    import numpy as np
+
+    semaphore = asyncio.Semaphore(16)
+    connector = aiohttp.TCPConnector(limit=32) if _has_aiohttp else None
     aio_session = aiohttp.ClientSession(connector=connector) if _has_aiohttp else None
-
-    # Process pool for CPU-bound rapidfuzz domain similarity
-    pool = ProcessPoolExecutor(max_workers=DOMAIN_SIM_WORKERS)
-
-    results = []
-    # Process the 2,000,000 URLs in chunks to prevent memory explosion & perfectly batch the GPU
-    chunk_size = CLIP_BATCH_SIZE
-
+    
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
+        tasks = [fetch_features(u, browser, semaphore, aio_session) for u in chunk_urls]
+        chunk_features = await asyncio.gather(*tasks)
+        await browser.close()
+    if aio_session:
+        await aio_session.close()
 
-        print(f"🚀 Processing {len(url_list)} URLs in chunks of {chunk_size} with up to {MAX_CONCURRENT_PAGES} concurrent pages...")
+    images = []
+    cpu_scores_list = []
+    final_urls = []
+    
+    n_entities = len(_entity_index["names"])
+    
+    for url, domain, screenshot, words, fav_hash in chunk_features:
+        if screenshot is None:
+            continue
+        images.append(Image.open(BytesIO(screenshot)))
+        final_urls.append(url)
+        
+        scores = np.zeros(n_entities, dtype="float64")
+        for i in range(n_entities):
+            entity_domains = _entity_index["domains"][i]
+            if entity_domains:
+                d_sim = max(domain_similarity(domain, d) for d in entity_domains)
+            else:
+                d_sim = 0.0
+            scores[i] += d_sim * WEIGHTS["domain"]
+            if fav_hash and fav_hash in _entity_index["fav_sets"][i]:
+                scores[i] += WEIGHTS["favicon"]
+            if _entity_index["kw_sets"][i]:
+                overlap = len(words & _entity_index["kw_sets"][i])
+                scores[i] += min(overlap / 5, 1.0) * WEIGHTS["keywords"]
+        cpu_scores_list.append(scores)
+        
+    if not images:
+        return []
+        
+    cpu_scores_batch = np.array(cpu_scores_list, dtype="float32")
+    # RPC to the hot VRAM Actor!
+    gpu_results = await gpu_actor_handle.score_batch.remote(images, cpu_scores_batch)
+    
+    out = []
+    for url, res in zip(final_urls, gpu_results):
+        out.append((url, res["entity"], res["score"]))
+    return out
 
-        for i in range(0, len(url_list), chunk_size):
-            chunk_urls = url_list[i:i+chunk_size]
-            print(f"🔄 Processing chunk {i//chunk_size + 1} / {(len(url_list)-1)//chunk_size + 1}")
-
-            # 1. Scraping & Extracted text concurrently (CPU/IO Bound)
-            tasks = [fetch_features(u, browser, semaphore, aio_session) for u in chunk_urls]
-            chunk_features = await asyncio.gather(*tasks)
-
-            # 2. Separate valid images for the H100 NVL
-            images = []
-            for feat in chunk_features:
-                if feat[2] is not None:
-                    images.append(Image.open(BytesIO(feat[2])))
-            
-            # 3. Massive GPU Batch Inference (1 forward pass!)
-            clip_embeddings = []
-            if images:
-                clip_embeddings = get_clip_embeddings_batch(images, batch_size=CLIP_BATCH_SIZE)
-            
-            # 4. Fast Map Reduce CPU+GPU Scoring
-            clip_idx = 0
-            for feat in chunk_features:
-                url, domain, screenshot_bytes, words, fav_hash = feat
-                
-                if screenshot_bytes is None:
-                    continue  # Site failed to load
-                
-                emb = clip_embeddings[clip_idx]
-                clip_idx += 1
-                
-                # GPU Tensor / CPU Math Similarity
-                scores = score_all_entities(emb, domain, fav_hash, words, pool)
-                best_entity = max(scores, key=scores.get)
-                best_score = scores[best_entity]
-
+def run_hashing_shortlist_ray(url_list, threshold=65):
+    import pandas as pd
+    import time
+    t0 = time.perf_counter()
+    
+    # Pre-init Ray using EPYC's 48 CPUs and H100 GPU
+    if not ray.is_initialized():
+        ray.init(ignore_reinit_error=True)
+        
+    chunk_size = 128
+    print(f"🚀 Submitting {len(url_list)} URLs to Ray Cluster across CPUs and 1 GPU...")
+    
+    gpu_actor = GPUInferenceActor.remote(_entity_index["clip_matrix"])
+    
+    futures = []
+    # Send chunks rapidly as asynchronous Ray RPC Tasks
+    for i in range(0, len(url_list), chunk_size):
+        chunk = url_list[i : i+chunk_size]
+        futures.append(process_url_chunk_ray.remote(chunk, gpu_actor))
+        
+    results = []
+    while futures:
+        ready, futures = ray.wait(futures, num_returns=1, timeout=0.1)
+        for f in ready:
+            res_list = ray.get(f)
+            for url, best_entity, best_score in res_list:
                 if best_score > threshold:
                     print(f"✅ {url} -> {best_entity} ({best_score:.1f}%)")
                     results.append((url, best_entity, best_score))
                 else:
                     print(f"❌ {url} -> None (best: {best_entity} {best_score:.1f}%)")
-
-        await browser.close()
-
-    pool.shutdown(wait=False)
-
-    if aio_session:
-        await aio_session.close()
-
+                
     elapsed = time.perf_counter() - t0
-    print(f"\n⏱ Done in {elapsed:.1f}s ({len(url_list)} URLs)")
-
+    print(f"\n⏱ Ray Processing done in {elapsed:.1f}s ({len(url_list)} URLs)")
+    
+    # Optional cleanup for long running instances
+    ray.shutdown()
+    
     rows = []
     for target_url, best_entity, best_score in results:
         rows.append({
             "Cooresponding CSE": best_entity,
             "Identified Phishing/Suspected Domain Name": target_url
         })
-    
     return pd.DataFrame(rows)
 
 def run_hashing_shortlist(url_list, threshold=65):
-    """Synchronous wrapper for the hashing shortlisting process."""
-    return asyncio.run(run_hashing_shortlist_async(url_list, threshold))
+    return run_hashing_shortlist_ray(url_list, threshold)
 
 if __name__ == "__main__":
-    # For testing standalone
     test_urls = [
         "https://www.onlinesbi.sbi/",
         "http://airtel.in",
         "http://myjio.login.com",
     ]
-    df = run_hashing_shortlist(test_urls)
+    df = run_hashing_shortlist_ray(test_urls)
     print(df)
