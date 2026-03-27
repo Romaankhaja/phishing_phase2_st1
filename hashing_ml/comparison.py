@@ -432,7 +432,7 @@ async def detect_entity(target_url, browser, semaphore, aio_session, pool):
 
         except Exception:
             print(f"⚠ Failed loading {target_url}")
-            return
+            return target_url, None, 0.0
 
     ###############################################
     # FEATURES (collected in parallel where possible)
@@ -468,15 +468,18 @@ async def detect_entity(target_url, browser, semaphore, aio_session, pool):
 
     if best_score > 65:
         print(f"✅ Related to: {best_entity} ({best_score:.1f}%)")
+        return target_url, best_entity, best_score
     else:
         print(f"❌ Not related to any known CSE (best: {best_entity} {best_score:.1f}%)")
+        return target_url, None, best_score
 
 
 ###############################################
 # RUN (parallel)
 ###############################################
 
-async def main():
+async def run_hashing_shortlist_async(url_list, threshold=65):
+    import pandas as pd
     t0 = time.perf_counter()
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_PAGES)
 
@@ -496,7 +499,7 @@ async def main():
             detect_entity(url, browser, semaphore, aio_session, pool)
             for url in url_list
         ]
-        await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks)
 
         await browser.close()
 
@@ -508,6 +511,26 @@ async def main():
     elapsed = time.perf_counter() - t0
     print(f"\n⏱ Done in {elapsed:.1f}s ({len(url_list)} URLs)")
 
+    rows = []
+    for target_url, best_entity, best_score in results:
+        if best_entity is not None and best_score >= threshold:
+            rows.append({
+                "Cooresponding CSE": best_entity,
+                "Identified Phishing/Suspected Domain Name": target_url
+            })
+    
+    return pd.DataFrame(rows)
+
+def run_hashing_shortlist(url_list, threshold=65):
+    """Synchronous wrapper for the hashing shortlisting process."""
+    return asyncio.run(run_hashing_shortlist_async(url_list, threshold))
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # For testing standalone
+    test_urls = [
+        "https://www.onlinesbi.sbi/",
+        "http://airtel.in",
+        "http://myjio.login.com",
+    ]
+    df = run_hashing_shortlist(test_urls)
+    print(df)

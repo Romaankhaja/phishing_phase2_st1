@@ -37,7 +37,7 @@ from .utils import extract_all_features_async
 from .visual_features import close_browser
 from .geoip_utils import enrich_with_geoip
 from .model_utils import load_models_and_preproc
-from .shortlisting import generate_shortlisted_csv
+# from .shortlisting import generate_shortlisted_csv # REMOVED: Using hashing_ml instead
 from .rate_limiter import RateLimiter
 from .utils import (
     MAX_CONCURRENT_RDAP, MAX_CONCURRENT_WHOIS, MAX_CONCURRENT_DNS_PREFILTER,
@@ -714,12 +714,22 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
     holdout_csv_path = os.path.join(ROOT_DIR, "output", "holdout.csv")
 
     if not use_existing_holdout or not os.path.exists(holdout_csv_path):
-        logger.info("Generating new holdout.csv...")
-        holdout_csv_path = generate_shortlisted_csv(
-            holdout_folder=holdout_folder,
-            ps02_whitelist_file=ps02_whitelist_file,
-            limit_whitelisted=limit_whitelisted
-        )
+        logger.info("Generating new holdout.csv via hashing_ml...")
+        from .shortlisting import load_urls_from_excel_folder
+        # Ensure parent module is in path
+        sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+        try:
+            from hashing_ml.comparison import run_hashing_shortlist
+            urls = load_urls_from_excel_folder(holdout_folder)
+            holdout_df = run_hashing_shortlist(list(urls), threshold=65)
+            
+            os.makedirs(os.path.dirname(holdout_csv_path), exist_ok=True)
+            holdout_df.to_csv(holdout_csv_path, index=False)
+            logger.info(f"Generated holdout.csv with {len(holdout_df)} matched rows.")
+        except Exception as e:
+            logger.error("Failed to generate holdout.csv using hashing_ml: %s", e)
+            return
+
         if not os.path.exists(holdout_csv_path):
              logger.error("Failed to generate holdout.csv. Exiting.")
              return

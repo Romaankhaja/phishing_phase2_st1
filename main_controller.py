@@ -70,10 +70,17 @@ except ImportError as e:
 
 try:
     from phishing_pipeline import shortlisting
-    logger.info("Imported shortlisting module (shortlisting.py)")
+    logger.info("Imported shortlisting module for utils (shortlisting.py)")
 except ImportError as e:
     logger.warning("Could not import shortlisting.py: %s", e)
     shortlisting = None
+
+try:
+    from hashing_ml.comparison import run_hashing_shortlist
+    logger.info("Imported run_hashing_shortlist from hashing_ml.comparison")
+except ImportError as e:
+    logger.warning("Could not import hashing_ml.comparison: %s", e)
+    run_hashing_shortlist = None
 
 
 def clear_gpu_memory():
@@ -132,20 +139,19 @@ async def main():
 
         df_out = None
 
-        # Try the new-style orchestration (controller -> shortlisting -> pipeline)
-        if shortlisting and hasattr(shortlisting, 'run_shortlisting_process'):
+        # Try the new-style orchestration (controller -> hashing_ml -> pipeline)
+        if run_hashing_shortlist and shortlisting:
+            # 1. Run Shortlisting using hashing_ml
+            logger.info("--- Starting Step 1: Running Hashing-based Shortlisting ---")
+            urls = shortlisting.load_urls_from_excel_folder(args.shortlisting)
             
-            # --- This is your junior's new flow ---
+            holdout_df = run_hashing_shortlist(list(urls), threshold=65)
             
-            # 1. Run Shortlisting
-            logger.info("--- Starting Step 1: Running Shortlisting Process ---")
-            holdout_df = shortlisting.run_shortlisting_process(
-                holdout_folder=args.shortlisting,
-                whitelist_file=args.whitelist,
-                limit_whitelisted=args.limit,
-                write_outputs=True  # This creates holdout.csv
-            )
-            logger.info("--- Finished Step 1: Shortlisting Complete ---")
+            # Save output to holdout.csv
+            out_csv = os.path.join("output", "holdout.csv")
+            os.makedirs("output", exist_ok=True)
+            holdout_df.to_csv(out_csv, index=False)
+            logger.info(f"--- Finished Step 1: Shortlisting Complete ({len(holdout_df)} matched) ---")
             
             # 2. Run Pipeline
             logger.info("--- Starting Step 2: Running Main Pipeline ---")
