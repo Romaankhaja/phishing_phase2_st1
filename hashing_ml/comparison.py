@@ -623,6 +623,9 @@ def run_hashing_shortlist_ray(url_list, threshold=65):
 def run_hashing_shortlist(url_list, threshold=65):
     return run_hashing_shortlist_ray(url_list, threshold)
 
+# Alias for backward compatibility with main_controller.py
+run_hashing_shortlist_async = run_hashing_shortlist_ray
+
 if __name__ == "__main__":
     test_urls = [
         "https://www.onlinesbi.sbi/",
