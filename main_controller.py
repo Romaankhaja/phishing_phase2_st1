@@ -76,10 +76,10 @@ except ImportError as e:
     shortlisting = None
 
 try:
-    from hashing_ml.comparison import run_hashing_shortlist_async
-    logger.info("Imported run_hashing_shortlist_async from hashing_ml.comparison")
+    from phishing_pipeline.comparison import run_hashing_shortlist_async
+    logger.info("Imported run_hashing_shortlist_async from phishing_pipeline.comparison")
 except ImportError as e:
-    logger.warning("Could not import hashing_ml.comparison: %s", e)
+    logger.warning("Could not import phishing_pipeline.comparison: %s", e)
     run_hashing_shortlist_async = None
 
 
@@ -139,9 +139,9 @@ async def main():
 
         df_out = None
 
-        # Try the new-style orchestration (controller -> hashing_ml -> pipeline)
+        # Try the new-style orchestration (controller -> comparison -> pipeline)
         if run_hashing_shortlist_async and shortlisting:
-            # 1. Run Shortlisting using hashing_ml
+            # 1. Run Shortlisting using phishing_pipeline.comparison
             logger.info("--- Starting Step 1: Running Hashing-based Shortlisting ---")
             urls = shortlisting.load_urls_from_excel_folder(args.shortlisting)
             
@@ -183,7 +183,8 @@ async def main():
         zip_path = None
         if package_results is not None:
             try:
-                zip_path = package_results()
+                input_name = os.path.basename(os.path.normpath(args.shortlisting))
+                zip_path = package_results(zip_path=f"Submission-{input_name}.zip")
                 logger.info("Packaged results into: %s", zip_path)
             except Exception as exc:
                 logger.warning("package_results() failed: %s", exc)

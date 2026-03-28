@@ -714,12 +714,12 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
     holdout_csv_path = os.path.join(ROOT_DIR, "output", "holdout.csv")
 
     if not use_existing_holdout or not os.path.exists(holdout_csv_path):
-        logger.info("Generating new holdout.csv via hashing_ml...")
+        logger.info("Generating new holdout.csv via phishing_pipeline relocation...")
         from .shortlisting import load_urls_from_excel_folder
         # Ensure parent module is in path
         sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
         try:
-            from hashing_ml.comparison import run_hashing_shortlist_async
+            from .comparison import run_hashing_shortlist_async
             urls = load_urls_from_excel_folder(holdout_folder)
             holdout_df = await run_hashing_shortlist_async(list(urls), threshold=65)
             
@@ -727,7 +727,7 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
             holdout_df.to_csv(holdout_csv_path, index=False)
             logger.info(f"Generated holdout.csv with {len(holdout_df)} matched rows.")
         except Exception as e:
-            logger.error("Failed to generate holdout.csv using hashing_ml: %s", e)
+            logger.error("Failed to generate holdout.csv using hashing shortlist: %s", e)
             return
 
         if not os.path.exists(holdout_csv_path):
@@ -1205,8 +1205,10 @@ def package_results(output_file=FINAL_OUTPUT, zip_path="PS-02_ISS_NLP_Submission
 
     # --- Create the new ZIP file with the correct structure ---
     files_added_count = 0
-    # Note: zip_path is now created in the *root* directory
-    zip_path_full = os.path.join(ROOT_DIR, zip_path) 
+    # Note: zip_path is now created in the *output* directory
+    output_dir = os.path.join(ROOT_DIR, "output")
+    os.makedirs(output_dir, exist_ok=True)
+    zip_path_full = os.path.join(output_dir, os.path.basename(zip_path))
     
     with zipfile.ZipFile(zip_path_full, 'w', zipfile.ZIP_DEFLATED) as zipf:
         
@@ -1357,5 +1359,6 @@ if __name__ == "__main__":
 
     # Optionally package results
     if args.package_results:
-        zip_path = package_results()
+        input_name = os.path.basename(os.path.normpath(args.holdout_folder))
+        zip_path = package_results(zip_path=f"Submission-{input_name}.zip")
         logger.info("Packaged results into %s", zip_path)

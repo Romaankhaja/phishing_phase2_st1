@@ -201,7 +201,7 @@ def phash_distance(hash1, hash2):
 # LOAD DATA
 ###############################################
 
-with open(os.path.join(BASE_DIR, "entity_hash_db.json")) as f:
+with open(os.path.join(os.path.dirname(BASE_DIR), "data", "entity_hash_db.json")) as f:
     entity_db = json.load(f)
 
 
@@ -225,7 +225,8 @@ def load_domains(csv_file):
 
 
 BASE_DIR = os.path.dirname(__file__)
-URLS_PATH = os.path.join(BASE_DIR, "urls.csv")
+ROOT_DIR = os.path.dirname(BASE_DIR)
+URLS_PATH = os.path.join(ROOT_DIR, "data", "urls.csv")
 
 # Only load test URLs if running standalone; do not crash module import.
 # url_list = load_domains(URLS_PATH)
@@ -584,7 +585,7 @@ def run_hashing_shortlist_ray(url_list, threshold=65):
     if not ray.is_initialized():
         ray.init(ignore_reinit_error=True)
         
-    chunk_size = 128
+    chunk_size = 10
     print(f"🚀 Submitting {len(url_list)} URLs to Ray Cluster across CPUs and 1 GPU...")
     
     gpu_actor = GPUInferenceActor.remote(_entity_index["clip_matrix"])
@@ -615,10 +616,24 @@ def run_hashing_shortlist_ray(url_list, threshold=65):
     
     rows = []
     for target_url, best_entity, best_score in results:
+        legit_domain = "Unknown"
+        parsed = urlparse(normalize_url(target_url))
+        target_domain = parsed.netloc.lower()
+        try:
+            best_idx = _entity_index["names"].index(best_entity)
+            entity_domains = _entity_index["domains"][best_idx]
+            if entity_domains:
+                legit_domain = max(entity_domains, key=lambda d: domain_similarity(target_domain, d))
+        except ValueError:
+            pass
+            
         rows.append({
             "Cooresponding CSE": best_entity,
+            "Legitimate Domains": legit_domain,
             "Identified Phishing/Suspected Domain Name": target_url
         })
+    if not rows:
+        return pd.DataFrame(columns=["Cooresponding CSE", "Legitimate Domains", "Identified Phishing/Suspected Domain Name"])
     return pd.DataFrame(rows)
 
 def run_hashing_shortlist(url_list, threshold=65):

@@ -20,7 +20,7 @@ except ImportError:
     _has_aiohttp = False
 
 # Use the shared, optimized CLIP from comparison.py (lazy-loaded, FP16, batched)
-from hashing_ml.comparison import get_clip_embeddings_batch
+from .comparison import get_clip_embeddings_batch
 
 # ── Parallelism tuning (AMD EPYC 9654 – 48 cores, H100 GPU) ──
 MAX_CONCURRENT_PAGES = 16       # Playwright pages open at the same time
@@ -119,7 +119,8 @@ def get_ssl_hash(domain):
 ###############################################
 
 BASE_DIR = os.path.dirname(__file__)
-EXCEL_PATH = os.path.join(BASE_DIR, "Stage_2_Legitimate_Domains.xlsx")
+ROOT_DIR = os.path.dirname(BASE_DIR)
+EXCEL_PATH = os.path.join(ROOT_DIR, "data", "Stage_2_Legitimate_Domains.xlsx")
 
 df = pd.read_excel(EXCEL_PATH)
 df["CSE Name"] = df["CSE Name"].ffill()
@@ -294,7 +295,7 @@ asyncio.run(generate_hashes())
 # SAVE
 ###############################################
 
-with open(os.path.join(BASE_DIR, "entity_hash_db.json"), "w") as f:
+with open(os.path.join(os.path.dirname(BASE_DIR), "data", "entity_hash_db.json"), "w") as f:
     json.dump(entity_db, f, indent=4)
 
 

@@ -7,7 +7,7 @@ submission zip per file.
 Usage:
     python batch_holdout_runner.py
     python batch_holdout_runner.py --dry-run
-    python batch_holdout_runner.py --holdout-dir "data/data/holdout_sets/PS-02_hold-out_Set_2"
+    python batch_holdout_runner.py --holdout-dir "data/holdout_sets/PS-02_hold-out_Set_2"
     python batch_holdout_runner.py --whitelist "data/whitelists/Stage_2_Legitimate_Domains_80.xlsx"
 """
 
@@ -158,10 +158,10 @@ def derive_zip_name(xlsx_filename: str) -> str:
     """Derive a submission zip name from the holdout filename.
 
     Example: 'Unlabelled_Data_2026-03-01.xlsx'
-           → 'PS-02_ISS_NLP_Submission_Unlabelled_Data_2026-03-01.zip'
+           → 'Submission-Unlabelled_Data_2026-03-01.zip'
     """
     stem = os.path.splitext(xlsx_filename)[0]
-    return f"PS-02_ISS_NLP_Submission_{stem}.zip"
+    return f"Submission-{stem}.zip"
 
 
 async def run_single_file(
@@ -332,8 +332,8 @@ def main():
     parser.add_argument(
         "--holdout-dir",
         type=str,
-        default=r"data\data\holdout_sets\PS-02_hold-out_Set_2",
-        help="Directory containing holdout .xlsx files (default: data\\data\\holdout_sets\\PS-02_hold-out_Set_2)",
+        default=r"data\holdout_sets\PS-02_hold-out_Set_2",
+        help="Directory containing holdout .xlsx files (default: data\\holdout_sets\\PS-02_hold-out_Set_2)",
     )
     parser.add_argument(
         "--whitelist",
