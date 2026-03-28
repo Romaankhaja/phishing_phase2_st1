@@ -143,7 +143,11 @@ def get_clip_embeddings_batch(images: list, batch_size: int = CLIP_BATCH_SIZE) -
             inputs = {k: v.to(device=device, dtype=model_dtype) if v.dtype.is_floating_point else v.to(device) for k, v in inputs.items()}
 
             with torch.no_grad():
-                features = m.get_image_features(**inputs)
+                # Robust HuggingFace extraction (bypassing unpredictable get_image_features APIs)
+                pixel_values = inputs["pixel_values"]
+                vision_out = m.vision_model(pixel_values=pixel_values)
+                pooler = vision_out.pooler_output if hasattr(vision_out, "pooler_output") else vision_out[1]
+                features = m.visual_projection(pooler)
 
             # L2 normalize
             features = features / features.norm(dim=-1, keepdim=True).clamp(min=1e-8)
@@ -573,7 +577,7 @@ class ScraperActor:
             await self._start_browser()
             self.ops_count = 0
 
-        semaphore = asyncio.Semaphore(16)
+        semaphore = asyncio.Semaphore(6)
         tasks = [fetch_features(u, self.browser, semaphore, self.aio_session) for u in chunk_urls]
         
         try:
@@ -644,17 +648,19 @@ def run_hashing_shortlist_ray(url_list, threshold=65):
     if not ray.is_initialized():
         ray.init(ignore_reinit_error=True)
     # Tuned for GPU throughput! 25 images batched simultaneously per worker.
-    chunk_size = 25
-    print(f"🚀 Initializing 45 Stateful Playwright Scrapers & 1 Hot-VRAM GPU Processor...")
+    chunk_size = 50
+    print(f"🚀 Initializing 24 Stateful Playwright Scrapers & 4 Concurrent GPU Processors...")
     
-    gpu_actor = GPUInferenceActor.remote(_entity_index["clip_matrix"])
+    # Spawn 4 parallel GPU actors using fractional VRAM to completely saturate the H100
+    gpu_actors = [GPUInferenceActor.remote(_entity_index["clip_matrix"]) for _ in range(4)]
     
-    # Cap actors to max exactly 45 to leave 3 cores free for the OS and GPU orchestrations
-    num_actors = min(45, (len(url_list) // chunk_size) + 1)
+    # Cap actors to max exactly 24 to prevent 48-core CPU thread thrashing
+    num_actors = min(24, (len(url_list) // chunk_size) + 1)
     if num_actors < 1: 
         num_actors = 1
         
-    workers = [ScraperActor.remote(gpu_actor) for _ in range(num_actors)]
+    # Round-robin assign each CPU worker to one of the 4 GPU processors
+    workers = [ScraperActor.remote(gpu_actors[i % 4]) for i in range(num_actors)]
     pool = ActorPool(workers)
     
     # Push all URLs via dynamic generator maps
