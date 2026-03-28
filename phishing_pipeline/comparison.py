@@ -471,7 +471,7 @@ async def fetch_features(target_url, browser, semaphore, aio_session):
 # RAY DISTRIBUTED DETECTION
 ###############################################
 
-@ray.remote(num_gpus=1)
+@ray.remote(num_gpus=0.25)
 class GPUInferenceActor:
     def __init__(self, clip_matrix_np):
         import torch
