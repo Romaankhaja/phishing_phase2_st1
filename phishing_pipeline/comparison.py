@@ -435,9 +435,8 @@ async def fetch_features(target_url, browser, semaphore, aio_session):
         try:
             page = await browser.new_page()
 
-            await page.goto(target_url, timeout=40000)
-            await page.wait_for_load_state("networkidle")
-            await page.wait_for_timeout(2000)
+            # HUGE SPEEDUP: "load" implies HTML+CSS finished, bypassing broken scripts/trackers that delay "networkidle" endlessly.
+            await page.goto(target_url, timeout=20000, wait_until="load")
 
             html = await page.content()
             screenshot = await page.screenshot()
@@ -603,8 +602,8 @@ def run_hashing_shortlist_ray(url_list, threshold=65):
     t0 = time.perf_counter()
     if not ray.is_initialized():
         ray.init(ignore_reinit_error=True)
-        
-    chunk_size = 10
+    # Tuned for GPU throughput! 25 images batched simultaneously per worker.
+    chunk_size = 25
     print(f"🚀 Initializing 45 Stateful Playwright Scrapers & 1 Hot-VRAM GPU Processor...")
     
     gpu_actor = GPUInferenceActor.remote(_entity_index["clip_matrix"])
