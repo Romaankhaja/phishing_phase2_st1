@@ -471,7 +471,7 @@ async def fetch_features(target_url, browser, semaphore, aio_session):
 # RAY DISTRIBUTED DETECTION
 ###############################################
 
-@ray.remote(num_gpus=0.25)
+@ray.remote(num_gpus=1)
 class GPUInferenceActor:
     def __init__(self, clip_matrix_np):
         import torch
@@ -573,7 +573,7 @@ class ScraperActor:
             await self._start_browser()
             self.ops_count = 0
 
-        semaphore = asyncio.Semaphore(6)
+        semaphore = asyncio.Semaphore(16)
         tasks = [fetch_features(u, self.browser, semaphore, self.aio_session) for u in chunk_urls]
         
         try:
@@ -643,20 +643,18 @@ def run_hashing_shortlist_ray(url_list, threshold=65):
     t0 = time.perf_counter()
     if not ray.is_initialized():
         ray.init(ignore_reinit_error=True)
-    # Tuned for GPU throughput! 50 images batched simultaneously per worker.
-    chunk_size = 50
-    print(f"🚀 Initializing 24 Stateful Playwright Scrapers & 4 Hot-VRAM GPU Processors...")
+    # Tuned for GPU throughput! 25 images batched simultaneously per worker.
+    chunk_size = 25
+    print(f"🚀 Initializing 45 Stateful Playwright Scrapers & 1 Hot-VRAM GPU Processor...")
     
-    # Spawn 4 GPU actors concurrently on the single H100
-    gpu_actors = [GPUInferenceActor.remote(_entity_index["clip_matrix"]) for _ in range(4)]
+    gpu_actor = GPUInferenceActor.remote(_entity_index["clip_matrix"])
     
-    # Cap actors to max exactly 24 to stop CPU context thrashing
-    num_actors = min(24, (len(url_list) // chunk_size) + 1)
+    # Cap actors to max exactly 45 to leave 3 cores free for the OS and GPU orchestrations
+    num_actors = min(45, (len(url_list) // chunk_size) + 1)
     if num_actors < 1: 
         num_actors = 1
         
-    # Round-robin assign the 4 GPU actors to the web scrapers
-    workers = [ScraperActor.remote(gpu_actors[i % 4]) for i in range(num_actors)]
+    workers = [ScraperActor.remote(gpu_actor) for _ in range(num_actors)]
     pool = ActorPool(workers)
     
     # Push all URLs via dynamic generator maps
