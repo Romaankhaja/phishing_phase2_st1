@@ -513,105 +513,129 @@ class GPUInferenceActor:
         return results
 
 @ray.remote(num_cpus=1)
-def process_url_chunk_ray(chunk_urls, gpu_actor_handle):
-    import asyncio
-    return asyncio.run(_async_process_chunk(chunk_urls, gpu_actor_handle))
+class ScraperActor:
+    def __init__(self, gpu_actor_handle):
+        self.gpu_actor = gpu_actor_handle
+        self.p = None
+        self.browser = None
+        self.aio_session = None
+        self.ops_count = 0
+        
+    async def _start_browser(self):
+        import aiohttp
+        from playwright.async_api import async_playwright
+        if self.p is None:
+            self.p = await async_playwright().start()
+            self.browser = await self.p.chromium.launch(headless=True)
+            connector = aiohttp.TCPConnector(limit=32) if _has_aiohttp else None
+            self.aio_session = aiohttp.ClientSession(connector=connector) if _has_aiohttp else None
 
-async def _async_process_chunk(chunk_urls, gpu_actor_handle):
-    import asyncio
-    import aiohttp
-    from playwright.async_api import async_playwright
-    from PIL import Image
-    from io import BytesIO
-    import numpy as np
+    async def process_chunk(self, chunk_urls):
+        import asyncio
+        from PIL import Image
+        from io import BytesIO
+        import numpy as np
 
-    semaphore = asyncio.Semaphore(16)
-    connector = aiohttp.TCPConnector(limit=32) if _has_aiohttp else None
-    aio_session = aiohttp.ClientSession(connector=connector) if _has_aiohttp else None
-    
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        tasks = [fetch_features(u, browser, semaphore, aio_session) for u in chunk_urls]
+        if self.browser is None:
+            await self._start_browser()
+            
+        self.ops_count += len(chunk_urls)
+        
+        # Memory Failsafe: Recycle the heavy Chromium browser rigidly every 1000 pages 
+        if self.ops_count > 1000:
+            if self.browser:
+                await self.browser.close()
+            if self.aio_session:
+                await self.aio_session.close()
+            if self.p:
+                await self.p.stop()
+            self.p = None
+            await self._start_browser()
+            self.ops_count = 0
+
+        semaphore = asyncio.Semaphore(16)
+        tasks = [fetch_features(u, self.browser, semaphore, self.aio_session) for u in chunk_urls]
         chunk_features = await asyncio.gather(*tasks)
-        await browser.close()
-    if aio_session:
-        await aio_session.close()
 
-    images = []
-    cpu_scores_list = []
-    final_urls = []
-    
-    n_entities = len(_entity_index["names"])
-    
-    for url, domain, screenshot, words, fav_hash in chunk_features:
-        if screenshot is None:
-            continue
-        images.append(Image.open(BytesIO(screenshot)))
-        final_urls.append(url)
+        images = []
+        cpu_scores_list = []
+        final_urls = []
+        n_entities = len(_entity_index["names"])
         
-        scores = np.zeros(n_entities, dtype="float64")
-        for i in range(n_entities):
-            entity_domains = _entity_index["domains"][i]
-            if entity_domains:
-                d_sim = max(domain_similarity(domain, d) for d in entity_domains)
-            else:
-                d_sim = 0.0
-            scores[i] += d_sim * WEIGHTS["domain"]
-            if fav_hash and fav_hash in _entity_index["fav_sets"][i]:
-                scores[i] += WEIGHTS["favicon"]
-            if _entity_index["kw_sets"][i]:
-                overlap = len(words & _entity_index["kw_sets"][i])
-                scores[i] += min(overlap / 5, 1.0) * WEIGHTS["keywords"]
-        cpu_scores_list.append(scores)
+        for url, domain, screenshot, words, fav_hash in chunk_features:
+            if screenshot is None:
+                continue
+            images.append(Image.open(BytesIO(screenshot)))
+            final_urls.append(url)
+            
+            scores = np.zeros(n_entities, dtype="float64")
+            for i in range(n_entities):
+                entity_domains = _entity_index["domains"][i]
+                if entity_domains:
+                    d_sim = max(domain_similarity(domain, d) for d in entity_domains)
+                else:
+                    d_sim = 0.0
+                scores[i] += d_sim * WEIGHTS["domain"]
+                if fav_hash and fav_hash in _entity_index["fav_sets"][i]:
+                    scores[i] += WEIGHTS["favicon"]
+                if _entity_index["kw_sets"][i]:
+                    overlap = len(words & _entity_index["kw_sets"][i])
+                    scores[i] += min(overlap / 5, 1.0) * WEIGHTS["keywords"]
+            cpu_scores_list.append(scores)
+            
+        if not images:
+            return []
+            
+        cpu_scores_batch = np.array(cpu_scores_list, dtype="float32")
+        gpu_results = await self.gpu_actor.score_batch.remote(images, cpu_scores_batch)
         
-    if not images:
-        return []
-        
-    cpu_scores_batch = np.array(cpu_scores_list, dtype="float32")
-    # RPC to the hot VRAM Actor!
-    gpu_results = await gpu_actor_handle.score_batch.remote(images, cpu_scores_batch)
-    
-    out = []
-    for url, res in zip(final_urls, gpu_results):
-        out.append((url, res["entity"], res["score"]))
-    return out
+        out = []
+        for url, res in zip(final_urls, gpu_results):
+            out.append((url, res["entity"], res["score"]))
+        return out
+
 
 def run_hashing_shortlist_ray(url_list, threshold=65):
     import pandas as pd
     import time
-    t0 = time.perf_counter()
+    from ray.util.actor_pool import ActorPool
     
-    # Pre-init Ray using EPYC's 48 CPUs and H100 GPU
+    t0 = time.perf_counter()
     if not ray.is_initialized():
         ray.init(ignore_reinit_error=True)
         
     chunk_size = 10
-    print(f"🚀 Submitting {len(url_list)} URLs to Ray Cluster across CPUs and 1 GPU...")
+    print(f"🚀 Initializing 45 Stateful Playwright Scrapers & 1 Hot-VRAM GPU Processor...")
     
     gpu_actor = GPUInferenceActor.remote(_entity_index["clip_matrix"])
     
-    futures = []
-    # Send chunks rapidly as asynchronous Ray RPC Tasks
-    for i in range(0, len(url_list), chunk_size):
-        chunk = url_list[i : i+chunk_size]
-        futures.append(process_url_chunk_ray.remote(chunk, gpu_actor))
+    # Cap actors to max exactly 45 to leave 3 cores free for the OS and GPU orchestrations
+    num_actors = min(45, (len(url_list) // chunk_size) + 1)
+    if num_actors < 1: 
+        num_actors = 1
+        
+    workers = [ScraperActor.remote(gpu_actor) for _ in range(num_actors)]
+    pool = ActorPool(workers)
+    
+    # Push all URLs via dynamic generator maps
+    chunks = [url_list[i : i+chunk_size] for i in range(0, len(url_list), chunk_size)]
+    for chunk in chunks:
+        pool.submit(lambda a, c: a.process_chunk.remote(c), chunk)
         
     results = []
-    while futures:
-        ready, futures = ray.wait(futures, num_returns=1, timeout=0.1)
-        for f in ready:
-            res_list = ray.get(f)
-            for url, best_entity, best_score in res_list:
-                if best_score > threshold:
-                    print(f"✅ {url} -> {best_entity} ({best_score:.1f}%)")
-                    results.append((url, best_entity, best_score))
-                else:
-                    print(f"❌ {url} -> None (best: {best_entity} {best_score:.1f}%)")
+    while pool.has_next():
+        res_list = pool.get_next()
+        for url, best_entity, best_score in res_list:
+            if best_score > threshold:
+                print(f"✅ {url} -> {best_entity} ({best_score:.1f}%)")
+                results.append((url, best_entity, best_score))
+            else:
+                print(f"❌ {url} -> None (best: {best_entity} {best_score:.1f}%)")
                 
     elapsed = time.perf_counter() - t0
-    print(f"\n⏱ Ray Processing done in {elapsed:.1f}s ({len(url_list)} URLs)")
+    print(f"\n⏱ Ray Actor Pool Processing completed cleanly in {elapsed:.1f}s ({len(url_list)} URLs)")
     
-    # Optional cleanup for long running instances
+    # Gracefully command ray shutdown
     ray.shutdown()
     
     rows = []
