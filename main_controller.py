@@ -108,7 +108,7 @@ async def main():
     # ---
     parser.add_argument("--whitelist", type=str, default=os.path.join("data", "whitelists", "Stage_2_Legitimate_Domains_80.xlsx"),
                         help="Path to whitelist Excel file")
-    parser.add_argument("--shortlisting", type=str, default=os.path.join("data", "holdout_sets", "PS-02_hold-out_Set_2"),
+    parser.add_argument("--shortlisting", type=str, default=os.path.join("data", "holdout_sets"),
                         help="Folder containing shortlisting .xlsx files")
     # --- (End of Fix 1) ---
     
