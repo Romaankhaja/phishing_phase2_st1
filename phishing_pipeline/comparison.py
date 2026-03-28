@@ -664,7 +664,9 @@ def run_hashing_shortlist(url_list, threshold=65):
     return run_hashing_shortlist_ray(url_list, threshold)
 
 # Alias for backward compatibility with main_controller.py
-run_hashing_shortlist_async = run_hashing_shortlist_ray
+async def run_hashing_shortlist_async(url_list, threshold=65):
+    import asyncio
+    return await asyncio.to_thread(run_hashing_shortlist_ray, url_list, threshold)
 
 if __name__ == "__main__":
     test_urls = [

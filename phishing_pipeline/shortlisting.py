@@ -98,7 +98,12 @@ def is_similar_advanced(cand_url_norm: str, legit_url_norm: str,
 def load_urls_from_excel_folder(folder_path):
     logger.info(f"Reading Excel files from: {folder_path}")
     all_urls = set()
-    files = glob.glob(os.path.join(folder_path, "*.xlsx")) + glob.glob(os.path.join(folder_path, "*.xls"))
+    
+    if os.path.isfile(folder_path) and folder_path.endswith((".xlsx", ".xls")):
+        files = [folder_path]
+    else:
+        files = glob.glob(os.path.join(folder_path, "*.xlsx")) + glob.glob(os.path.join(folder_path, "*.xls"))
+        
     if not files:
         logger.warning(f"No .xlsx or .xls files found in {folder_path}.")
         return all_urls
