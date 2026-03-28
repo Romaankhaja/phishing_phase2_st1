@@ -63,7 +63,7 @@ def _get_model():
 
     try:
         _clip_logger.info("🚀 Loading CLIP model (%s) on %s...", _MODEL_NAME, device)
-        m = CLIPModel.from_pretrained(_MODEL_NAME)
+        m = CLIPModel.from_pretrained(_MODEL_NAME, use_safetensors=True)
         # FP16 on CUDA for massive throughput
         if device == "cuda":
             m = m.half()
@@ -435,12 +435,15 @@ async def fetch_features(target_url, browser, semaphore, aio_session):
         try:
             page = await browser.new_page()
 
-            # HUGE SPEEDUP: "load" implies HTML+CSS finished, bypassing broken scripts/trackers that delay "networkidle" endlessly.
-            await page.goto(target_url, timeout=20000, wait_until="load")
+            # HUGE SPEEDUP & SAFETY: Wait for 'load', disable full_page (prevent rendering bombs), and use strict timeouts
+            import asyncio
+            async def _grab():
+                await page.goto(target_url, timeout=15000, wait_until="load")
+                html_content = await page.content()
+                screenshot_bytes = await page.screenshot(full_page=False, timeout=5000)
+                return html_content, screenshot_bytes
 
-            html = await page.content()
-            screenshot = await page.screenshot()
-
+            html, screenshot = await asyncio.wait_for(_grab(), timeout=25.0)
             await page.close()
 
         except Exception:
@@ -481,8 +484,26 @@ class GPUInferenceActor:
         if not images:
             return []
         
-        clip_embeddings = get_clip_embeddings_batch(images, batch_size=len(images))
-        sv = torch.tensor(clip_embeddings, dtype=torch.float32, device=self.device)
+        import io
+        from PIL import Image
+        
+        # Decode raw PNG bytes received from Ray IPC to prevent OOM
+        try:
+            decoded_images = [Image.open(io.BytesIO(b)).convert("RGB") for b in images if b is not None]
+        except Exception as filter_err:
+            print(f"⚠ GPU failed to decode bytes: {filter_err}")
+            decoded_images = []
+            
+        if not decoded_images:
+            return []
+            
+        try:
+            clip_embeddings = get_clip_embeddings_batch(decoded_images, batch_size=len(decoded_images))
+        except Exception as e:
+            print(f"⚠ CLIP inference failed: {e}")
+            clip_embeddings = [np.zeros(_CLIP_DIM, dtype="float32") for _ in decoded_images]
+            
+        sv = torch.tensor(np.array(clip_embeddings), dtype=torch.float32, device=self.device)
         sv = sv / sv.norm(dim=1, keepdim=True).clamp(min=1e-8)
         
         all_sims = torch.mm(self.gpu_clip_matrix, sv.T).cpu().numpy()
@@ -564,7 +585,8 @@ class ScraperActor:
         for url, domain, screenshot, words, fav_hash in chunk_features:
             if screenshot is None:
                 continue
-            images.append(Image.open(BytesIO(screenshot)))
+            # Send raw PNG bytes directly over Ray IPC to avoid Plasma Object Store overflow
+            images.append(screenshot)
             final_urls.append(url)
             
             scores = np.zeros(n_entities, dtype="float64")
