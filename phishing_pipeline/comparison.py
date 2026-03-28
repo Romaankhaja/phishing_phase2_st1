@@ -575,7 +575,24 @@ class ScraperActor:
 
         semaphore = asyncio.Semaphore(16)
         tasks = [fetch_features(u, self.browser, semaphore, self.aio_session) for u in chunk_urls]
-        chunk_features = await asyncio.gather(*tasks)
+        
+        try:
+            # Hard failsafe: If the chunk takes >90s, the browser instance has deadlocked internally.
+            chunk_features = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=90.0)
+        except asyncio.TimeoutError:
+            print("⚠ CRITICAL: Chrome headless deadlocked. Rebooting worker and skipping chunk...")
+            if self.browser:
+                try: await self.browser.close()
+                except: pass
+            if self.aio_session:
+                try: await self.aio_session.close()
+                except: pass
+            if self.p:
+                try: await self.p.stop()
+                except: pass
+            self.p = None
+            await self._start_browser()
+            return []
 
         images = []
         cpu_scores_list = []
@@ -583,6 +600,8 @@ class ScraperActor:
         n_entities = len(_entity_index["names"])
         
         for url, domain, screenshot, words, fav_hash in chunk_features:
+            if isinstance(url, Exception):
+                continue
             if screenshot is None:
                 continue
             # Send raw PNG bytes directly over Ray IPC to avoid Plasma Object Store overflow
