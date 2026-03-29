@@ -49,6 +49,7 @@ SHORT_BRAND_AFFIXES = tuple(
 PREFILTER_CPU_CAP = max(1, min(48, os.cpu_count() or 1))
 PREFILTER_DEFAULT_BATCH_SIZE = 1024
 PREFILTER_MIN_PARALLEL_URLS = 2048
+USE_PROCESS_POOL_BY_DEFAULT = os.name != "nt"
 
 _SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.-]*://", re.IGNORECASE)
 _TOKEN_SPLIT_RE = re.compile(r"[^a-z0-9]+")
@@ -434,69 +435,69 @@ def _score_target_urls_parallel(
     )
 
     ordered_results = [None] * len(target_urls)
-    try:
-        with ProcessPoolExecutor(
-            max_workers=worker_count,
-            mp_context=get_context("spawn"),
-            initializer=_init_prefilter_worker,
-            initargs=(prefilter_index,),
-        ) as executor:
+    def _run_thread_pool() -> list[dict]:
+        threaded_results = [None] * len(target_urls)
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
             future_to_batch = {
-                executor.submit(_score_prefilter_batch, batch): batch
+                executor.submit(_score_prefilter_batch, batch, prefilter_index): batch
                 for batch in batches
             }
-
             for future in as_completed(future_to_batch):
                 batch = future_to_batch[future]
                 try:
                     scored_rows = future.result()
-                except Exception as exc:
+                except Exception as thread_exc:
                     logger.warning(
-                        "Parallel prefilter batch failed; retrying sequentially. Batch start=%d size=%d error=%s",
+                        "Threaded prefilter batch failed; retrying sequentially. Batch start=%d size=%d error=%s",
                         batch[0][0],
                         len(batch),
-                        exc,
+                        thread_exc,
                     )
                     scored_rows = _score_prefilter_batch(batch, prefilter_index=prefilter_index)
 
                 for absolute_index, row in scored_rows:
-                    ordered_results[absolute_index] = row
-    except Exception as exc:
-        logger.warning(
-            "ProcessPool prefilter executor failed; falling back to threaded mode: %s",
-            exc,
-        )
-        ordered_results = [None] * len(target_urls)
+                    threaded_results[absolute_index] = row
+        return threaded_results
+
+    if USE_PROCESS_POOL_BY_DEFAULT:
         try:
-            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            with ProcessPoolExecutor(
+                max_workers=worker_count,
+                mp_context=get_context("spawn"),
+                initializer=_init_prefilter_worker,
+                initargs=(prefilter_index,),
+            ) as executor:
                 future_to_batch = {
-                    executor.submit(_score_prefilter_batch, batch, prefilter_index): batch
+                    executor.submit(_score_prefilter_batch, batch): batch
                     for batch in batches
                 }
+
                 for future in as_completed(future_to_batch):
                     batch = future_to_batch[future]
                     try:
                         scored_rows = future.result()
-                    except Exception as thread_exc:
+                    except Exception as exc:
                         logger.warning(
-                            "Threaded prefilter batch failed; retrying sequentially. Batch start=%d size=%d error=%s",
+                            "Parallel prefilter batch failed; retrying sequentially. Batch start=%d size=%d error=%s",
                             batch[0][0],
                             len(batch),
-                            thread_exc,
+                            exc,
                         )
                         scored_rows = _score_prefilter_batch(batch, prefilter_index=prefilter_index)
 
                     for absolute_index, row in scored_rows:
                         ordered_results[absolute_index] = row
-        except Exception as thread_executor_exc:
+        except Exception as exc:
             logger.warning(
-                "Threaded prefilter executor failed; falling back to sequential mode: %s",
-                thread_executor_exc,
+                "ProcessPool prefilter executor failed; falling back to threaded mode: %s",
+                exc,
             )
-            ordered_results = [None] * len(target_urls)
-            for batch in batches:
-                for absolute_index, row in _score_prefilter_batch(batch, prefilter_index=prefilter_index):
-                    ordered_results[absolute_index] = row
+            ordered_results = _run_thread_pool()
+    else:
+        logger.info(
+            "Using threaded prefilter executor on Windows to avoid multiprocessing spawn overhead."
+        )
+        ordered_results = _run_thread_pool()
 
     missing_indexes = [index for index, row in enumerate(ordered_results) if row is None]
     if missing_indexes:

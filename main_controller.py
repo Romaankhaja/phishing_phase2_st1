@@ -8,6 +8,7 @@ import os
 import argparse
 import asyncio
 import logging
+from typing import Any
 
 # Event loop policy on Windows
 # Event loop policy on Windows
@@ -42,45 +43,58 @@ logger = logging.getLogger(__name__)
 # --- We have REMOVED the unused EasyOCR initialization that was here ---
 # ---
 
-# Import pipeline pieces
-run_pipeline = None
-package_results = None
-FINAL_OUTPUT = None
-close_browser = None
-shortlisting = None  # Import the whole module
+def _load_runtime_components() -> dict[str, Any]:
+    """
+    Import pipeline modules lazily.
 
-try:
-    from phishing_pipeline.config import FINAL_OUTPUT
-except Exception as e:
-    logger.warning("Could not import FINAL_OUTPUT from config: %s", e)
+    This avoids import-time side effects when Windows multiprocessing spawns
+    worker processes and re-imports this file as ``__mp_main__``.
+    """
+    components: dict[str, Any] = {
+        "FINAL_OUTPUT": None,
+        "close_browser": None,
+        "run_pipeline": None,
+        "package_results": None,
+        "shortlisting": None,
+        "run_hashing_shortlist_async": None,
+    }
 
-try:
-    from phishing_pipeline.visual_features import close_browser
-except Exception as e:
-    logger.warning("Could not import close_browser from visual_features: %s", e)
+    try:
+        from phishing_pipeline.config import FINAL_OUTPUT
+        components["FINAL_OUTPUT"] = FINAL_OUTPUT
+    except Exception as exc:
+        logger.warning("Could not import FINAL_OUTPUT from config: %s", exc)
 
-try:
-    from phishing_pipeline import pipeline
-    run_pipeline = pipeline.run_pipeline
-    package_results = pipeline.package_results
-    logger.info("Imported run_pipeline and package_results from pipeline.py")
-except ImportError as e:
-    logger.error("Failed to import from pipeline.py: %s", e)
-    sys.exit(1)
+    try:
+        from phishing_pipeline.visual_features import close_browser
+        components["close_browser"] = close_browser
+    except Exception as exc:
+        logger.warning("Could not import close_browser from visual_features: %s", exc)
 
-try:
-    from phishing_pipeline import shortlisting
-    logger.info("Imported shortlisting module for utils (shortlisting.py)")
-except ImportError as e:
-    logger.warning("Could not import shortlisting.py: %s", e)
-    shortlisting = None
+    try:
+        from phishing_pipeline import pipeline
+        components["run_pipeline"] = pipeline.run_pipeline
+        components["package_results"] = pipeline.package_results
+        logger.info("Imported run_pipeline and package_results from pipeline.py")
+    except ImportError as exc:
+        logger.error("Failed to import from pipeline.py: %s", exc)
+        raise
 
-try:
-    from phishing_pipeline.comparison import run_hashing_shortlist_async
-    logger.info("Imported run_hashing_shortlist_async from phishing_pipeline.comparison")
-except ImportError as e:
-    logger.warning("Could not import phishing_pipeline.comparison: %s", e)
-    run_hashing_shortlist_async = None
+    try:
+        from phishing_pipeline import shortlisting
+        components["shortlisting"] = shortlisting
+        logger.info("Imported shortlisting module for utils (shortlisting.py)")
+    except ImportError as exc:
+        logger.warning("Could not import shortlisting.py: %s", exc)
+
+    try:
+        from phishing_pipeline.comparison import run_hashing_shortlist_async
+        components["run_hashing_shortlist_async"] = run_hashing_shortlist_async
+        logger.info("Imported run_hashing_shortlist_async from phishing_pipeline.comparison")
+    except ImportError as exc:
+        logger.warning("Could not import phishing_pipeline.comparison: %s", exc)
+
+    return components
 
 
 def clear_gpu_memory():
@@ -101,6 +115,14 @@ def clear_gpu_memory():
 
 
 async def main():
+    components = _load_runtime_components()
+    final_output = components["FINAL_OUTPUT"]
+    close_browser = components["close_browser"]
+    run_pipeline = components["run_pipeline"]
+    package_results = components["package_results"]
+    shortlisting = components["shortlisting"]
+    run_hashing_shortlist_async = components["run_hashing_shortlist_async"]
+
     parser = argparse.ArgumentParser(description="Phishing Detection CLI Controller")
     
     # ---
@@ -189,8 +211,8 @@ async def main():
             except Exception as exc:
                 logger.warning("package_results() failed: %s", exc)
 
-        if FINAL_OUTPUT:
-            logger.info("Final output expected at: %s", FINAL_OUTPUT)
+        if final_output:
+            logger.info("Final output expected at: %s", final_output)
 
         # Show small preview if df_out is a DataFrame-like object
         if df_out is not None:
@@ -227,4 +249,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main())
