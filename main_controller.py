@@ -208,7 +208,23 @@ async def main():
             except Exception as exc:
                 logger.warning("close_browser() raised: %s", exc)
 
+        # Gracefully shutdown Ray to prevent GCS zombie crash
+        try:
+            import ray
+            if ray.is_initialized():
+                ray.shutdown()
+                logger.info("Ray cluster shut down cleanly.")
+        except Exception as exc:
+            logger.warning("ray.shutdown() raised: %s", exc)
+
+        # Kill any orphaned chrome-headless processes
+        try:
+            import subprocess
+            subprocess.run(["pkill", "-f", "chrome-headless"], capture_output=True, timeout=5)
+            logger.info("Cleaned up orphaned Chrome processes.")
+        except Exception:
+            pass  # Expected to fail on Windows
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
-    
+    asyncio.run(main())

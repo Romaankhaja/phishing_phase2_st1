@@ -436,6 +436,7 @@ async def fetch_features(target_url, browser, semaphore, aio_session):
     target_domain = parsed.netloc.lower()
 
     async with semaphore:
+        page = None
         try:
             page = await browser.new_page()
 
@@ -448,11 +449,17 @@ async def fetch_features(target_url, browser, semaphore, aio_session):
                 return html_content, screenshot_bytes
 
             html, screenshot = await asyncio.wait_for(_grab(), timeout=25.0)
-            await page.close()
 
         except Exception:
             print(f"⚠ Failed loading {target_url}")
             return target_url, target_domain, None, None, None
+        finally:
+            # ALWAYS close the page to prevent Chromium handle exhaustion
+            if page:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
 
     # HTML parsing (CPU-bound but fast)
     soup = BeautifulSoup(html, "html.parser")
