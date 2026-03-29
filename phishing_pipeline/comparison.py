@@ -319,6 +319,62 @@ def _write_hashing_log_messages(log_messages: list[dict]) -> None:
         log_method(message)
 
 
+def _format_asyncio_exception_context(context: dict) -> str:
+    message = str(context.get("message", "Asyncio loop exception")).strip()
+    future = context.get("future") or context.get("task")
+    exception = context.get("exception")
+
+    details = [message]
+    if future is not None:
+        details.append(f"future={future!r}")
+    if exception is not None:
+        details.append(f"{exception.__class__.__name__}: {exception}")
+
+    return " | ".join(details)
+
+
+def _is_playwright_background_exception(context: dict) -> bool:
+    message = str(context.get("message", ""))
+    exception = context.get("exception")
+    if message != "Future exception was never retrieved" or exception is None:
+        return False
+
+    exception_name = exception.__class__.__name__
+    exception_text = str(exception)
+    return (
+        exception_name in {"TargetClosedError", "TimeoutError"}
+        and "taking page screenshot" in exception_text
+    )
+
+
+def _install_asyncio_exception_logging(loop) -> None:
+    if getattr(loop, "_hashing_log_exception_handler", False):
+        return
+
+    def _exception_handler(loop, context):
+        formatted = _format_asyncio_exception_context(context)
+        exception = context.get("exception")
+
+        if _is_playwright_background_exception(context):
+            _clip_logger.warning(
+                "Suppressed Playwright background exception in hashing actor: %s",
+                formatted,
+            )
+            return
+
+        if exception is not None:
+            _clip_logger.error(
+                "Asyncio exception in hashing actor: %s",
+                formatted,
+                exc_info=(type(exception), exception, exception.__traceback__),
+            )
+        else:
+            _clip_logger.error("Asyncio exception in hashing actor: %s", formatted)
+
+    loop.set_exception_handler(_exception_handler)
+    loop._hashing_log_exception_handler = True
+
+
 def _empty_shortlist_df():
     import pandas as pd
 
@@ -551,7 +607,8 @@ async def fetch_features(target_url, browser, semaphore, aio_session):
             # ALWAYS close the page to prevent Chromium handle exhaustion
             if page:
                 try:
-                    await page.close()
+                    if not page.is_closed():
+                        await page.close()
                 except Exception:
                     pass
 
@@ -654,10 +711,15 @@ class ScraperActor:
         self.browser = None
         self.aio_session = None
         self.ops_count = 0
+
+    async def _ensure_actor_loop_handler(self):
+        loop = asyncio.get_running_loop()
+        _install_asyncio_exception_logging(loop)
         
     async def _start_browser(self):
         import aiohttp
         from playwright.async_api import async_playwright
+        await self._ensure_actor_loop_handler()
         if self.p is None:
             self.p = await async_playwright().start()
             self.browser = await self.p.chromium.launch(headless=True)
@@ -670,6 +732,8 @@ class ScraperActor:
         from io import BytesIO
         import numpy as np
         chunk_logs = []
+
+        await self._ensure_actor_loop_handler()
 
         if self.browser is None:
             await self._start_browser()
@@ -689,12 +753,30 @@ class ScraperActor:
             self.ops_count = 0
 
         semaphore = asyncio.Semaphore(6)
-        tasks = [fetch_features(u, self.browser, semaphore, self.aio_session) for u in chunk_urls]
+        tasks = [
+            asyncio.create_task(
+                fetch_features(u, self.browser, semaphore, self.aio_session)
+            )
+            for u in chunk_urls
+        ]
         
         try:
             # Hard failsafe: If the chunk takes >90s, the browser instance has deadlocked internally.
             chunk_features = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=90.0)
         except asyncio.TimeoutError:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            cancellation_results = await asyncio.gather(*tasks, return_exceptions=True)
+            for cancellation_result in cancellation_results:
+                if isinstance(cancellation_result, Exception) and not isinstance(cancellation_result, asyncio.CancelledError):
+                    chunk_logs.append({
+                        "level": "warning",
+                        "message": (
+                            "Fetch task raised during chunk timeout cancellation: "
+                            f"{cancellation_result.__class__.__name__}: {cancellation_result}"
+                        ),
+                    })
             chunk_logs.append({
                 "level": "warning",
                 "message": (
