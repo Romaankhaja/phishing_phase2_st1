@@ -16,6 +16,7 @@ import os
 import time
 import torch
 import logging as _logging
+import warnings as _warnings
 
 try:
     import aiohttp
@@ -39,7 +40,7 @@ except Exception as e:
     _has_clip = False
     CLIPProcessor = None
     CLIPModel = None
-    print(f"⚠ transformers/CLIP import failed, using fallback embeddings: {e}")
+    _clip_logger.debug("transformers/CLIP import failed, using fallback embeddings: %s", e)
 
 BASE_DIR = os.path.dirname(__file__)
 
@@ -76,7 +77,7 @@ def _get_model():
         _has_clip = False
         _model = None
         _processor = None
-        print(f"⚠ Failed to init CLIP model, using fallback embeddings: {e}")
+        _clip_logger.debug("Failed to init CLIP model, using fallback embeddings: %s", e)
         return None, None
 
 # Backward-compat aliases used by external code that references the globals
@@ -154,7 +155,7 @@ def get_clip_embeddings_batch(images: list, batch_size: int = CLIP_BATCH_SIZE) -
             batch_np = features.cpu().float().numpy().astype("float32")
             all_embeddings.extend(batch_np)
         except Exception as e:
-            _clip_logger.warning("⚠ CLIP batch embedding failed: %s", e)
+            _clip_logger.debug("CLIP batch embedding failed: %s", e)
             all_embeddings.extend([np.zeros(_CLIP_DIM, dtype="float32") for _ in batch])
 
     return all_embeddings
@@ -231,6 +232,7 @@ def load_domains(csv_file):
 BASE_DIR = os.path.dirname(__file__)
 ROOT_DIR = os.path.dirname(BASE_DIR)
 URLS_PATH = os.path.join(ROOT_DIR, "data", "urls.csv")
+HASHING_LOG_PATH = os.path.join(ROOT_DIR, "output", "hashing_shortlist.log")
 
 # Only load test URLs if running standalone; do not crash module import.
 # url_list = load_domains(URLS_PATH)
@@ -247,6 +249,86 @@ def normalize_url(url):
     if not url.startswith(("http://", "https://")):
         return "https://" + url
     return url
+
+
+def _configure_hashing_log(log_path: str = HASHING_LOG_PATH) -> str:
+    return _ensure_hashing_log(log_path=log_path, reset=True)
+
+
+def _ensure_hashing_log(log_path: str = HASHING_LOG_PATH, reset: bool = False) -> str:
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+
+    target_loggers = (
+        _clip_logger,
+        _logging.getLogger("py.warnings"),
+        _logging.getLogger("phishing_pipeline.url_prefilter"),
+    )
+    for logger in target_loggers:
+        for handler in list(logger.handlers):
+            if getattr(handler, "_hashing_run_log", False):
+                logger.removeHandler(handler)
+                handler.close()
+
+    if reset:
+        open(log_path, "w", encoding="utf-8").close()
+
+    for logger in target_loggers:
+        file_handler = _logging.FileHandler(log_path, mode="a", encoding="utf-8")
+        file_handler.setLevel(_logging.DEBUG)
+        file_handler.setFormatter(
+            _logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+        )
+        file_handler._hashing_run_log = True
+        logger.addHandler(file_handler)
+
+    _clip_logger.setLevel(_logging.DEBUG)
+    _clip_logger.propagate = False
+    warning_logger = _logging.getLogger("py.warnings")
+    warning_logger.setLevel(_logging.WARNING)
+    warning_logger.propagate = False
+    prefilter_logger = _logging.getLogger("phishing_pipeline.url_prefilter")
+    prefilter_logger.setLevel(_logging.INFO)
+    prefilter_logger.propagate = False
+    _logging.captureWarnings(True)
+    _warnings.simplefilter("default")
+    return log_path
+
+
+def _close_hashing_log() -> None:
+    for logger in (
+        _clip_logger,
+        _logging.getLogger("py.warnings"),
+        _logging.getLogger("phishing_pipeline.url_prefilter"),
+    ):
+        for handler in list(logger.handlers):
+            if getattr(handler, "_hashing_run_log", False):
+                handler.flush()
+                logger.removeHandler(handler)
+                handler.close()
+    _logging.captureWarnings(False)
+
+
+def _write_hashing_log_messages(log_messages: list[dict]) -> None:
+    for log_message in log_messages:
+        level = str(log_message.get("level", "info")).lower()
+        message = str(log_message.get("message", "")).strip()
+        if not message:
+            continue
+
+        log_method = getattr(_clip_logger, level, _clip_logger.info)
+        log_method(message)
+
+
+def _empty_shortlist_df():
+    import pandas as pd
+
+    return pd.DataFrame(
+        columns=[
+            "Cooresponding CSE",
+            "Legitimate Domains",
+            "Identified Phishing/Suspected Domain Name",
+        ]
+    )
 
 
 # ── Async favicon fetching (non-blocking) ──
@@ -450,9 +532,21 @@ async def fetch_features(target_url, browser, semaphore, aio_session):
 
             html, screenshot = await asyncio.wait_for(_grab(), timeout=25.0)
 
-        except Exception:
-            print(f"⚠ Failed loading {target_url}")
-            return target_url, target_domain, None, None, None
+        except Exception as exc:
+            return (
+                target_url,
+                target_domain,
+                None,
+                None,
+                None,
+                {
+                    "level": "warning",
+                    "message": (
+                        f"Failed loading {target_url}: "
+                        f"{exc.__class__.__name__}: {exc}"
+                    ),
+                },
+            )
         finally:
             # ALWAYS close the page to prevent Chromium handle exhaustion
             if page:
@@ -471,7 +565,7 @@ async def fetch_features(target_url, browser, semaphore, aio_session):
     # Favicon (async I/O)
     fav_hash = await favicon_hash_async(target_domain, session=aio_session)
 
-    return target_url, target_domain, screenshot, words, fav_hash
+    return target_url, target_domain, screenshot, words, fav_hash, None
 
 
 ###############################################
@@ -486,14 +580,16 @@ async def fetch_features(target_url, browser, semaphore, aio_session):
 class GPUInferenceActor:
     def __init__(self, clip_matrix_np):
         import torch
+        _ensure_hashing_log()
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.gpu_clip_matrix = torch.tensor(clip_matrix_np, dtype=torch.float32, device=self.device)
 
     def score_batch(self, images, cpu_scores_batch):
         import torch
         import numpy as np
+        log_messages = []
         if not images:
-            return []
+            return {"results": [], "logs": log_messages}
         
         import io
         from PIL import Image
@@ -502,16 +598,22 @@ class GPUInferenceActor:
         try:
             decoded_images = [Image.open(io.BytesIO(b)).convert("RGB") for b in images if b is not None]
         except Exception as filter_err:
-            print(f"⚠ GPU failed to decode bytes: {filter_err}")
+            log_messages.append({
+                "level": "warning",
+                "message": f"GPU failed to decode screenshot bytes: {filter_err}",
+            })
             decoded_images = []
             
         if not decoded_images:
-            return []
+            return {"results": [], "logs": log_messages}
             
         try:
             clip_embeddings = get_clip_embeddings_batch(decoded_images, batch_size=len(decoded_images))
         except Exception as e:
-            print(f"⚠ CLIP inference failed: {e}")
+            log_messages.append({
+                "level": "warning",
+                "message": f"CLIP inference failed; using zero vectors: {e}",
+            })
             clip_embeddings = [np.zeros(_CLIP_DIM, dtype="float32") for _ in decoded_images]
             
         sv = torch.tensor(np.array(clip_embeddings), dtype=torch.float32, device=self.device)
@@ -541,11 +643,12 @@ class GPUInferenceActor:
                 "entity": _entity_index["names"][best_idx], 
                 "score": float(scores[best_idx])
             })
-        return results
+        return {"results": results, "logs": log_messages}
 
 @ray.remote(num_cpus=1)
 class ScraperActor:
     def __init__(self, gpu_actor_handle):
+        _ensure_hashing_log()
         self.gpu_actor = gpu_actor_handle
         self.p = None
         self.browser = None
@@ -566,6 +669,7 @@ class ScraperActor:
         from PIL import Image
         from io import BytesIO
         import numpy as np
+        chunk_logs = []
 
         if self.browser is None:
             await self._start_browser()
@@ -591,7 +695,13 @@ class ScraperActor:
             # Hard failsafe: If the chunk takes >90s, the browser instance has deadlocked internally.
             chunk_features = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=90.0)
         except asyncio.TimeoutError:
-            print("⚠ CRITICAL: Chrome headless deadlocked. Rebooting worker and skipping chunk...")
+            chunk_logs.append({
+                "level": "warning",
+                "message": (
+                    "Chrome headless deadlocked for a chunk; "
+                    "worker rebooted and the chunk was skipped."
+                ),
+            })
             if self.browser:
                 try: await self.browser.close()
                 except: pass
@@ -603,14 +713,28 @@ class ScraperActor:
                 except: pass
             self.p = None
             await self._start_browser()
-            return []
+            return {"results": [], "processed": len(chunk_urls), "logs": chunk_logs}
 
         images = []
         cpu_scores_list = []
         final_urls = []
         n_entities = len(_entity_index["names"])
         
-        for url, domain, screenshot, words, fav_hash in chunk_features:
+        for feature_result in chunk_features:
+            if isinstance(feature_result, Exception):
+                chunk_logs.append({
+                    "level": "warning",
+                    "message": (
+                        "Unhandled fetch task failure in hashing stage: "
+                        f"{feature_result.__class__.__name__}: {feature_result}"
+                    ),
+                })
+                continue
+
+            url, domain, screenshot, words, fav_hash, log_message = feature_result
+            if log_message:
+                chunk_logs.append(log_message)
+
             if isinstance(url, Exception):
                 continue
             if screenshot is None:
@@ -635,15 +759,17 @@ class ScraperActor:
             cpu_scores_list.append(scores)
             
         if not images:
-            return []
+            return {"results": [], "processed": len(chunk_urls), "logs": chunk_logs}
             
         cpu_scores_batch = np.array(cpu_scores_list, dtype="float32")
-        gpu_results = await self.gpu_actor.score_batch.remote(images, cpu_scores_batch)
+        gpu_payload = await self.gpu_actor.score_batch.remote(images, cpu_scores_batch)
+        gpu_results = gpu_payload.get("results", [])
+        chunk_logs.extend(gpu_payload.get("logs", []))
         
         out = []
         for url, res in zip(final_urls, gpu_results):
             out.append((url, res["entity"], res["score"]))
-        return out
+        return {"results": out, "processed": len(chunk_urls), "logs": chunk_logs}
 
 
 def run_hashing_shortlist_ray(url_list, threshold=65):
@@ -720,6 +846,178 @@ def run_hashing_shortlist(url_list, threshold=65):
 async def run_hashing_shortlist_async(url_list, threshold=65):
     import asyncio
     return await asyncio.to_thread(run_hashing_shortlist_ray, url_list, threshold)
+
+
+# Active shortlist entrypoints with URL prefilter support.
+# These override the legacy definitions above without rewriting the older block.
+def run_hashing_shortlist_ray(
+    url_list,
+    threshold=65,
+    prefilter_threshold=10.0,
+    enable_prefilter=True,
+):
+    import pandas as pd
+    import time
+    from ray.util.actor_pool import ActorPool
+    from tqdm import tqdm
+
+    log_path = _configure_hashing_log()
+    original_count = len(url_list)
+    shortlisted_urls = list(url_list)
+    ray_started = False
+
+    _clip_logger.info(
+        "Hashing shortlist run started | urls=%d | threshold=%s | prefilter=%s | prefilter_threshold=%s",
+        original_count,
+        threshold,
+        enable_prefilter,
+        prefilter_threshold,
+    )
+
+    try:
+        if enable_prefilter:
+            from .url_prefilter import filter_urls_for_hashing
+
+            shortlisted_urls, audit_rows = filter_urls_for_hashing(
+                shortlisted_urls,
+                threshold=prefilter_threshold,
+            )
+            accepted_count = sum(1 for row in audit_rows if row["decision"] == "accepted")
+            _clip_logger.info(
+                "Prefilter kept %d/%d URLs at %.1f%% threshold",
+                accepted_count,
+                original_count,
+                prefilter_threshold,
+            )
+            print(
+                f"Prefilter kept {accepted_count}/{original_count} URLs "
+                f"(threshold={prefilter_threshold:.1f}%)"
+            )
+
+        _clip_logger.info("Hashing log file: %s", log_path)
+        print(f"Hashing log: {log_path}")
+
+        if not shortlisted_urls:
+            _clip_logger.info("No URLs passed the prefilter; skipping hashing stage.")
+            print("No URLs passed the prefilter. Skipping Ray hashing shortlist.")
+            return _empty_shortlist_df()
+
+        t0 = time.perf_counter()
+        if not ray.is_initialized():
+            ray.init(ignore_reinit_error=True)
+            ray_started = True
+
+        chunk_size = 50
+
+        gpu_actors = [GPUInferenceActor.remote(_entity_index["clip_matrix"]) for _ in range(4)]
+
+        num_actors = min(24, (len(shortlisted_urls) // chunk_size) + 1)
+        if num_actors < 1:
+            num_actors = 1
+
+        workers = [ScraperActor.remote(gpu_actors[i % 4]) for i in range(num_actors)]
+        pool = ActorPool(workers)
+
+        chunks = [
+            shortlisted_urls[i : i + chunk_size]
+            for i in range(0, len(shortlisted_urls), chunk_size)
+        ]
+        for chunk in chunks:
+            pool.submit(lambda a, c: a.process_chunk.remote(c), chunk)
+
+        results = []
+        with tqdm(
+            total=len(shortlisted_urls),
+            desc="Hashing shortlist",
+            unit="url",
+            leave=True,
+        ) as progress_bar:
+            while pool.has_next():
+                chunk_result = pool.get_next()
+                processed_count = chunk_result.get("processed", 0)
+                res_list = chunk_result.get("results", [])
+                _write_hashing_log_messages(chunk_result.get("logs", []))
+
+                for url, best_entity, best_score in res_list:
+                    if best_score > threshold:
+                        results.append((url, best_entity, best_score))
+
+                progress_bar.update(processed_count)
+                progress_bar.set_postfix(matches=len(results), refresh=False)
+
+        elapsed = time.perf_counter() - t0
+        print(
+            f"\nHashing shortlist completed in {elapsed:.1f}s "
+            f"({len(shortlisted_urls)} URLs, {len(results)} matched)"
+        )
+        _clip_logger.info(
+            "Hashing shortlist completed | shortlisted=%d | matched=%d | elapsed=%.1fs",
+            len(shortlisted_urls),
+            len(results),
+            elapsed,
+        )
+
+        rows = []
+        for target_url, best_entity, best_score in results:
+            legit_domain = "Unknown"
+            parsed = urlparse(normalize_url(target_url))
+            target_domain = parsed.netloc.lower()
+            try:
+                best_idx = _entity_index["names"].index(best_entity)
+                entity_domains = _entity_index["domains"][best_idx]
+                if entity_domains:
+                    legit_domain = max(
+                        entity_domains,
+                        key=lambda d: domain_similarity(target_domain, d),
+                    )
+            except ValueError:
+                pass
+
+            rows.append({
+                "Cooresponding CSE": best_entity,
+                "Legitimate Domains": legit_domain,
+                "Identified Phishing/Suspected Domain Name": target_url
+            })
+        if not rows:
+            return _empty_shortlist_df()
+        return pd.DataFrame(rows)
+    except Exception:
+        _clip_logger.exception("Hashing shortlist crashed unexpectedly.")
+        raise
+    finally:
+        if ray_started and ray.is_initialized():
+            ray.shutdown()
+        _close_hashing_log()
+
+
+def run_hashing_shortlist(
+    url_list,
+    threshold=65,
+    prefilter_threshold=10.0,
+    enable_prefilter=True,
+):
+    return run_hashing_shortlist_ray(
+        url_list,
+        threshold=threshold,
+        prefilter_threshold=prefilter_threshold,
+        enable_prefilter=enable_prefilter,
+    )
+
+
+async def run_hashing_shortlist_async(
+    url_list,
+    threshold=65,
+    prefilter_threshold=10.0,
+    enable_prefilter=True,
+):
+    import asyncio
+    return await asyncio.to_thread(
+        run_hashing_shortlist_ray,
+        url_list,
+        threshold,
+        prefilter_threshold,
+        enable_prefilter,
+    )
 
 if __name__ == "__main__":
     test_urls = [

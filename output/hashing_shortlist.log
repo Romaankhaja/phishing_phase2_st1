@@ -1,0 +1,4 @@
+2026-03-29 12:33:20,728 | INFO | Hashing shortlist run started | urls=3 | threshold=65 | prefilter=False | prefilter_threshold=10.0
+2026-03-29 12:33:20,729 | INFO | Hashing log file: C:\Users\SATWIK\Documents\Phishing\output\hashing_shortlist.log
+2026-03-29 12:33:20,729 | WARNING | GPU warning for three.example
+2026-03-29 12:33:20,729 | INFO | Hashing shortlist completed | shortlisted=3 | matched=1 | elapsed=0.0s
