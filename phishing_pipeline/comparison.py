@@ -17,6 +17,7 @@ import time
 import torch
 import logging as _logging
 import warnings as _warnings
+import math
 
 try:
     import aiohttp
@@ -28,9 +29,16 @@ except ImportError:
 _clip_logger = _logging.getLogger(__name__)
 
 # ── Parallelism tuning (AMD EPYC 9654 + NVIDIA H100) ──
-MAX_CONCURRENT_PAGES =  120# Scale up Playwright pages for AMD EPYC
+MAX_CONCURRENT_PAGES = 120
 DOMAIN_SIM_WORKERS   = 40       # More ProcessPoolExecutor workers for CPU-bound scoring
 CLIP_BATCH_SIZE      = 3000  # Massive VRAM allows huge batch pass
+SCRAPER_PAGE_CONCURRENCY = 5
+SCRAPER_CHUNK_SIZE = SCRAPER_PAGE_CONCURRENCY * 5
+SCRAPER_NAV_TIMEOUT_MS = 12000
+SCRAPER_SCREENSHOT_TIMEOUT_MS = 4000
+SCRAPER_FETCH_TIMEOUT_S = 18.0
+SCRAPER_CHUNK_TIMEOUT_FLOOR_S = 90.0
+SCRAPER_CHUNK_TIMEOUT_BUFFER_S = 20.0
 
 # transformers and CLIP are optional; use fallback for environments without these deps.
 try:
@@ -291,6 +299,16 @@ def _ensure_hashing_log(log_path: str = HASHING_LOG_PATH, reset: bool = False) -
     prefilter_logger.propagate = False
     _logging.captureWarnings(True)
     _warnings.simplefilter("default")
+    _warnings.filterwarnings(
+        "ignore",
+        category=FutureWarning,
+        message=r".*Ray will no longer override accelerator visible devices env var.*",
+    )
+    _warnings.filterwarnings(
+        "ignore",
+        category=ResourceWarning,
+        message=r".*unclosed file.*?/dev/null.*",
+    )
     return log_path
 
 
@@ -333,6 +351,29 @@ def _format_asyncio_exception_context(context: dict) -> str:
     return " | ".join(details)
 
 
+def _compact_exception_message(exc: Exception) -> str:
+    text = str(exc or "").strip()
+    if not text:
+        return exc.__class__.__name__
+
+    browser_logs_index = text.find("\nBrowser logs:")
+    if browser_logs_index != -1:
+        text = text[:browser_logs_index].rstrip()
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return exc.__class__.__name__
+
+    compact_lines = [lines[0]]
+    if "Call log:" in lines:
+        call_log_index = lines.index("Call log:")
+        call_steps = lines[call_log_index + 1:call_log_index + 4]
+        if call_steps:
+            compact_lines.append("Call log: " + " | ".join(call_steps))
+
+    return " | ".join(compact_lines)
+
+
 def _is_playwright_background_exception(context: dict) -> bool:
     message = str(context.get("message", ""))
     exception = context.get("exception")
@@ -342,8 +383,12 @@ def _is_playwright_background_exception(context: dict) -> bool:
     exception_name = exception.__class__.__name__
     exception_text = str(exception)
     return (
-        exception_name in {"TargetClosedError", "TimeoutError"}
-        and "taking page screenshot" in exception_text
+        exception_name in {"TargetClosedError", "TimeoutError", "Error"}
+        and (
+            "taking page screenshot" in exception_text
+            or "Target page, context or browser has been closed" in exception_text
+            or "Unable to retrieve content because the page is navigating" in exception_text
+        )
     )
 
 
@@ -385,6 +430,22 @@ def _empty_shortlist_df():
             "Identified Phishing/Suspected Domain Name",
         ]
     )
+
+
+def _estimate_chunk_timeout(chunk_len: int) -> float:
+    waves = max(1, math.ceil(chunk_len / SCRAPER_PAGE_CONCURRENCY))
+    return max(
+        SCRAPER_CHUNK_TIMEOUT_FLOOR_S,
+        (waves * SCRAPER_FETCH_TIMEOUT_S) + SCRAPER_CHUNK_TIMEOUT_BUFFER_S,
+    )
+
+
+async def _route_nonessential_requests(route):
+    request = route.request
+    if request.resource_type in {"font", "media"}:
+        await route.abort()
+        return
+    await route.continue_()
 
 
 # ── Async favicon fetching (non-blocking) ──
@@ -565,7 +626,7 @@ def score_all_entities(screenshot_vec, target_domain, fav_hash, words, pool):
 # PARALLEL DETECTION
 ###############################################
 
-async def fetch_features(target_url, browser, semaphore, aio_session):
+async def fetch_features(target_url, browser_context, semaphore, aio_session):
     """
     Playwright Scraping ONLY - decoupled from GPU Inference.
     """
@@ -576,17 +637,29 @@ async def fetch_features(target_url, browser, semaphore, aio_session):
     async with semaphore:
         page = None
         try:
-            page = await browser.new_page()
+            page = await browser_context.new_page()
 
             # HUGE SPEEDUP & SAFETY: Wait for 'load', disable full_page (prevent rendering bombs), and use strict timeouts
             import asyncio
             async def _grab():
-                await page.goto(target_url, timeout=15000, wait_until="load")
+                await page.goto(
+                    target_url,
+                    timeout=SCRAPER_NAV_TIMEOUT_MS,
+                    wait_until="domcontentloaded",
+                )
                 html_content = await page.content()
-                screenshot_bytes = await page.screenshot(full_page=False, timeout=5000)
+                screenshot_bytes = await page.screenshot(
+                    full_page=False,
+                    timeout=SCRAPER_SCREENSHOT_TIMEOUT_MS,
+                    animations="disabled",
+                    type="png",
+                )
                 return html_content, screenshot_bytes
 
-            html, screenshot = await asyncio.wait_for(_grab(), timeout=25.0)
+            html, screenshot = await asyncio.wait_for(
+                _grab(),
+                timeout=SCRAPER_FETCH_TIMEOUT_S,
+            )
 
         except Exception as exc:
             return (
@@ -599,7 +672,7 @@ async def fetch_features(target_url, browser, semaphore, aio_session):
                     "level": "warning",
                     "message": (
                         f"Failed loading {target_url}: "
-                        f"{exc.__class__.__name__}: {exc}"
+                        f"{exc.__class__.__name__}: {_compact_exception_message(exc)}"
                     ),
                 },
             )
@@ -702,19 +775,47 @@ class GPUInferenceActor:
             })
         return {"results": results, "logs": log_messages}
 
-@ray.remote(num_cpus=1)
+@ray.remote(num_cpus=1, max_concurrency=1)
 class ScraperActor:
     def __init__(self, gpu_actor_handle):
         _ensure_hashing_log()
         self.gpu_actor = gpu_actor_handle
         self.p = None
         self.browser = None
+        self.browser_context = None
         self.aio_session = None
         self.ops_count = 0
 
     async def _ensure_actor_loop_handler(self):
         loop = asyncio.get_running_loop()
         _install_asyncio_exception_logging(loop)
+
+    async def _reset_runtime(self):
+        if self.browser_context:
+            try:
+                await self.browser_context.close()
+            except Exception:
+                pass
+        if self.browser:
+            try:
+                await self.browser.close()
+            except Exception:
+                pass
+        if self.aio_session:
+            try:
+                await self.aio_session.close()
+            except Exception:
+                pass
+        if self.p:
+            try:
+                await self.p.stop()
+            except Exception:
+                pass
+        self.browser_context = None
+        self.browser = None
+        self.aio_session = None
+        self.p = None
+        self.ops_count = 0
         
     async def _start_browser(self):
         import aiohttp
@@ -723,8 +824,23 @@ class ScraperActor:
         if self.p is None:
             self.p = await async_playwright().start()
             self.browser = await self.p.chromium.launch(headless=True)
+            self.browser_context = await self.browser.new_context(
+                ignore_https_errors=True,
+                service_workers="block",
+            )
+            await self.browser_context.route("**/*", _route_nonessential_requests)
             connector = aiohttp.TCPConnector(limit=32) if _has_aiohttp else None
             self.aio_session = aiohttp.ClientSession(connector=connector) if _has_aiohttp else None
+            self.browser_context.set_default_navigation_timeout(SCRAPER_NAV_TIMEOUT_MS)
+            self.browser_context.set_default_timeout(SCRAPER_SCREENSHOT_TIMEOUT_MS)
+
+    async def shutdown(self):
+        await self._reset_runtime()
+        return True
+
+    async def warmup(self):
+        await self._start_browser()
+        return True
 
     async def process_chunk(self, chunk_urls):
         import asyncio
@@ -732,6 +848,7 @@ class ScraperActor:
         from io import BytesIO
         import numpy as np
         chunk_logs = []
+        fetch_failed = 0
 
         await self._ensure_actor_loop_handler()
 
@@ -742,27 +859,25 @@ class ScraperActor:
         
         # Memory Failsafe: Recycle the heavy Chromium browser rigidly every 1000 pages 
         if self.ops_count > 1000:
-            if self.browser:
-                await self.browser.close()
-            if self.aio_session:
-                await self.aio_session.close()
-            if self.p:
-                await self.p.stop()
-            self.p = None
+            await self._reset_runtime()
             await self._start_browser()
             self.ops_count = 0
 
-        semaphore = asyncio.Semaphore(6)
+        semaphore = asyncio.Semaphore(SCRAPER_PAGE_CONCURRENCY)
         tasks = [
             asyncio.create_task(
-                fetch_features(u, self.browser, semaphore, self.aio_session)
+                fetch_features(u, self.browser_context, semaphore, self.aio_session)
             )
             for u in chunk_urls
         ]
+        chunk_timeout = _estimate_chunk_timeout(len(chunk_urls))
         
         try:
-            # Hard failsafe: If the chunk takes >90s, the browser instance has deadlocked internally.
-            chunk_features = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=90.0)
+            # Hard failsafe with a timeout scaled to chunk size and page concurrency.
+            chunk_features = await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=chunk_timeout,
+            )
         except asyncio.TimeoutError:
             for task in tasks:
                 if not task.done():
@@ -780,22 +895,21 @@ class ScraperActor:
             chunk_logs.append({
                 "level": "warning",
                 "message": (
-                    "Chrome headless deadlocked for a chunk; "
+                    f"Chrome headless chunk timed out after {chunk_timeout:.1f}s; "
                     "worker rebooted and the chunk was skipped."
                 ),
             })
-            if self.browser:
-                try: await self.browser.close()
-                except: pass
-            if self.aio_session:
-                try: await self.aio_session.close()
-                except: pass
-            if self.p:
-                try: await self.p.stop()
-                except: pass
-            self.p = None
+            await self._reset_runtime()
             await self._start_browser()
-            return {"results": [], "processed": len(chunk_urls), "logs": chunk_logs}
+            return {
+                "results": [],
+                "processed": len(chunk_urls),
+                "logs": chunk_logs,
+                "hashed_success": 0,
+                "fetch_failed": 0,
+                "chunk_skipped": len(chunk_urls),
+                "actor_restart": True,
+            }
 
         images = []
         cpu_scores_list = []
@@ -811,6 +925,7 @@ class ScraperActor:
                         f"{feature_result.__class__.__name__}: {feature_result}"
                     ),
                 })
+                fetch_failed += 1
                 continue
 
             url, domain, screenshot, words, fav_hash, log_message = feature_result
@@ -818,8 +933,10 @@ class ScraperActor:
                 chunk_logs.append(log_message)
 
             if isinstance(url, Exception):
+                fetch_failed += 1
                 continue
             if screenshot is None:
+                fetch_failed += 1
                 continue
             # Send raw PNG bytes directly over Ray IPC to avoid Plasma Object Store overflow
             images.append(screenshot)
@@ -841,7 +958,15 @@ class ScraperActor:
             cpu_scores_list.append(scores)
             
         if not images:
-            return {"results": [], "processed": len(chunk_urls), "logs": chunk_logs}
+            return {
+                "results": [],
+                "processed": len(chunk_urls),
+                "logs": chunk_logs,
+                "hashed_success": 0,
+                "fetch_failed": fetch_failed,
+                "chunk_skipped": 0,
+                "actor_restart": False,
+            }
             
         cpu_scores_batch = np.array(cpu_scores_list, dtype="float32")
         gpu_payload = await self.gpu_actor.score_batch.remote(images, cpu_scores_batch)
@@ -851,7 +976,113 @@ class ScraperActor:
         out = []
         for url, res in zip(final_urls, gpu_results):
             out.append((url, res["entity"], res["score"]))
-        return {"results": out, "processed": len(chunk_urls), "logs": chunk_logs}
+        return {
+            "results": out,
+            "processed": len(chunk_urls),
+            "logs": chunk_logs,
+            "hashed_success": len(images),
+            "fetch_failed": fetch_failed,
+            "chunk_skipped": 0,
+            "actor_restart": False,
+        }
+
+
+def _create_scraper_actor(
+    gpu_actor_handle,
+    slot_id: int,
+    launch_retries: int = 2,
+    retry_backoff_s: float = 2.0,
+):
+    total_attempts = max(1, int(launch_retries) + 1)
+    last_exc = None
+
+    for attempt in range(1, total_attempts + 1):
+        actor = None
+        try:
+            actor = ScraperActor.remote(gpu_actor_handle)
+            ray.get(actor.warmup.remote(), timeout=90)
+            _clip_logger.info(
+                "Scraper actor ready | slot=%d | attempt=%d/%d",
+                slot_id,
+                attempt,
+                total_attempts,
+            )
+            return actor
+        except Exception as exc:
+            last_exc = exc
+            _clip_logger.warning(
+                "Scraper actor launch failed | slot=%d | attempt=%d/%d | error=%s",
+                slot_id,
+                attempt,
+                total_attempts,
+                _compact_exception_message(exc),
+            )
+            if actor is not None:
+                try:
+                    ray.kill(actor, no_restart=True)
+                except Exception:
+                    pass
+            if attempt < total_attempts:
+                time.sleep(retry_backoff_s)
+
+    _clip_logger.error(
+        "Scraper actor could not be created after %d attempts | slot=%d | last_error=%s",
+        total_attempts,
+        slot_id,
+        _compact_exception_message(last_exc) if last_exc is not None else "unknown",
+    )
+    return None
+
+
+def _shutdown_scraper_actors(worker_slots: list[dict]) -> None:
+    if not worker_slots or not ray.is_initialized():
+        return
+
+    active_handles = []
+    seen_actor_ids = set()
+    for slot in worker_slots:
+        actor = slot.get("actor")
+        if actor is None:
+            continue
+        actor_id = getattr(actor, "_actor_id", None)
+        actor_id_hex = actor_id.hex() if actor_id is not None else repr(actor)
+        if actor_id_hex in seen_actor_ids:
+            continue
+        seen_actor_ids.add(actor_id_hex)
+        active_handles.append(actor)
+
+    if not active_handles:
+        return
+
+    try:
+        ray.get([actor.shutdown.remote() for actor in active_handles], timeout=30)
+    except Exception as exc:
+        _clip_logger.warning("Failed to shut down scraper actors cleanly: %s", exc)
+
+
+def _build_progress_postfix(metrics: dict) -> dict:
+    return {
+        "proc": metrics["processed"],
+        "pref": metrics["passed_prefilter"],
+        "ok": metrics["hashed_success"],
+        "fail": metrics["fetch_failed"],
+        "skip": metrics["chunk_skipped"],
+        "match": metrics["final_matches_above_threshold"],
+    }
+
+
+def _log_hashing_metrics_summary(metrics: dict, elapsed: float, threshold: float) -> None:
+    _clip_logger.info(
+        "Hashing shortlist completed | passed_prefilter=%d | processed=%d | hashed_success=%d | fetch_failed=%d | chunk_skipped=%d | final_matches_above_threshold=%d | threshold=%s | elapsed=%.1fs",
+        metrics["passed_prefilter"],
+        metrics["processed"],
+        metrics["hashed_success"],
+        metrics["fetch_failed"],
+        metrics["chunk_skipped"],
+        metrics["final_matches_above_threshold"],
+        threshold,
+        elapsed,
+    )
 
 
 def run_hashing_shortlist_ray(url_list, threshold=65):
@@ -940,13 +1171,23 @@ def run_hashing_shortlist_ray(
 ):
     import pandas as pd
     import time
-    from ray.util.actor_pool import ActorPool
+    from collections import deque
     from tqdm import tqdm
 
     log_path = _configure_hashing_log()
     original_count = len(url_list)
     shortlisted_urls = list(url_list)
     ray_started = False
+    worker_slots = []
+    gpu_actors = []
+    progress_metrics = {
+        "processed": 0,
+        "passed_prefilter": 0,
+        "hashed_success": 0,
+        "fetch_failed": 0,
+        "chunk_skipped": 0,
+        "final_matches_above_threshold": 0,
+    }
 
     _clip_logger.info(
         "Hashing shortlist run started | urls=%d | threshold=%s | prefilter=%s | prefilter_threshold=%s",
@@ -976,6 +1217,7 @@ def run_hashing_shortlist_ray(
                 f"(threshold={prefilter_threshold:.1f}%)"
             )
 
+        progress_metrics["passed_prefilter"] = len(shortlisted_urls)
         _clip_logger.info("Hashing log file: %s", log_path)
         print(f"Hashing log: {log_path}")
 
@@ -986,26 +1228,71 @@ def run_hashing_shortlist_ray(
 
         t0 = time.perf_counter()
         if not ray.is_initialized():
+            os.environ.setdefault("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
             ray.init(ignore_reinit_error=True)
             ray_started = True
 
-        chunk_size = 50
+        chunk_size = SCRAPER_CHUNK_SIZE
 
         gpu_actors = [GPUInferenceActor.remote(_entity_index["clip_matrix"]) for _ in range(4)]
 
-        num_actors = min(24, (len(shortlisted_urls) // chunk_size) + 1)
+        max_scraper_actors = max(1, MAX_CONCURRENT_PAGES // SCRAPER_PAGE_CONCURRENCY)
+        num_actors = min(max_scraper_actors, (len(shortlisted_urls) // chunk_size) + 1)
         if num_actors < 1:
             num_actors = 1
 
-        workers = [ScraperActor.remote(gpu_actors[i % 4]) for i in range(num_actors)]
-        pool = ActorPool(workers)
+        for slot_id in range(num_actors):
+            gpu_actor = gpu_actors[slot_id % len(gpu_actors)]
+            actor = _create_scraper_actor(gpu_actor, slot_id=slot_id)
+            worker_slots.append({
+                "slot_id": slot_id,
+                "gpu_actor": gpu_actor,
+                "actor": actor,
+            })
 
-        chunks = [
-            shortlisted_urls[i : i + chunk_size]
-            for i in range(0, len(shortlisted_urls), chunk_size)
-        ]
-        for chunk in chunks:
-            pool.submit(lambda a, c: a.process_chunk.remote(c), chunk)
+        if not any(slot.get("actor") is not None for slot in worker_slots):
+            raise RuntimeError("Failed to start any scraper actors for hashing shortlist.")
+
+        pending_chunks = deque()
+        for chunk_id, start in enumerate(range(0, len(shortlisted_urls), chunk_size)):
+            pending_chunks.append({
+                "chunk_id": chunk_id,
+                "urls": shortlisted_urls[start : start + chunk_size],
+                "attempt_count": 0,
+                "assigned_actor": None,
+                "status": "pending",
+            })
+
+        available_slots = deque(
+            slot for slot in worker_slots
+            if slot.get("actor") is not None
+        )
+        inflight = {}
+
+        def _schedule_pending_chunks() -> None:
+            while pending_chunks and available_slots:
+                slot = available_slots.popleft()
+                actor = slot.get("actor")
+                if actor is None:
+                    continue
+
+                chunk = pending_chunks.popleft()
+                chunk["attempt_count"] += 1
+                chunk["assigned_actor"] = slot["slot_id"]
+                chunk["status"] = "in_flight"
+
+                future = actor.process_chunk.remote(chunk["urls"])
+                inflight[future] = {
+                    "chunk": chunk,
+                    "slot": slot,
+                }
+                _clip_logger.info(
+                    "Submitted hashing chunk | chunk_id=%d | size=%d | attempt=%d | slot=%d",
+                    chunk["chunk_id"],
+                    len(chunk["urls"]),
+                    chunk["attempt_count"],
+                    slot["slot_id"],
+                )
 
         results = []
         with tqdm(
@@ -1014,30 +1301,124 @@ def run_hashing_shortlist_ray(
             unit="url",
             leave=True,
         ) as progress_bar:
-            while pool.has_next():
-                chunk_result = pool.get_next()
+            progress_bar.set_postfix(_build_progress_postfix(progress_metrics), refresh=False)
+            _schedule_pending_chunks()
+
+            while inflight or pending_chunks:
+                if not inflight:
+                    active_actors = [slot for slot in worker_slots if slot.get("actor") is not None]
+                    if not active_actors:
+                        raise RuntimeError(
+                            "All scraper actors failed before hashing shortlist could complete."
+                        )
+                    _schedule_pending_chunks()
+                    if not inflight:
+                        raise RuntimeError(
+                            "Hashing shortlist scheduler stalled with pending chunks and no in-flight work."
+                        )
+
+                ready_refs, _ = ray.wait(list(inflight.keys()), num_returns=1)
+                ready_ref = ready_refs[0]
+                future_meta = inflight.pop(ready_ref)
+                chunk = future_meta["chunk"]
+                slot = future_meta["slot"]
+                actor = slot.get("actor")
+
+                try:
+                    chunk_result = ray.get(ready_ref)
+                except Exception as exc:
+                    _clip_logger.warning(
+                        "Scraper actor failed | slot=%d | chunk_id=%d | attempt=%d | error=%s",
+                        slot["slot_id"],
+                        chunk["chunk_id"],
+                        chunk["attempt_count"],
+                        _compact_exception_message(exc),
+                    )
+                    if actor is not None:
+                        try:
+                            ray.kill(actor, no_restart=True)
+                        except Exception:
+                            pass
+                    slot["actor"] = None
+                    chunk["assigned_actor"] = None
+                    chunk["status"] = "failed"
+
+                    replacement_actor = _create_scraper_actor(
+                        slot["gpu_actor"],
+                        slot_id=slot["slot_id"],
+                    )
+                    if replacement_actor is not None:
+                        slot["actor"] = replacement_actor
+                        available_slots.append(slot)
+
+                    if chunk["attempt_count"] <= 1:
+                        chunk["status"] = "pending"
+                        pending_chunks.appendleft(chunk)
+                        _clip_logger.info(
+                            "Requeued hashing chunk after actor failure | chunk_id=%d | size=%d | next_attempt=%d",
+                            chunk["chunk_id"],
+                            len(chunk["urls"]),
+                            chunk["attempt_count"] + 1,
+                        )
+                    else:
+                        chunk["status"] = "skipped"
+                        progress_metrics["processed"] += len(chunk["urls"])
+                        progress_metrics["chunk_skipped"] += len(chunk["urls"])
+                        _clip_logger.warning(
+                            "Skipping hashing chunk after repeated actor failure | chunk_id=%d | size=%d",
+                            chunk["chunk_id"],
+                            len(chunk["urls"]),
+                        )
+                        progress_bar.update(len(chunk["urls"]))
+                        progress_bar.set_postfix(
+                            _build_progress_postfix(progress_metrics),
+                            refresh=False,
+                        )
+
+                    _schedule_pending_chunks()
+                    continue
+
+                chunk["status"] = "completed"
+                chunk["assigned_actor"] = None
+                if slot.get("actor") is not None:
+                    available_slots.append(slot)
+
                 processed_count = chunk_result.get("processed", 0)
                 res_list = chunk_result.get("results", [])
+                progress_metrics["processed"] += int(processed_count)
+                progress_metrics["hashed_success"] += int(chunk_result.get("hashed_success", 0))
+                progress_metrics["fetch_failed"] += int(chunk_result.get("fetch_failed", 0))
+                progress_metrics["chunk_skipped"] += int(chunk_result.get("chunk_skipped", 0))
                 _write_hashing_log_messages(chunk_result.get("logs", []))
 
                 for url, best_entity, best_score in res_list:
                     if best_score > threshold:
                         results.append((url, best_entity, best_score))
+                        progress_metrics["final_matches_above_threshold"] += 1
 
                 progress_bar.update(processed_count)
-                progress_bar.set_postfix(matches=len(results), refresh=False)
+                progress_bar.set_postfix(
+                    _build_progress_postfix(progress_metrics),
+                    refresh=False,
+                )
+                _schedule_pending_chunks()
 
         elapsed = time.perf_counter() - t0
         print(
             f"\nHashing shortlist completed in {elapsed:.1f}s "
-            f"({len(shortlisted_urls)} URLs, {len(results)} matched)"
+            f"({progress_metrics['processed']} processed, "
+            f"{progress_metrics['final_matches_above_threshold']} matched)"
         )
-        _clip_logger.info(
-            "Hashing shortlist completed | shortlisted=%d | matched=%d | elapsed=%.1fs",
-            len(shortlisted_urls),
-            len(results),
-            elapsed,
+        print(
+            "Hashing metrics: "
+            f"passed_prefilter={progress_metrics['passed_prefilter']} "
+            f"processed={progress_metrics['processed']} "
+            f"hashed_success={progress_metrics['hashed_success']} "
+            f"fetch_failed={progress_metrics['fetch_failed']} "
+            f"chunk_skipped={progress_metrics['chunk_skipped']} "
+            f"final_matches_above_threshold={progress_metrics['final_matches_above_threshold']}"
         )
+        _log_hashing_metrics_summary(progress_metrics, elapsed, threshold)
 
         rows = []
         for target_url, best_entity, best_score in results:
@@ -1067,6 +1448,7 @@ def run_hashing_shortlist_ray(
         _clip_logger.exception("Hashing shortlist crashed unexpectedly.")
         raise
     finally:
+        _shutdown_scraper_actors(worker_slots)
         if ray_started and ray.is_initialized():
             ray.shutdown()
         _close_hashing_log()
