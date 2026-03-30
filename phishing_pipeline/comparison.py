@@ -269,7 +269,7 @@ def _ensure_hashing_log(log_path: str = HASHING_LOG_PATH, reset: bool = False) -
     target_loggers = (
         _clip_logger,
         _logging.getLogger("py.warnings"),
-        _logging.getLogger("phishing_pipeline.url_prefilter"),
+        _logging.getLogger("phishing_pipeline.dns_gate"),
     )
     for logger in target_loggers:
         for handler in list(logger.handlers):
@@ -294,9 +294,9 @@ def _ensure_hashing_log(log_path: str = HASHING_LOG_PATH, reset: bool = False) -
     warning_logger = _logging.getLogger("py.warnings")
     warning_logger.setLevel(_logging.WARNING)
     warning_logger.propagate = False
-    prefilter_logger = _logging.getLogger("phishing_pipeline.url_prefilter")
-    prefilter_logger.setLevel(_logging.INFO)
-    prefilter_logger.propagate = False
+    dns_gate_logger = _logging.getLogger("phishing_pipeline.dns_gate")
+    dns_gate_logger.setLevel(_logging.INFO)
+    dns_gate_logger.propagate = False
     _logging.captureWarnings(True)
     _warnings.simplefilter("default")
     _warnings.filterwarnings(
@@ -316,7 +316,7 @@ def _close_hashing_log() -> None:
     for logger in (
         _clip_logger,
         _logging.getLogger("py.warnings"),
-        _logging.getLogger("phishing_pipeline.url_prefilter"),
+        _logging.getLogger("phishing_pipeline.dns_gate"),
     ):
         for handler in list(logger.handlers):
             if getattr(handler, "_hashing_run_log", False):
@@ -1063,7 +1063,7 @@ def _shutdown_scraper_actors(worker_slots: list[dict]) -> None:
 def _build_progress_postfix(metrics: dict) -> dict:
     return {
         "proc": metrics["processed"],
-        "pref": metrics["passed_prefilter"],
+        "dns": metrics["passed_dns_gate"],
         "ok": metrics["hashed_success"],
         "fail": metrics["fetch_failed"],
         "skip": metrics["chunk_skipped"],
@@ -1073,8 +1073,8 @@ def _build_progress_postfix(metrics: dict) -> dict:
 
 def _log_hashing_metrics_summary(metrics: dict, elapsed: float, threshold: float) -> None:
     _clip_logger.info(
-        "Hashing shortlist completed | passed_prefilter=%d | processed=%d | hashed_success=%d | fetch_failed=%d | chunk_skipped=%d | final_matches_above_threshold=%d | threshold=%s | elapsed=%.1fs",
-        metrics["passed_prefilter"],
+        "Hashing shortlist completed | passed_dns_gate=%d | processed=%d | hashed_success=%d | fetch_failed=%d | chunk_skipped=%d | final_matches_above_threshold=%d | threshold=%s | elapsed=%.1fs",
+        metrics["passed_dns_gate"],
         metrics["processed"],
         metrics["hashed_success"],
         metrics["fetch_failed"],
@@ -1085,89 +1085,10 @@ def _log_hashing_metrics_summary(metrics: dict, elapsed: float, threshold: float
     )
 
 
-def run_hashing_shortlist_ray(url_list, threshold=65):
-    import pandas as pd
-    import time
-    from ray.util.actor_pool import ActorPool
-    
-    t0 = time.perf_counter()
-    if not ray.is_initialized():
-        ray.init(ignore_reinit_error=True)
-    # Tuned for GPU throughput! 25 images batched simultaneously per worker.
-    chunk_size = 50
-    print(f"🚀 Initializing 24 Stateful Playwright Scrapers & 4 Concurrent GPU Processors...")
-    
-    # Spawn 4 parallel GPU actors using fractional VRAM to completely saturate the H100
-    gpu_actors = [GPUInferenceActor.remote(_entity_index["clip_matrix"]) for _ in range(4)]
-    
-    # Cap actors to max exactly 24 to prevent 48-core CPU thread thrashing
-    num_actors = min(24, (len(url_list) // chunk_size) + 1)
-    if num_actors < 1: 
-        num_actors = 1
-        
-    # Round-robin assign each CPU worker to one of the 4 GPU processors
-    workers = [ScraperActor.remote(gpu_actors[i % 4]) for i in range(num_actors)]
-    pool = ActorPool(workers)
-    
-    # Push all URLs via dynamic generator maps
-    chunks = [url_list[i : i+chunk_size] for i in range(0, len(url_list), chunk_size)]
-    for chunk in chunks:
-        pool.submit(lambda a, c: a.process_chunk.remote(c), chunk)
-        
-    results = []
-    while pool.has_next():
-        res_list = pool.get_next()
-        for url, best_entity, best_score in res_list:
-            if best_score > threshold:
-                print(f"✅ {url} -> {best_entity} ({best_score:.1f}%)")
-                results.append((url, best_entity, best_score))
-            else:
-                print(f"❌ {url} -> None (best: {best_entity} {best_score:.1f}%)")
-                
-    elapsed = time.perf_counter() - t0
-    print(f"\n⏱ Ray Actor Pool Processing completed cleanly in {elapsed:.1f}s ({len(url_list)} URLs)")
-    
-    # Gracefully command ray shutdown
-    ray.shutdown()
-    
-    rows = []
-    for target_url, best_entity, best_score in results:
-        legit_domain = "Unknown"
-        parsed = urlparse(normalize_url(target_url))
-        target_domain = parsed.netloc.lower()
-        try:
-            best_idx = _entity_index["names"].index(best_entity)
-            entity_domains = _entity_index["domains"][best_idx]
-            if entity_domains:
-                legit_domain = max(entity_domains, key=lambda d: domain_similarity(target_domain, d))
-        except ValueError:
-            pass
-            
-        rows.append({
-            "Cooresponding CSE": best_entity,
-            "Legitimate Domains": legit_domain,
-            "Identified Phishing/Suspected Domain Name": target_url
-        })
-    if not rows:
-        return pd.DataFrame(columns=["Cooresponding CSE", "Legitimate Domains", "Identified Phishing/Suspected Domain Name"])
-    return pd.DataFrame(rows)
-
-def run_hashing_shortlist(url_list, threshold=65):
-    return run_hashing_shortlist_ray(url_list, threshold)
-
-# Alias for backward compatibility with main_controller.py
-async def run_hashing_shortlist_async(url_list, threshold=65):
-    import asyncio
-    return await asyncio.to_thread(run_hashing_shortlist_ray, url_list, threshold)
-
-
-# Active shortlist entrypoints with URL prefilter support.
-# These override the legacy definitions above without rewriting the older block.
+# Hashing shortlist entrypoints with DNS gate support.
 def run_hashing_shortlist_ray(
     url_list,
     threshold=65,
-    prefilter_threshold=10.0,
-    enable_prefilter=True,
 ):
     import pandas as pd
     import time
@@ -1182,7 +1103,7 @@ def run_hashing_shortlist_ray(
     gpu_actors = []
     progress_metrics = {
         "processed": 0,
-        "passed_prefilter": 0,
+        "passed_dns_gate": 0,
         "hashed_success": 0,
         "fetch_failed": 0,
         "chunk_skipped": 0,
@@ -1190,40 +1111,35 @@ def run_hashing_shortlist_ray(
     }
 
     _clip_logger.info(
-        "Hashing shortlist run started | urls=%d | threshold=%s | prefilter=%s | prefilter_threshold=%s",
+        "Hashing shortlist run started | urls=%d | threshold=%s | dns_gate=%s",
         original_count,
         threshold,
-        enable_prefilter,
-        prefilter_threshold,
+        True,
     )
 
     try:
-        if enable_prefilter:
-            from .url_prefilter import filter_urls_for_hashing
+        from .dns_gate import DEFAULT_DNS_TIMEOUT, gate_urls_for_hashing
 
-            shortlisted_urls, audit_rows = filter_urls_for_hashing(
-                shortlisted_urls,
-                threshold=prefilter_threshold,
-            )
-            accepted_count = sum(1 for row in audit_rows if row["decision"] == "accepted")
-            _clip_logger.info(
-                "Prefilter kept %d/%d URLs at %.1f%% threshold",
-                accepted_count,
-                original_count,
-                prefilter_threshold,
-            )
-            print(
-                f"Prefilter kept {accepted_count}/{original_count} URLs "
-                f"(threshold={prefilter_threshold:.1f}%)"
-            )
+        shortlisted_urls, audit_rows = gate_urls_for_hashing(shortlisted_urls)
+        accepted_count = sum(1 for row in audit_rows if row["decision"] == "accepted")
+        _clip_logger.info(
+            "DNS gate kept %d/%d URLs at %.1fs timeout",
+            accepted_count,
+            original_count,
+            DEFAULT_DNS_TIMEOUT,
+        )
+        print(
+            f"DNS gate kept {accepted_count}/{original_count} URLs "
+            f"(timeout={DEFAULT_DNS_TIMEOUT:.1f}s)"
+        )
 
-        progress_metrics["passed_prefilter"] = len(shortlisted_urls)
+        progress_metrics["passed_dns_gate"] = len(shortlisted_urls)
         _clip_logger.info("Hashing log file: %s", log_path)
         print(f"Hashing log: {log_path}")
 
         if not shortlisted_urls:
-            _clip_logger.info("No URLs passed the prefilter; skipping hashing stage.")
-            print("No URLs passed the prefilter. Skipping Ray hashing shortlist.")
+            _clip_logger.info("No URLs passed the DNS gate; skipping hashing stage.")
+            print("No URLs passed the DNS gate. Skipping Ray hashing shortlist.")
             return _empty_shortlist_df()
 
         t0 = time.perf_counter()
@@ -1411,7 +1327,7 @@ def run_hashing_shortlist_ray(
         )
         print(
             "Hashing metrics: "
-            f"passed_prefilter={progress_metrics['passed_prefilter']} "
+            f"passed_dns_gate={progress_metrics['passed_dns_gate']} "
             f"processed={progress_metrics['processed']} "
             f"hashed_success={progress_metrics['hashed_success']} "
             f"fetch_failed={progress_metrics['fetch_failed']} "
@@ -1457,31 +1373,16 @@ def run_hashing_shortlist_ray(
 def run_hashing_shortlist(
     url_list,
     threshold=65,
-    prefilter_threshold=10.0,
-    enable_prefilter=True,
 ):
-    return run_hashing_shortlist_ray(
-        url_list,
-        threshold=threshold,
-        prefilter_threshold=prefilter_threshold,
-        enable_prefilter=enable_prefilter,
-    )
+    return run_hashing_shortlist_ray(url_list, threshold=threshold)
 
 
 async def run_hashing_shortlist_async(
     url_list,
     threshold=65,
-    prefilter_threshold=10.0,
-    enable_prefilter=True,
 ):
     import asyncio
-    return await asyncio.to_thread(
-        run_hashing_shortlist_ray,
-        url_list,
-        threshold,
-        prefilter_threshold,
-        enable_prefilter,
-    )
+    return await asyncio.to_thread(run_hashing_shortlist_ray, url_list, threshold)
 
 if __name__ == "__main__":
     test_urls = [
