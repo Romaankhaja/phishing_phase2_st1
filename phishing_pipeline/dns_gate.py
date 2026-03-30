@@ -4,15 +4,17 @@ import asyncio
 import csv
 import logging
 import os
-import socket
-from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
+
+import dns.asyncresolver
+import dns.exception
+import dns.resolver
 
 from .config import OUTPUT_DIR
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DNS_TIMEOUT = 3.0
+DEFAULT_DNS_TIMEOUT = 1.5
 DEFAULT_AUDIT_PATH = os.path.join(OUTPUT_DIR, "dns_gate_audit.csv")
 DEFAULT_MIN_WORKERS = 32
 DEFAULT_MAX_WORKERS = 256
@@ -39,6 +41,7 @@ def _resolve_dns_worker_count(target_count: int, max_workers: int | None = None)
 async def _resolve_single_url(
     target_url: str,
     semaphore: asyncio.Semaphore,
+    resolver: dns.asyncresolver.Resolver,
     timeout: float,
 ) -> dict:
     normalized_url = normalize_url(target_url)
@@ -55,45 +58,77 @@ async def _resolve_single_url(
 
     try:
         async with semaphore:
-            loop = asyncio.get_running_loop()
-            infos = await asyncio.wait_for(
-                loop.getaddrinfo(
-                    hostname,
-                    None,
-                    family=socket.AF_UNSPEC,
-                    type=socket.SOCK_STREAM,
-                ),
-                timeout=timeout,
+            a_task = resolver.resolve(hostname, "A", lifetime=timeout)
+            aaaa_task = resolver.resolve(hostname, "AAAA", lifetime=timeout)
+            answers = await asyncio.gather(
+                a_task,
+                aaaa_task,
+                return_exceptions=True,
             )
 
-        resolved_ips = sorted({
-            info[4][0]
-            for info in infos
-            if len(info) >= 5 and info[4] and info[4][0]
-        })
+        resolved_ips: set[str] = set()
+        saw_timeout = False
+        saw_resolver_error = False
 
-        if not resolved_ips:
+        for answer in answers:
+            if isinstance(answer, Exception):
+                if isinstance(answer, dns.resolver.NoAnswer):
+                    continue
+                if isinstance(answer, dns.resolver.NXDOMAIN):
+                    return {
+                        "target_url": target_url,
+                        "hostname": hostname,
+                        "resolved_ips": "",
+                        "dns_status": "dns_error",
+                        "decision": "rejected",
+                    }
+                if isinstance(answer, dns.exception.Timeout):
+                    saw_timeout = True
+                    continue
+                if isinstance(answer, (dns.resolver.NoNameservers, dns.resolver.LifetimeTimeout)):
+                    saw_resolver_error = True
+                    continue
+                saw_resolver_error = True
+                continue
+
+            for item in answer:
+                text = getattr(item, "address", None) or item.to_text()
+                if text:
+                    resolved_ips.add(text)
+
+        if resolved_ips:
+            return {
+                "target_url": target_url,
+                "hostname": hostname,
+                "resolved_ips": ";".join(sorted(resolved_ips)),
+                "dns_status": "resolved",
+                "decision": "accepted",
+            }
+
+        if saw_timeout:
             return {
                 "target_url": target_url,
                 "hostname": hostname,
                 "resolved_ips": "",
-                "dns_status": "no_records",
+                "dns_status": "timeout",
                 "decision": "rejected",
             }
 
         return {
             "target_url": target_url,
             "hostname": hostname,
-            "resolved_ips": ";".join(resolved_ips),
-            "dns_status": "resolved",
-            "decision": "accepted",
+            "resolved_ips": "",
+            "dns_status": "resolver_error" if saw_resolver_error else "no_records",
+            "decision": "rejected",
         }
-    except asyncio.TimeoutError:
-        dns_status = "timeout"
-    except (socket.gaierror, UnicodeError, ValueError):
+    except (UnicodeError, ValueError):
         dns_status = "dns_error"
-    except OSError:
-        dns_status = "os_error"
+    except dns.exception.Timeout:
+        dns_status = "timeout"
+    except dns.resolver.NXDOMAIN:
+        dns_status = "dns_error"
+    except (dns.resolver.NoNameservers, dns.resolver.LifetimeTimeout, dns.exception.DNSException):
+        dns_status = "resolver_error"
     except Exception:
         dns_status = "resolver_error"
 
@@ -116,14 +151,14 @@ async def _gate_urls_for_hashing_async(
 
     worker_count = _resolve_dns_worker_count(len(target_urls), max_workers=max_workers)
     semaphore = asyncio.Semaphore(worker_count)
-    loop = asyncio.get_running_loop()
+    resolver = dns.asyncresolver.Resolver(configure=True)
+    resolver.timeout = timeout
+    resolver.lifetime = timeout
 
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        loop.set_default_executor(executor)
-        audit_rows = await asyncio.gather(*[
-            _resolve_single_url(target_url, semaphore, timeout)
-            for target_url in target_urls
-        ])
+    audit_rows = await asyncio.gather(*[
+        _resolve_single_url(target_url, semaphore, resolver, timeout)
+        for target_url in target_urls
+    ])
 
     accepted_urls = [
         row["target_url"]

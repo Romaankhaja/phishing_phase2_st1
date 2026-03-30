@@ -1,6 +1,4 @@
 target_url,hostname,resolved_ips,dns_status,decision
-shiguangmeiren.com,shiguangmeiren.com,47.76.127.217;47.91.170.222;8.218.208.240,resolved,accepted
-cicu.xyz,cicu.xyz,160.251.64.80,resolved,accepted
-jacobsheartandhoof.xyz,jacobsheartandhoof.xyz,15.197.148.33;3.33.130.190,resolved,accepted
-caladriuslogic.com,caladriuslogic.com,104.21.78.23;172.67.215.25,resolved,accepted
-artisanlensstudios.qpon,artisanlensstudios.qpon,104.21.72.54;172.67.175.167,resolved,accepted
+example.com,example.com,,timeout,rejected
+openai.com,openai.com,,timeout,rejected
+nonexistent-test-domain-xyz-12345.invalid,nonexistent-test-domain-xyz-12345.invalid,,timeout,rejected
