@@ -1,0 +1,4 @@
+target_url,hostname,resolved_ips,dns_status,decision
+example.com,example.com,,timeout,rejected
+openai.com,openai.com,,timeout,rejected
+nonexistent-test-domain-xyz-12345.invalid,nonexistent-test-domain-xyz-12345.invalid,,timeout,rejected
