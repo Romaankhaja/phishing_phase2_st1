@@ -136,6 +136,8 @@ async def main():
     
     parser.add_argument("--limit", type=int, default=None,
                         help="Number of whitelisted domains to process (default = ALL)")
+    parser.add_argument("--target-limit", type=int, default=None,
+                        help="Number of target URLs to load from the shortlisting Excel input before hashing")
     args = parser.parse_args()
 
     # ✅ Ensure whitelist file exists
@@ -158,6 +160,8 @@ async def main():
             logger.info("Processing first %d whitelisted domains...", args.limit)
         else:
             logger.info("Processing ALL whitelisted domains...")
+        if args.target_limit is not None:
+            logger.info("Limiting shortlist input to first %d target URLs...", args.target_limit)
 
         df_out = None
 
@@ -165,7 +169,10 @@ async def main():
         if run_hashing_shortlist_async and shortlisting:
             # 1. Run Shortlisting using phishing_pipeline.comparison
             logger.info("--- Starting Step 1: Running Hashing-based Shortlisting ---")
-            urls = shortlisting.load_urls_from_excel_folder(args.shortlisting)
+            urls = shortlisting.load_urls_from_excel_folder(
+                args.shortlisting,
+                limit=args.target_limit,
+            )
             
             holdout_df = await run_hashing_shortlist_async(list(urls), threshold=65)
             
@@ -182,6 +189,7 @@ async def main():
                 holdout_folder=args.shortlisting, 
                 ps02_whitelist_file=args.whitelist,
                 limit_whitelisted=args.limit if args.limit else None,
+                limit_target_urls=args.target_limit,
                 use_existing_holdout=True # This tells pipeline.py to *use* holdout.csv
             )
             
@@ -194,7 +202,8 @@ async def main():
                 df_out = await run_pipeline(
                     holdout_folder=args.shortlisting, 
                     ps02_whitelist_file=args.whitelist,
-                    limit_whitelisted=args.limit if args.limit else None
+                    limit_whitelisted=args.limit if args.limit else None,
+                    limit_target_urls=args.target_limit,
                 )
             except TypeError:
                 df_out = await run_pipeline(args.shortlisting, args.whitelist, args.limit)

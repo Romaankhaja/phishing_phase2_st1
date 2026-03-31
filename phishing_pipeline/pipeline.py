@@ -695,7 +695,13 @@ def reclassify_label(domain, registrar, host, dns, ocr_text_from_csv, tvc_brand_
 # ------------------------------------------------------------------
 # Pipeline runner
 # ------------------------------------------------------------------
-async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=None, use_existing_holdout=False):
+async def run_pipeline(
+    holdout_folder,
+    ps02_whitelist_file,
+    limit_whitelisted=None,
+    limit_target_urls=None,
+    use_existing_holdout=False,
+):
     import time
     from tqdm import tqdm as tqdm_sync
     
@@ -720,7 +726,10 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
         sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
         try:
             from .comparison import run_hashing_shortlist_async
-            urls = load_urls_from_excel_folder(holdout_folder)
+            urls = load_urls_from_excel_folder(
+                holdout_folder,
+                limit=limit_target_urls,
+            )
             holdout_df = await run_hashing_shortlist_async(list(urls), threshold=65)
             
             os.makedirs(os.path.dirname(holdout_csv_path), exist_ok=True)
@@ -1322,6 +1331,8 @@ if __name__ == "__main__":
                         help="Path to PS-02 whitelist Excel file (e.g. PS-02_hold-out_Set1_Legitimate_Domains_for_10_CSEs.xlsx)")
     parser.add_argument("--limit", type=int, default=None,
                         help="Optional: limit how many whitelisted rows to process (for testing)")
+    parser.add_argument("--target-limit", type=int, default=None,
+                        help="Optional: limit how many target URLs are loaded before hashing shortlist generation")
     parser.add_argument("--use-existing-holdout", action="store_true",
                         help="If set and holdout.csv exists, reuse it instead of regenerating.")
     
@@ -1343,7 +1354,9 @@ if __name__ == "__main__":
         async def main_wrapper():
             try:
                 await run_pipeline(args.holdout_folder, args.ps02_whitelist_file,
-                                   limit_whitelisted=args.limit, use_existing_holdout=args.use_existing_holdout)
+                                   limit_whitelisted=args.limit,
+                                   limit_target_urls=args.target_limit,
+                                   use_existing_holdout=args.use_existing_holdout)
             finally:
                 # Use the new async closer
                 from .visual_features import close_browser_async

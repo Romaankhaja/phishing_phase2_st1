@@ -95,9 +95,10 @@ def is_similar_advanced(cand_url_norm: str, legit_url_norm: str,
         pass
     return False
 
-def load_urls_from_excel_folder(folder_path):
+def load_urls_from_excel_folder(folder_path, limit: int | None = None):
     logger.info(f"Reading Excel files from: {folder_path}")
     all_urls = set()
+    max_urls = None if limit is None else max(0, int(limit))
     
     if os.path.isfile(folder_path) and folder_path.endswith((".xlsx", ".xls")):
         files = [folder_path]
@@ -108,6 +109,9 @@ def load_urls_from_excel_folder(folder_path):
         logger.warning(f"No .xlsx or .xls files found in {folder_path}.")
         return all_urls
     logger.info(f"Found {len(files)} files.")
+    if max_urls == 0:
+        logger.info("Target URL limit set to 0; skipping Excel URL loading.")
+        return all_urls
     
     for f in files:
         # Ignore temporary lock files created by Excel
@@ -116,23 +120,49 @@ def load_urls_from_excel_folder(folder_path):
             continue
             
         try:
-            df = pd.read_excel(f)
+            header_df = pd.read_excel(f, nrows=0)
             possible_cols = ["Identified Phishing/Suspected Domain Name", "URL", "url", "Domain", "domain_name"]
             found_col = None
             for col in possible_cols:
-                if col in df.columns:
+                if col in header_df.columns:
                     found_col = col
                     break
             if not found_col:
-                for col in df.columns:
+                for col in header_df.columns:
                     if "url" in str(col).lower() or "domain" in str(col).lower():
                         found_col = col
                         break
             if not found_col:
-                found_col = df.columns[0]
+                found_col = header_df.columns[0]
                 logger.warning(f"No known URL column in {f}. Using first column: {found_col}")
+            remaining_limit = None
+            if max_urls is not None:
+                remaining_limit = max_urls - len(all_urls)
+                if remaining_limit <= 0:
+                    logger.info("Reached target URL limit (%d total).", max_urls)
+                    return all_urls
+
+            df = pd.read_excel(
+                f,
+                usecols=[found_col],
+                nrows=remaining_limit,
+            )
             urls = df[found_col].dropna().astype(str)
-            all_urls.update(url.strip().lower() for url in urls)
+            added_from_file = 0
+            for url in urls:
+                normalized = url.strip().lower()
+                if not normalized or normalized in all_urls:
+                    continue
+                all_urls.add(normalized)
+                added_from_file += 1
+                if max_urls is not None and len(all_urls) >= max_urls:
+                    logger.info(
+                        "Loaded %d new URLs from '%s' before reaching target limit (%d total).",
+                        added_from_file,
+                        f,
+                        max_urls,
+                    )
+                    return all_urls
             logger.info(f"Loaded {len(urls)} URLs from '{f}'")
         except Exception as e:
             logger.error(f"Failed to read {f}: {e}")
