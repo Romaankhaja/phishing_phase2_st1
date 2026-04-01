@@ -32,13 +32,14 @@ _clip_logger = _logging.getLogger(__name__)
 MAX_CONCURRENT_PAGES = 120
 DOMAIN_SIM_WORKERS   = 40       # More ProcessPoolExecutor workers for CPU-bound scoring
 CLIP_BATCH_SIZE      = 3000  # Massive VRAM allows huge batch pass
-SCRAPER_PAGE_CONCURRENCY = 5
-SCRAPER_CHUNK_SIZE = SCRAPER_PAGE_CONCURRENCY * 5
-SCRAPER_NAV_TIMEOUT_MS = 12000
-SCRAPER_SCREENSHOT_TIMEOUT_MS = 4000
-SCRAPER_FETCH_TIMEOUT_S = 18.0
+SCRAPER_PAGE_CONCURRENCY = 16   # 3× increase: EPYC+H100 can sustain 16 concurrent tabs per actor
+SCRAPER_CHUNK_SIZE = SCRAPER_PAGE_CONCURRENCY * 5  # 80 URLs/chunk — fewer Ray IPC round-trips
+SCRAPER_NAV_TIMEOUT_MS = 9000   # Tightened from 12s; domcontentloaded is fast
+SCRAPER_SCREENSHOT_TIMEOUT_MS = 3000  # Tightened from 4s
+SCRAPER_FETCH_TIMEOUT_S = 12.0  # Tightened outer fence from 18s
 SCRAPER_CHUNK_TIMEOUT_FLOOR_S = 90.0
 SCRAPER_CHUNK_TIMEOUT_BUFFER_S = 20.0
+_AIOHTTP_CONNECTOR_LIMIT = 256  # Match elevated page concurrency for favicon fetching
 
 # transformers and CLIP are optional; use fallback for environments without these deps.
 try:
@@ -440,9 +441,13 @@ def _estimate_chunk_timeout(chunk_len: int) -> float:
     )
 
 
+# Block all resource types not needed for HTML text + screenshot extraction.
+# Dropping images/fonts/media/stylesheets cuts per-page network time significantly.
+_BLOCKED_RESOURCE_TYPES = {"font", "media", "image", "stylesheet", "other", "eventsource", "websocket"}
+
 async def _route_nonessential_requests(route):
     request = route.request
-    if request.resource_type in {"font", "media"}:
+    if request.resource_type in _BLOCKED_RESOURCE_TYPES:
         await route.abort()
         return
     await route.continue_()
@@ -829,7 +834,7 @@ class ScraperActor:
                 service_workers="block",
             )
             await self.browser_context.route("**/*", _route_nonessential_requests)
-            connector = aiohttp.TCPConnector(limit=32) if _has_aiohttp else None
+            connector = aiohttp.TCPConnector(limit=_AIOHTTP_CONNECTOR_LIMIT, ttl_dns_cache=300) if _has_aiohttp else None
             self.aio_session = aiohttp.ClientSession(connector=connector) if _has_aiohttp else None
             self.browser_context.set_default_navigation_timeout(SCRAPER_NAV_TIMEOUT_MS)
             self.browser_context.set_default_timeout(SCRAPER_SCREENSHOT_TIMEOUT_MS)
