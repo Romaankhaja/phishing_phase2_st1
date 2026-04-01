@@ -11,7 +11,6 @@ import logging
 from typing import Any
 
 # Event loop policy on Windows
-# Event loop policy on Windows
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     
@@ -39,9 +38,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---
-# --- We have REMOVED the unused EasyOCR initialization that was here ---
-# ---
 
 def _load_runtime_components() -> dict[str, Any]:
     """
@@ -125,15 +121,10 @@ async def main():
 
     parser = argparse.ArgumentParser(description="Phishing Detection CLI Controller")
     
-    # ---
-    # --- FIX 1: Updated default paths to match your new system
-    # ---
     parser.add_argument("--whitelist", type=str, default=os.path.join("data", "whitelists", "Stage_2_Legitimate_Domains_80.xlsx"),
                         help="Path to whitelist Excel file")
     parser.add_argument("--shortlisting", type=str, default=os.path.join("data", "holdout_sets"),
                         help="Folder containing shortlisting .xlsx files")
-    # --- (End of Fix 1) ---
-    
     parser.add_argument("--limit", type=int, default=None,
                         help="Number of whitelisted domains to process (default = ALL)")
     parser.add_argument("--target-limit", type=int, default=None,
@@ -153,6 +144,32 @@ async def main():
     try:
         # 🧹 Clear GPU memory at the start of every run
         clear_gpu_memory()
+
+        # 🧹 Clear stale outputs from previous runs
+        import shutil
+        import glob
+
+        evidence_dir = os.path.join("phishing_pipeline", "PS-02_ISS_NLP_Evidences")
+        if os.path.isdir(evidence_dir):
+            shutil.rmtree(evidence_dir, ignore_errors=True)
+            logger.info("🧹 Cleared previous evidence directory: %s", evidence_dir)
+
+        # Remove old submission xlsx (temp file in phishing_pipeline/)
+        for xlsx in glob.glob(os.path.join("phishing_pipeline", "PS-02_*_Submission_Set.xlsx")):
+            os.remove(xlsx)
+            logger.info("🧹 Removed old submission xlsx: %s", xlsx)
+
+        # Remove old submission zip and output CSVs
+        for pattern in [
+            os.path.join("output", "*.zip"),
+            os.path.join("output", "output_file.csv"),
+            os.path.join("output", "output_file_filtered.csv"),
+            os.path.join("output", "holdout.csv"),
+            os.path.join("output", "checkpoint_records.csv"),
+        ]:
+            for f in glob.glob(pattern):
+                os.remove(f)
+                logger.info("🧹 Removed old output: %s", f)
         
         logger.info("Using whitelist file: %s", args.whitelist)
         logger.info("Using shortlisting folder: %s", args.shortlisting)
@@ -190,7 +207,7 @@ async def main():
                 ps02_whitelist_file=args.whitelist,
                 limit_whitelisted=args.limit if args.limit else None,
                 limit_target_urls=args.target_limit,
-                use_existing_holdout=True # This tells pipeline.py to *use* holdout.csv
+                use_existing_holdout=True
             )
             
             logger.info("--- Finished Step 2: Main Pipeline Complete ---")
@@ -238,15 +255,6 @@ async def main():
                 logger.info("Closed visual browser.")
             except Exception as exc:
                 logger.warning("close_browser() raised: %s", exc)
-
-        # Gracefully shutdown Ray to prevent GCS zombie crash
-        try:
-            import ray
-            if ray.is_initialized():
-                ray.shutdown()
-                logger.info("Ray cluster shut down cleanly.")
-        except Exception as exc:
-            logger.warning("ray.shutdown() raised: %s", exc)
 
         # Kill any orphaned chrome-headless processes
         try:

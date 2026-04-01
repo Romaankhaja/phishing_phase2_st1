@@ -1,100 +1,48 @@
-2026-03-30 14:06:54,259 | INFO | Hashing shortlist run started | urls=5 | threshold=65 | dns_gate=True
-2026-03-30 14:06:54,920 | INFO | DNS gate kept 5/5 URLs at 3.0s timeout
-2026-03-30 14:06:54,920 | INFO | DNS gate kept 5/5 URLs at 3.0s timeout
-2026-03-30 14:06:54,921 | INFO | Hashing log file: C:\Users\SATWIK\Documents\Phishing\output\hashing_shortlist.log
-2026-03-30 14:06:55,173 | WARNING | C:\Users\SATWIK\Documents\Phishing\venv\lib\site-packages\ray\_private\node.py:1075: ResourceWarning: unclosed file <_io.TextIOWrapper name='nul' mode='w' encoding='cp1252'>
-  process_info = ray._private.services.start_gcs_server(
+2026-04-01 13:57:03,000 | INFO | Hashing shortlist (streaming) started | urls=198 | threshold=65
+2026-04-01 13:57:04,623 | INFO | DNS gate kept 169/198 URLs at 1.5s timeout
+2026-04-01 13:57:04,623 | INFO | Hashing log file: c:\Users\SATWIK\Documents\Phishing\output\hashing_shortlist.log
+2026-04-01 13:57:08,320 | INFO | 🚀 Loading CLIP model (openai/clip-vit-base-patch32) on cuda...
+2026-04-01 13:57:17,693 | INFO | ✅ CLIP model ready (dtype=torch.float16)
+2026-04-01 13:57:18,478 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001FDFA8EB100>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
 
-2026-03-30 14:06:55,691 | WARNING | C:\Users\SATWIK\Documents\Phishing\venv\lib\site-packages\ray\_private\node.py:1221: ResourceWarning: unclosed file <_io.TextIOWrapper name='nul' mode='w' encoding='cp1252'>
-  process_info = ray._private.services.start_monitor(
+2026-04-01 13:57:23,224 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001FDF9622F20>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
 
-2026-03-30 14:06:57,977 | WARNING | C:\Users\SATWIK\Documents\Phishing\venv\lib\site-packages\ray\_private\node.py:1005: ResourceWarning: unclosed file <_io.TextIOWrapper name='nul' mode='w' encoding='cp1252'>
-  process_info = ray._private.services.start_log_monitor(
+2026-04-01 13:57:28,412 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001FDFA768100>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
 
-2026-03-30 14:06:58,057 | WARNING | C:\Users\SATWIK\Documents\Phishing\venv\lib\site-packages\ray\_private\node.py:1156: ResourceWarning: unclosed file <_io.TextIOWrapper name='nul' mode='w' encoding='cp1252'>
-  process_info = ray._private.services.start_raylet(
+2026-04-01 13:57:32,216 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001FE10668040>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
 
-2026-03-30 14:07:02,499 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\typing.py:668: ResourceWarning: unclosed file <_io.TextIOWrapper name='nul' mode='w' encoding='cp1252'>
-  code = compile(arg, '<string>', 'eval')
+2026-04-01 13:57:33,991 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001FDD6763220>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
 
-2026-03-30 14:07:25,076 | ERROR | Asyncio exception in hashing actor: Task exception was never retrieved | future=<Task finished name='Task-4' coro=<Connection.run() done, defined at C:\Users\SATWIK\Documents\Phishing\venv\lib\site-packages\playwright\_impl\_connection.py:305> exception=PermissionError(13, 'Access is denied', None, 5, None)> | PermissionError: [WinError 5] Access is denied
-Traceback (most recent call last):
-  File "C:\Users\SATWIK\Documents\Phishing\venv\lib\site-packages\playwright\_impl\_connection.py", line 312, in run
-    await self._transport.connect()
-  File "C:\Users\SATWIK\Documents\Phishing\venv\lib\site-packages\playwright\_impl\_transport.py", line 133, in connect
-    raise exc
-  File "C:\Users\SATWIK\Documents\Phishing\venv\lib\site-packages\playwright\_impl\_transport.py", line 120, in connect
-    self._proc = await asyncio.create_subprocess_exec(
-  File "C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\subprocess.py", line 218, in create_subprocess_exec
-    transport, protocol = await loop.subprocess_exec(
-  File "C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\base_events.py", line 1681, in subprocess_exec
-    transport = await self._make_subprocess_transport(
-  File "C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\windows_events.py", line 399, in _make_subprocess_transport
-    transp = _WindowsSubprocessTransport(self, protocol, args, shell,
-  File "C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\base_subprocess.py", line 36, in __init__
-    self._start(args=args, shell=shell, stdin=stdin, stdout=stdout,
-  File "C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\windows_events.py", line 901, in _start
-    self._proc = windows_utils.Popen(
-  File "C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\windows_utils.py", line 136, in __init__
-    stdin_rh, stdin_wh = pipe(overlapped=(False, True), duplex=True)
-  File "C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\windows_utils.py", line 63, in pipe
-    h2 = _winapi.CreateFile(
-PermissionError: [WinError 5] Access is denied
-2026-03-30 14:07:25,151 | WARNING | Scraper actor launch failed | slot=0 | attempt=1/3 | error=[36mray::ScraperActor.warmup()[39m (pid=24688, ip=127.0.0.1, actor_id=f2e9db4e2b54e0b8de1e56cf01000000, repr=<phishing_pipeline.comparison.ScraperActor object at 0x00000163C5461210>)
-2026-03-30 14:07:42,076 | ERROR | Asyncio exception in hashing actor: Task exception was never retrieved | future=<Task finished name='Task-4' coro=<Connection.run() done, defined at C:\Users\SATWIK\Documents\Phishing\venv\lib\site-packages\playwright\_impl\_connection.py:305> exception=PermissionError(13, 'Access is denied', None, 5, None)> | PermissionError: [WinError 5] Access is denied
-Traceback (most recent call last):
-  File "C:\Users\SATWIK\Documents\Phishing\venv\lib\site-packages\playwright\_impl\_connection.py", line 312, in run
-    await self._transport.connect()
-  File "C:\Users\SATWIK\Documents\Phishing\venv\lib\site-packages\playwright\_impl\_transport.py", line 133, in connect
-    raise exc
-  File "C:\Users\SATWIK\Documents\Phishing\venv\lib\site-packages\playwright\_impl\_transport.py", line 120, in connect
-    self._proc = await asyncio.create_subprocess_exec(
-  File "C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\subprocess.py", line 218, in create_subprocess_exec
-    transport, protocol = await loop.subprocess_exec(
-  File "C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\base_events.py", line 1681, in subprocess_exec
-    transport = await self._make_subprocess_transport(
-  File "C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\windows_events.py", line 399, in _make_subprocess_transport
-    transp = _WindowsSubprocessTransport(self, protocol, args, shell,
-  File "C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\base_subprocess.py", line 36, in __init__
-    self._start(args=args, shell=shell, stdin=stdin, stdout=stdout,
-  File "C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\windows_events.py", line 901, in _start
-    self._proc = windows_utils.Popen(
-  File "C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\windows_utils.py", line 136, in __init__
-    stdin_rh, stdin_wh = pipe(overlapped=(False, True), duplex=True)
-  File "C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\windows_utils.py", line 63, in pipe
-    h2 = _winapi.CreateFile(
-PermissionError: [WinError 5] Access is denied
-2026-03-30 14:07:42,114 | WARNING | Scraper actor launch failed | slot=0 | attempt=2/3 | error=[36mray::ScraperActor.warmup()[39m (pid=12852, ip=127.0.0.1, actor_id=e624416266f9d7529a3913e901000000, repr=<phishing_pipeline.comparison.ScraperActor object at 0x000001FB57B11360>)
-2026-03-30 14:08:04,488 | ERROR | Asyncio exception in hashing actor: Task exception was never retrieved | future=<Task finished name='Task-4' coro=<Connection.run() done, defined at C:\Users\SATWIK\Documents\Phishing\venv\lib\site-packages\playwright\_impl\_connection.py:305> exception=PermissionError(13, 'Access is denied', None, 5, None)> | PermissionError: [WinError 5] Access is denied
-Traceback (most recent call last):
-  File "C:\Users\SATWIK\Documents\Phishing\venv\lib\site-packages\playwright\_impl\_connection.py", line 312, in run
-    await self._transport.connect()
-  File "C:\Users\SATWIK\Documents\Phishing\venv\lib\site-packages\playwright\_impl\_transport.py", line 133, in connect
-    raise exc
-  File "C:\Users\SATWIK\Documents\Phishing\venv\lib\site-packages\playwright\_impl\_transport.py", line 120, in connect
-    self._proc = await asyncio.create_subprocess_exec(
-  File "C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\subprocess.py", line 218, in create_subprocess_exec
-    transport, protocol = await loop.subprocess_exec(
-  File "C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\base_events.py", line 1681, in subprocess_exec
-    transport = await self._make_subprocess_transport(
-  File "C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\windows_events.py", line 399, in _make_subprocess_transport
-    transp = _WindowsSubprocessTransport(self, protocol, args, shell,
-  File "C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\base_subprocess.py", line 36, in __init__
-    self._start(args=args, shell=shell, stdin=stdin, stdout=stdout,
-  File "C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\windows_events.py", line 901, in _start
-    self._proc = windows_utils.Popen(
-  File "C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\windows_utils.py", line 136, in __init__
-    stdin_rh, stdin_wh = pipe(overlapped=(False, True), duplex=True)
-  File "C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\windows_utils.py", line 63, in pipe
-    h2 = _winapi.CreateFile(
-PermissionError: [WinError 5] Access is denied
-2026-03-30 14:08:04,598 | WARNING | Scraper actor launch failed | slot=0 | attempt=3/3 | error=[36mray::ScraperActor.warmup()[39m (pid=19144, ip=127.0.0.1, actor_id=46f541b0eef5e4dae754efe301000000, repr=<phishing_pipeline.comparison.ScraperActor object at 0x0000020CFCA815A0>)
-2026-03-30 14:08:04,600 | ERROR | Scraper actor could not be created after 3 attempts | slot=0 | last_error=[36mray::ScraperActor.warmup()[39m (pid=19144, ip=127.0.0.1, actor_id=46f541b0eef5e4dae754efe301000000, repr=<phishing_pipeline.comparison.ScraperActor object at 0x0000020CFCA815A0>)
-2026-03-30 14:08:04,603 | ERROR | Hashing shortlist crashed unexpectedly.
-Traceback (most recent call last):
-  File "C:\Users\SATWIK\Documents\Phishing\phishing_pipeline\comparison.py", line 1170, in run_hashing_shortlist_ray
-    raise RuntimeError("Failed to start any scraper actors for hashing shortlist.")
-RuntimeError: Failed to start any scraper actors for hashing shortlist.
-2026-03-30 14:08:06,964 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\subprocess.py:1072: ResourceWarning: subprocess 24496 is still running
-  _warn("subprocess %s is still running" % self.pid,
+2026-04-01 13:57:34,332 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001FE0FA2B460>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
 
+2026-04-01 13:57:34,433 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001FDF97A0880>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-01 13:57:35,016 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001FDFA98B940>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-01 13:57:35,744 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001FDFFEACD60>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-01 13:57:36,158 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001FDFFEDE620>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-01 13:57:38,859 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001FDD6604880>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-01 13:57:39,208 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001FE0F5F7100>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-01 13:57:43,004 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001FE0F496800>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-01 13:57:43,285 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001FE0F93E9E0>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-01 13:57:43,835 | INFO | Hashing shortlist completed | passed_dns_gate=169 | processed=169 | hashed_success=124 | fetch_failed=0 | fetch_timed_out=45 | final_matches=13 | gpu_batches=69 | avg_gpu_batch=1.8 | threshold=65 | elapsed=39.2s
