@@ -1,4 +1,4 @@
-import os, re
+﻿import os, re
 import psutil
 import tldextract
 import numpy as np
@@ -41,78 +41,107 @@ from .visual_features import (
 logger = logging.getLogger(__name__)
 
 # ================== DYNAMIC RESOURCE ALLOCATION ==================
+def _read_env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        logger.warning("Invalid integer override for %s=%r; using %d", name, raw, default)
+        return default
+
+
 def _get_optimal_concurrency():
     """
-    Calculate optimal concurrency limits based on system resources.
-    Strategy defined in docs/DYNAMIC_RESOURCE_ALLOCATION.md
+    Calculate runtime limits from the host profile.
     """
-    import torch
-
-    # 1. Detect Resources
     cpu_cores = os.cpu_count() or 4
     ram_gb = psutil.virtual_memory().total / (1024**3)
-    
-    vram_gb = 0
-    if torch.cuda.is_available():
+
+    vram_gb = 0.0
+    if TORCH_AVAILABLE and torch.cuda.is_available():
         try:
-            # Get VRAM of the first GPU in GB
             vram_bytes = torch.cuda.get_device_properties(0).total_memory
             vram_gb = vram_bytes / (1024**3)
         except Exception:
-            vram_gb = 0
+            vram_gb = 0.0
 
-    logger.info(f"⚙️  System Resources Detected: CPU={cpu_cores} cores, RAM={ram_gb:.1f}GB, VRAM={vram_gb:.1f}GB")
+    logger.info(
+        "System Resources Detected: CPU=%d cores, RAM=%.1fGB, VRAM=%.1fGB",
+        cpu_cores,
+        ram_gb,
+        vram_gb,
+    )
 
-    # 2. Apply Formulas
-    
-    # OCR: 3.0GB VRAM per process (Safe buffer for RTX 2050/3050 class cards)
-    # If VRAM < 6GB, we allow 3 concurrent tasks to queue (buffered), 
-    # but they will obtain the GPU lock one-by-one.
+    server_class = cpu_cores >= 32 and ram_gb >= 96
+
     if vram_gb > 0:
-        if vram_gb < 6.0:
+        if server_class and vram_gb >= 40.0:
+            max_ocr = max(8, min(16, int(vram_gb / 6.0)))
+        elif vram_gb < 6.0:
             max_ocr = 3
         else:
-            max_ocr = max(1, int(vram_gb / 3.0))
+            max_ocr = max(1, min(12, int(vram_gb / 3.0)))
     else:
-        max_ocr = max(1, int(cpu_cores / 2))
+        max_ocr = max(2, min(8, int(cpu_cores / 2)))
 
-    # Screenshots: ~500MB RAM per headless browser instance
-    # Cap at 20 to avoid CPU thrashing on consumer hardware
-    max_screenshots = min(25, max(1, int(ram_gb / 0.35)))
+    if server_class:
+        max_screenshots = min(96, max(24, min(int(ram_gb / 2.5), cpu_cores * 2)))
+        max_image_proc = min(192, cpu_cores * 3)
+        max_cpu = min(768, cpu_cores * 12)
+        max_rdap = min(48, max(16, cpu_cores))
+        max_whois = min(8, max(3, cpu_cores // 8))
+        max_dns_prefilter = min(768, max(256, cpu_cores * 8))
+        network_limit = min(256, max(96, max_screenshots * 2))
+        chunk_size = min(512, max(96, max_screenshots * 4))
+    else:
+        max_screenshots = min(32, max(1, min(int(ram_gb / 0.5), cpu_cores * 2)))
+        max_image_proc = cpu_cores * 2
+        max_cpu = cpu_cores * 10
+        max_rdap = 15
+        max_whois = 3
+        max_dns_prefilter = 200
+        network_limit = min(128, max(32, max_screenshots * 2))
+        chunk_size = max(32, max_screenshots * 5)
 
-    # Image Processing (CPU bound but light): 2x CPU cores
-    max_image_proc = cpu_cores * 2
+    return {
+        "ocr": _read_env_int("PHISHING_OCR_WORKERS", max_ocr),
+        "screenshots": _read_env_int("PHISHING_SCREENSHOT_WORKERS", max_screenshots),
+        "image_proc": _read_env_int("PHISHING_IMAGE_WORKERS", max_image_proc),
+        "cpu": _read_env_int("PHISHING_CPU_TASKS", max_cpu),
+        "chunk_size": _read_env_int("PHISHING_CHUNK_SIZE", chunk_size),
+        "rdap": _read_env_int("PHISHING_RDAP_WORKERS", max_rdap),
+        "whois": _read_env_int("PHISHING_WHOIS_WORKERS", max_whois),
+        "dns_prefilter": _read_env_int("PHISHING_DNS_PREFILTER_WORKERS", max_dns_prefilter),
+        "network": _read_env_int("PHISHING_NETWORK_SEMAPHORE", network_limit),
+    }
 
-    # CPU Tasks (General): 10x CPU cores (async tasks usually wait on I/O)
-    max_cpu = cpu_cores * 10  # Increased multiplier for I/O bound tasks
 
-    return max_ocr, max_screenshots, max_image_proc, max_cpu
+_CONCURRENCY_PROFILE = _get_optimal_concurrency()
 
+MAX_CONCURRENT_OCR = _CONCURRENCY_PROFILE["ocr"]
+MAX_CONCURRENT_SCREENSHOTS = _CONCURRENCY_PROFILE["screenshots"]
+MAX_CONCURRENT_IMAGE_PROCESSING = _CONCURRENCY_PROFILE["image_proc"]
+MAX_CONCURRENT_CPU_TASKS = _CONCURRENCY_PROFILE["cpu"]
+CHUNK_SIZE = _CONCURRENCY_PROFILE["chunk_size"]
+MAX_CONCURRENT_RDAP = _CONCURRENCY_PROFILE["rdap"]
+MAX_CONCURRENT_WHOIS = _CONCURRENCY_PROFILE["whois"]
+MAX_CONCURRENT_DNS_PREFILTER = _CONCURRENCY_PROFILE["dns_prefilter"]
+NETWORK_SEMAPHORE_LIMIT = _CONCURRENCY_PROFILE["network"]
 
-# Calculate dynamic values
-MAX_CONCURRENT_OCR, MAX_CONCURRENT_SCREENSHOTS, \
-MAX_CONCURRENT_IMAGE_PROCESSING, MAX_CONCURRENT_CPU_TASKS = _get_optimal_concurrency()
-
-# Define CHUNK_SIZE dynamically
-# We want to process enough domains to keep all workers busy, but not so many that we
-# hold onto too much memory (PDFs, images) before flushing.
-# A good heuristic is 3-5x the screenshot concurrency (since that's the memory bottleneck).
-CHUNK_SIZE = MAX_CONCURRENT_SCREENSHOTS * 5
-
-logger.info(f"🚀 Dynamic Concurrency Limits: OCR={MAX_CONCURRENT_OCR}, "
-            f"Screenshots={MAX_CONCURRENT_SCREENSHOTS}, "
-            f"ImgProc={MAX_CONCURRENT_IMAGE_PROCESSING}, "
-            f"CPU={MAX_CONCURRENT_CPU_TASKS}, "
-            f"CHUNK_SIZE={CHUNK_SIZE}")
-
-# ================== WHOIS/RDAP CONCURRENCY SETTINGS ==================
-# Adjust these to control parallel domain lookup throughput.
-# RDAP: Direct to authoritative registries (Verisign, etc.) — no published rate limit
-# WHOIS: Port 43 fallback — strict per-IP rate limits (~1 req/sec most registries)
-# DNS: Pre-filter resolution — lightweight, high concurrency safe
-MAX_CONCURRENT_RDAP = 15           # HTTP GET to registries, no hard rate limit
-MAX_CONCURRENT_WHOIS = 3           # 3 concurrent, still gated by rate_limiter
-MAX_CONCURRENT_DNS_PREFILTER = 200  # Fast (network bound)
+logger.info(
+    "Dynamic Concurrency Limits: OCR=%d, Screenshots=%d, ImgProc=%d, CPU=%d, RDAP=%d, WHOIS=%d, DNS=%d, Net=%d, CHUNK_SIZE=%d",
+    MAX_CONCURRENT_OCR,
+    MAX_CONCURRENT_SCREENSHOTS,
+    MAX_CONCURRENT_IMAGE_PROCESSING,
+    MAX_CONCURRENT_CPU_TASKS,
+    MAX_CONCURRENT_RDAP,
+    MAX_CONCURRENT_WHOIS,
+    MAX_CONCURRENT_DNS_PREFILTER,
+    NETWORK_SEMAPHORE_LIMIT,
+    CHUNK_SIZE,
+)
 
 _ocr_semaphore: asyncio.Semaphore | None = None
 _screenshot_semaphore: asyncio.Semaphore | None = None
@@ -193,7 +222,7 @@ async def wait_for_vram(min_free_gb: float = 1.5, poll_interval: float = 0.5):
             gc.collect()
             await asyncio.sleep(poll_interval)
     except Exception as e:
-        logger.warning("wait_for_vram check failed: %s — proceeding anyway", e)
+        logger.warning("wait_for_vram check failed: %s â€” proceeding anyway", e)
 
 # ================== RESOURCE MONITOR SINGLETON ==================
 # Imported here so pipeline.py can use it without a separate import chain.
@@ -483,7 +512,7 @@ def _safe_extract_ocr(path: str) -> str:
 
 def _safe_preprocess_image(path: str):
     """
-    Phase A wrapper — CPU only, no lock.
+    Phase A wrapper â€” CPU only, no lock.
     Returns numpy array or None. Run this in parallel while GPU is busy.
     """
     try:
@@ -498,7 +527,7 @@ def _safe_preprocess_image(path: str):
 
 def _safe_run_ocr(img_np) -> tuple:
     """
-    Phase B wrapper — GPU serialized, minimal lock scope.
+    Phase B wrapper â€” GPU serialized, minimal lock scope.
     Pass the numpy array from _safe_preprocess_image().
 
     Returns:
@@ -540,7 +569,7 @@ def _safe_extract_laplacian(path: str) -> float:
 # Textual-Visual Consistency (TVC) Features
 # =====================================================================
 
-# Brand → known legitimate domains mapping
+# Brand â†’ known legitimate domains mapping
 BRAND_DOMAIN_MAP = {
     "sbi":       ["sbi.co.in", "onlinesbi.com", "onlinesbi.sbi"],
     "icici":     ["icicibank.com"],
@@ -580,11 +609,11 @@ def extract_tvc_features(url: str, ocr_header_text: str, ocr_footer_text: str) -
 
     Returns:
         dict with TVC features:
-            tvc_brand_detected  (bool)  — any known brand found in visual text
-            tvc_detected_brand  (str)   — which brand was detected (or "none")
-            tvc_domain_match    (bool)  — actual domain is a legitimate domain for the brand
-            tvc_fuzzy_score     (float) — fuzzy string similarity (0.0—1.0)
-            tvc_brand_spoofed   (bool)  — brand detected but domain DOESN'T match (phishing signal)
+            tvc_brand_detected  (bool)  â€” any known brand found in visual text
+            tvc_detected_brand  (str)   â€” which brand was detected (or "none")
+            tvc_domain_match    (bool)  â€” actual domain is a legitimate domain for the brand
+            tvc_fuzzy_score     (float) â€” fuzzy string similarity (0.0â€”1.0)
+            tvc_brand_spoofed   (bool)  â€” brand detected but domain DOESN'T match (phishing signal)
     """
     from rapidfuzz import fuzz
 

@@ -1,11 +1,14 @@
-import pandas as pd
+﻿import pandas as pd
 import json
 import hashlib
 import asyncio
 import ssl
 import os
 import time
+import multiprocessing as mp
 import numpy as np
+import psutil
+import torch
 from io import BytesIO
 from playwright.async_api import async_playwright
 from PIL import Image
@@ -22,10 +25,50 @@ except ImportError:
 # Use the shared, optimized CLIP from comparison.py (lazy-loaded, FP16, batched)
 from .comparison import get_clip_embeddings_batch
 
-# ── Parallelism tuning (AMD EPYC 9654 – 48 cores, H100 GPU) ──
-MAX_CONCURRENT_PAGES = 16       # Playwright pages open at the same time
-CLIP_BATCH_SIZE      = 64       # H100 has 95 GB VRAM – use bigger batches
 
+def _read_env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        return default
+
+
+def _runtime_parallelism() -> tuple[int, int]:
+    cpu_count = mp.cpu_count() or 4
+    ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+    vram_gb = 0.0
+    if torch.cuda.is_available():
+        try:
+            vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        except Exception:
+            vram_gb = 0.0
+
+    if cpu_count >= 32 and ram_gb >= 96:
+        max_pages = min(64, max(32, cpu_count))
+    elif cpu_count >= 16:
+        max_pages = 32
+    else:
+        max_pages = 16
+
+    if vram_gb >= 80:
+        clip_batch = 512
+    elif vram_gb >= 40:
+        clip_batch = 256
+    elif vram_gb >= 16:
+        clip_batch = 128
+    else:
+        clip_batch = 64
+
+    return (
+        _read_env_int("PHISHING_LEGIT_HASH_PAGES", max_pages),
+        _read_env_int("PHISHING_LEGIT_CLIP_BATCH", clip_batch),
+    )
+
+
+MAX_CONCURRENT_PAGES, CLIP_BATCH_SIZE = _runtime_parallelism()
 
 ###############################################
 # HELPERS
@@ -39,7 +82,7 @@ def sha256_bytes(data):
     return hashlib.sha256(data).hexdigest()
 
 
-# ── Async favicon fetching ──
+# â”€â”€ Async favicon fetching â”€â”€
 async def favicon_hash_async(domain, session=None):
     """Fetch favicon hash using aiohttp (non-blocking) or requests fallback."""
     if _has_aiohttp and session is not None:
@@ -77,7 +120,7 @@ def favicon_hash(domain):
     return _favicon_hash_sync(domain)
 
 
-# ── Async SSL cert hash ──
+# â”€â”€ Async SSL cert hash â”€â”€
 async def get_ssl_hash_async(domain):
     """Non-blocking SSL certificate hash fetch."""
     try:
@@ -157,7 +200,7 @@ async def _scan_domain(domain, entity, context, semaphore, aio_session, lock,
     Lock protects entity_db writes.
     """
     async with semaphore:
-        print(f"  ↳ Scanning: {domain}")
+        print(f"  â†³ Scanning: {domain}")
         page = await context.new_page()
         try:
             url = "https://" + domain
@@ -178,7 +221,7 @@ async def _scan_domain(domain, entity, context, semaphore, aio_session, lock,
             fav_result, ssl_result = await asyncio.gather(fav_task, ssl_task)
 
             ###################################
-            # STORE DATA (non-CLIP) — protected by lock
+            # STORE DATA (non-CLIP) â€” protected by lock
             ###################################
 
             img = Image.open(BytesIO(screenshot)).convert("RGB")
@@ -193,7 +236,7 @@ async def _scan_domain(domain, entity, context, semaphore, aio_session, lock,
                 pending_clips[entity].append(img)
 
         except Exception as e:
-            print(f"  ⚠ Error: {domain} — {e}")
+            print(f"  âš  Error: {domain} â€” {e}")
 
         await page.close()
 
@@ -220,9 +263,9 @@ async def generate_hashes():
             viewport={"width": 1366, "height": 768}
         )
 
-        # ───────────────────────────────────────────
+        # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # PHASE 1: Browse & collect screenshots (PARALLEL)
-        # ───────────────────────────────────────────
+        # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         all_tasks = []
 
@@ -247,7 +290,7 @@ async def generate_hashes():
                 )
 
         total = len(all_tasks)
-        print(f"🚀 Scanning {total} domains with up to {MAX_CONCURRENT_PAGES} concurrent pages...")
+        print(f"ðŸš€ Scanning {total} domains with up to {MAX_CONCURRENT_PAGES} concurrent pages...")
 
         await asyncio.gather(*all_tasks)
 
@@ -257,11 +300,11 @@ async def generate_hashes():
         await aio_session.close()
 
     browse_elapsed = time.perf_counter() - t0
-    print(f"⏱ Phase 1 (browsing) done in {browse_elapsed:.1f}s")
+    print(f"â± Phase 1 (browsing) done in {browse_elapsed:.1f}s")
 
-    # ───────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # PHASE 2: Batch CLIP embedding (GPU-bound)
-    # ───────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Collect ALL images across all entities into one flat list for maximum batching
     all_images = []
     image_map = []  # (entity, index_within_entity)
@@ -272,16 +315,16 @@ async def generate_hashes():
             image_map.append((entity, i))
 
     if all_images:
-        print(f"🧠 Batch-embedding {len(all_images)} screenshots through CLIP (batch_size={CLIP_BATCH_SIZE})...")
+        print(f"ðŸ§  Batch-embedding {len(all_images)} screenshots through CLIP (batch_size={CLIP_BATCH_SIZE})...")
         embeddings = get_clip_embeddings_batch(all_images, batch_size=CLIP_BATCH_SIZE)
 
         for (entity, _), emb in zip(image_map, embeddings):
             entity_db[entity]["screenshot_clip"].append(emb.tolist())
 
-        print("✅ Batch CLIP embedding complete.")
+        print("âœ… Batch CLIP embedding complete.")
 
     total_elapsed = time.perf_counter() - t0
-    print(f"⏱ Total generation time: {total_elapsed:.1f}s")
+    print(f"â± Total generation time: {total_elapsed:.1f}s")
 
 
 ###############################################
@@ -299,5 +342,5 @@ with open(os.path.join(os.path.dirname(BASE_DIR), "data", "entity_hash_db.json")
     json.dump(entity_db, f, indent=4)
 
 
-print("✅ DB GENERATED WITH CLIP")
-
+print("âœ… DB GENERATED WITH CLIP")
+

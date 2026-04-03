@@ -4,6 +4,15 @@ import httpx
 # Suppress noisy httpx request logs
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+class _WhoisSocketNoiseFilter(logging.Filter):
+    def filter(self, record):
+        message = record.getMessage()
+        return "Error trying to connect to socket: closing socket" not in message
+
+
+logging.getLogger("whois.whois").addFilter(_WhoisSocketNoiseFilter())
 import pandas as pd
 import tldextract
 from tqdm.asyncio import tqdm
@@ -44,6 +53,7 @@ from .utils import (
     _get_rdap_semaphore, _get_whois_semaphore, _get_dns_prefilter_semaphore,
     CHUNK_SIZE,
     MAX_CONCURRENT_OCR, MAX_CONCURRENT_SCREENSHOTS,
+    NETWORK_SEMAPHORE_LIMIT,
     _get_screenshot_semaphore,
     wait_for_vram,
     extract_network_features_async,
@@ -241,6 +251,7 @@ def _parse_rdap_to_fields(data: dict) -> dict:
 # ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(BASE_DIR)
+HASH_REVIEW_QUEUE_PATH = os.path.join(ROOT_DIR, "output", "hash_review_queue.csv")
 # --- (End of Fix 1) ---
 
 warnings.filterwarnings("ignore", message=".*pin_memory.*")
@@ -404,7 +415,7 @@ async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=Non
         return
 
     if network_semaphore is None:
-        network_semaphore = asyncio.Semaphore(50)
+        network_semaphore = asyncio.Semaphore(NETWORK_SEMAPHORE_LIMIT)
 
     rows = df.to_dict('records')
     all_results = []
@@ -414,7 +425,7 @@ async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=Non
     # Shared queue between Stage 1 and Stage 2.
     # max size = OCR_workers * 2  so Stage 1 doesn't race far ahead and eat RAM.
     # -----------------------------------------------------------------------
-    OCR_QUEUE_DEPTH = MAX_CONCURRENT_OCR * 2
+    OCR_QUEUE_DEPTH = max(MAX_CONCURRENT_OCR * 4, MAX_CONCURRENT_SCREENSHOTS)
     queue: asyncio.Queue = asyncio.Queue(maxsize=OCR_QUEUE_DEPTH)
     DONE_SENTINEL = None  # Tells OCR workers to stop
 
@@ -692,6 +703,335 @@ def reclassify_label(domain, registrar, host, dns, ocr_text_from_csv, tvc_brand_
     # Default to Legitimate ONLY if valid data exists and no red flags found
     return "Legitimate"
 
+
+def _submission_record_columns() -> list[str]:
+    return [
+        "Application_ID",
+        "Source of detection",
+        "Identified Phishing/Suspected Domain Name",
+        "Corresponding CSE Domain Name",
+        "Critical Sector Entity Name",
+        "Phishing/Suspected Domains (i.e. Class Label)",
+        "Domain Registration Date",
+        "Registrar Name",
+        "Registrant Name or Registrant Organisation",
+        "Registrant Country",
+        "Name Servers",
+        "Hosting IP",
+        "Hosting ISP",
+        "Hosting Country",
+        "DNS Records (if any)",
+        "Evidence file name",
+        "Date of detection (DD-MM-YYYY)",
+        "Time of detection (HH-MM-SS)",
+        "Date of Post (If detection is from Source: social media)",
+        "Remarks",
+    ]
+
+
+def _confidence_band_from_score(score, high_confidence_threshold, medium_confidence_threshold):
+    try:
+        score_value = float(score)
+    except (TypeError, ValueError):
+        score_value = 0.0
+    if score_value >= high_confidence_threshold:
+        return "High"
+    if score_value >= medium_confidence_threshold:
+        return "Medium"
+    return "Low"
+
+
+def _normalize_confidence_band(raw_band, score, high_confidence_threshold, medium_confidence_threshold):
+    band_text = str(raw_band or "").strip().lower()
+    if band_text == "high":
+        return "High"
+    if band_text == "medium":
+        return "Medium"
+    if band_text == "low":
+        return "Low"
+    return _confidence_band_from_score(score, high_confidence_threshold, medium_confidence_threshold)
+
+
+def _normalize_evidence_tier(row: dict) -> str:
+    def _as_bool(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        text = str(value or "").strip().lower()
+        return text in {"1", "true", "yes", "y"}
+
+    raw = str(row.get("evidence_tier", "") or "").strip().lower()
+    if raw in {"strong", "strong_evidence"}:
+        return "strong_evidence"
+    if raw in {"weak", "weak_evidence"}:
+        return "weak_evidence"
+
+    lexical_hit = _as_bool(row.get("lexical_rule_hit")) or _as_bool(row.get("typo_anchor"))
+    hash_hit = _as_bool(row.get("hash_anchor"))
+    visual_hit = _as_bool(row.get("clip_anchor"))
+    if lexical_hit and (hash_hit or visual_hit):
+        return "strong_evidence"
+    return "weak_evidence"
+
+
+def _is_suspicious_infra(registrar, hosting_isp):
+    reg = str(registrar or "").lower()
+    isp = str(hosting_isp or "").lower()
+    return any(r in reg for r in SUSPICIOUS_REGISTRARS) or any(h in isp for h in SUSPICIOUS_HOSTS)
+
+
+def _as_bool_flag(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _hybrid_hash_classification(row: dict, registrar, hosting_isp, dns_records):
+    lexical_rule_hit = _as_bool_flag(row.get("lexical_rule_hit"))
+    brand_token_hit = _as_bool_flag(row.get("brand_token_hit"))
+    lexical_valid = lexical_rule_hit or brand_token_hit
+    if not lexical_valid:
+        return "Legitimate"
+
+    confidence_band = str(row.get("confidence_band", "Low") or "Low")
+    hash_anchor = _as_bool_flag(row.get("hash_anchor"))
+    clip_anchor = _as_bool_flag(row.get("clip_anchor"))
+    domain_hit = _as_bool_flag(row.get("signal_hit_domain"))
+    keyword_hit = _as_bool_flag(row.get("signal_hit_keywords"))
+    typo_anchor = _as_bool_flag(row.get("typo_anchor"))
+    suspicious_infra = _is_suspicious_infra(registrar, hosting_isp)
+    lexical_score = pd.to_numeric(pd.Series([row.get("lexical_score", 0.0)]), errors="coerce").fillna(0.0).iloc[0]
+    lexical_strong = lexical_score >= 0.85 or typo_anchor
+
+    base_label = reclassify_label(
+        row.get("Identified Phishing/Suspected Domain Name", ""),
+        registrar,
+        hosting_isp,
+        dns_records,
+        "",
+        tvc_brand_spoofed=False,
+    )
+
+    if hash_anchor and (suspicious_infra or domain_hit or keyword_hit or clip_anchor):
+        return "Phishing"
+
+    if lexical_strong and clip_anchor and suspicious_infra and confidence_band == "High":
+        return "Phishing"
+
+    if base_label == "Phishing" and hash_anchor and lexical_valid:
+        return "Phishing"
+
+    return "Suspected"
+
+
+async def _run_hash_only_pipeline(
+    df_filtered: pd.DataFrame,
+    whois_rate_limiter: RateLimiter,
+    high_confidence_threshold: float,
+    medium_confidence_threshold: float,
+):
+    df_filtered = df_filtered.copy()
+    os.makedirs(os.path.dirname(HASH_REVIEW_QUEUE_PATH), exist_ok=True)
+    if "hash_score" not in df_filtered.columns:
+        df_filtered["hash_score"] = 0.0
+    df_filtered["hash_score"] = pd.to_numeric(df_filtered["hash_score"], errors="coerce").fillna(0.0)
+    if "confidence_band" in df_filtered.columns:
+        confidence_series = df_filtered["confidence_band"]
+    else:
+        confidence_series = pd.Series([""] * len(df_filtered), index=df_filtered.index)
+    df_filtered["confidence_band"] = [
+        _normalize_confidence_band(raw_band, score, high_confidence_threshold, medium_confidence_threshold)
+        for raw_band, score in zip(confidence_series, df_filtered["hash_score"])
+    ]
+    df_filtered["evidence_tier"] = [
+        _normalize_evidence_tier(row)
+        for row in df_filtered.to_dict("records")
+    ]
+
+    low_conf_df = df_filtered[df_filtered["confidence_band"] == "Low"].copy()
+    low_conf_df.to_csv(HASH_REVIEW_QUEUE_PATH, index=False, encoding="utf-8")
+    logger.info("Hash review queue written to %s (%d rows)", HASH_REVIEW_QUEUE_PATH, len(low_conf_df))
+
+    classified_df = df_filtered.copy()
+    total_domains = len(classified_df)
+    logger.info("Hash-only mode will classify %d shortlisted rows", total_domains)
+
+    if classified_df.empty:
+        empty_df = pd.DataFrame(columns=_submission_record_columns())
+        empty_df.to_csv(FINAL_OUTPUT, index=False, encoding="utf-8")
+        logger.info("No shortlisted rows to classify. Final output written as empty schema CSV.")
+        return empty_df
+
+    records = []
+    records_lock = asyncio.Lock()
+    serial_counter = [0]
+    rdap_sem = _get_rdap_semaphore()
+    whois_sem = _get_whois_semaphore()
+    dns_sem = _get_dns_prefilter_semaphore()
+
+    def _get_rdap_url(host):
+        ext = tldextract.extract(host)
+        tld = ext.suffix.split(".")[-1] if ext.suffix else ""
+        return RDAP_DIRECT_URLS.get(tld, RDAP_FALLBACK_URL)
+
+    async def _process_hash_row(row: dict, client: httpx.AsyncClient):
+        domain_url = str(row.get("Identified Phishing/Suspected Domain Name", "")).strip()
+        host = urlparse(domain_url).hostname or domain_url
+        host = host.split(":")[0]
+
+        resolved_ip = None
+        async with dns_sem:
+            try:
+                loop = asyncio.get_running_loop()
+                resolved_ip = await asyncio.wait_for(
+                    loop.run_in_executor(None, socket.gethostbyname, host),
+                    timeout=3.0,
+                )
+            except Exception:
+                pass
+
+        reg_data = None
+        async with rdap_sem:
+            try:
+                base_url = _get_rdap_url(host)
+                resp = await client.get(f"{base_url}{host}")
+                if resp.status_code == 200:
+                    reg_data = _parse_rdap_to_fields(resp.json())
+            except Exception:
+                pass
+
+        if reg_data is None and resolved_ip is not None:
+            async with whois_sem:
+                await whois_rate_limiter.acquire()
+                try:
+                    loop = asyncio.get_running_loop()
+                    w = await asyncio.wait_for(
+                        loop.run_in_executor(None, whois.whois, host),
+                        timeout=5.0,
+                    )
+                    if w:
+                        cd = w.creation_date
+                        if isinstance(cd, list):
+                            cd = cd[0]
+                        reg_data = {
+                            "reg_date": str(cd) if cd else "NA",
+                            "registrar": w.registrar or "NA",
+                            "registrant_name": w.name or w.org or getattr(w, "registrant_name", None) or "NA",
+                            "registrant_country": w.country or "NA",
+                            "name_servers": ";".join(str(ns) for ns in w.name_servers) if w.name_servers else "NA",
+                        }
+                except Exception:
+                    pass
+
+        dns_records = "NA"
+        if resolved_ip is not None:
+            async with dns_sem:
+                try:
+                    loop = asyncio.get_running_loop()
+
+                    def _resolve_sync():
+                        results = []
+                        for qtype in ["A", "NS", "MX", "CNAME"]:
+                            try:
+                                answers = dns.resolver.resolve(host, qtype, lifetime=2.0)
+                                results.extend([f"{qtype}:{record.to_text()}" for record in answers])
+                            except Exception:
+                                pass
+                        return ";".join(results) if results else "NA"
+
+                    dns_records = await loop.run_in_executor(None, _resolve_sync)
+                except Exception:
+                    pass
+
+        rd = reg_data or {}
+        reg_date = rd.get("reg_date", "NA")
+        registrar = rd.get("registrar", "NA")
+        registrant_name = rd.get("registrant_name", "NA")
+        registrant_country = rd.get("registrant_country", "NA")
+        name_servers = rd.get("name_servers", "NA")
+
+        geo_input = pd.DataFrame([{"url": domain_url, "ip_address": resolved_ip or "NA"}])
+        geo_dict = enrich_with_geoip(geo_input, ASN_DB_PATH, CITY_DB_PATH).iloc[0].to_dict()
+        ip = str(geo_dict.get("ip_address") or (resolved_ip or "NA"))
+        hosting_isp = str(geo_dict.get("asn_org", "NA")) if geo_dict.get("asn_org") and not pd.isna(geo_dict.get("asn_org")) else "NA"
+        hosting_country = str(geo_dict.get("country", "NA")) if geo_dict.get("country") and not pd.isna(geo_dict.get("country")) else "NA"
+
+        confidence_band = row.get("confidence_band", "Low")
+        evidence_tier = _normalize_evidence_tier(row)
+        classification = _hybrid_hash_classification(
+            row,
+            registrar=registrar,
+            hosting_isp=hosting_isp,
+            dns_records=dns_records,
+        )
+        source_of_detection = adjust_source(
+            row.get("Cooresponding CSE", ""),
+            row.get("Legitimate Domains", ""),
+            "Unknown",
+        )
+
+        if classification.lower() == "phishing":
+            async with records_lock:
+                serial_counter[0] += 1
+                serial_no = serial_counter[0]
+            evidence_path, evidence_name = format_evidence_filename(
+                row.get("Cooresponding CSE", "Unknown"),
+                domain_url,
+                serial_no,
+                application_id=APPLICATION_ID,
+            )
+            await asyncio.to_thread(move_screenshot_to_evidence, domain_url, evidence_path)
+        else:
+            evidence_name = "NA"
+
+        detection_date = datetime.now().strftime("%d-%m-%Y")
+        detection_time_str = datetime.now().strftime("%H:%M:%S")
+        record = {
+            "Application_ID": APPLICATION_ID,
+            "Source of detection": source_of_detection,
+            "Identified Phishing/Suspected Domain Name": domain_url,
+            "Corresponding CSE Domain Name": row.get("Legitimate Domains", ""),
+            "Critical Sector Entity Name": row.get("Cooresponding CSE", ""),
+            "Phishing/Suspected Domains (i.e. Class Label)": classification,
+            "Domain Registration Date": reg_date,
+            "Registrar Name": registrar,
+            "Registrant Name or Registrant Organisation": registrant_name,
+            "Registrant Country": registrant_country,
+            "Name Servers": name_servers,
+            "Hosting IP": ip,
+            "Hosting ISP": hosting_isp,
+            "Hosting Country": hosting_country,
+            "DNS Records (if any)": dns_records,
+            "Evidence file name": evidence_name,
+            "Date of detection (DD-MM-YYYY)": detection_date,
+            "Time of detection (HH-MM-SS)": detection_time_str,
+            "Date of Post (If detection is from Source: social media)": "NA",
+            "Remarks": (
+                "non_aligned_or_weak_cse_similarity; NA values are due to privacy issues."
+                if classification == "Legitimate"
+                else "weak_or_single_signal_match; NA values are due to privacy issues."
+                if evidence_tier == "weak_evidence"
+                else "NA values are due to privacy issues."
+            ),
+        }
+        async with records_lock:
+            records.append(record)
+            await asyncio.to_thread(_append_record_to_checkpoint, record, CHECKPOINT_CSV)
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
+        tasks = [
+            asyncio.create_task(_process_hash_row(row, client))
+            for row in classified_df.to_dict("records")
+        ]
+        task_results = await asyncio.gather(*tasks, return_exceptions=True)
+        for task_result in task_results:
+            if isinstance(task_result, Exception):
+                logger.error("Hash-only worker failed: %s", task_result)
+
+    df_out = pd.DataFrame(records, columns=_submission_record_columns())
+    df_out.to_csv(FINAL_OUTPUT, index=False, encoding="utf-8")
+    logger.info("Hash-only final output written to %s (%d records)", FINAL_OUTPUT, len(df_out))
+    return df_out
+
 # ------------------------------------------------------------------
 # Pipeline runner
 # ------------------------------------------------------------------
@@ -701,15 +1041,47 @@ async def run_pipeline(
     limit_whitelisted=None,
     limit_target_urls=None,
     use_existing_holdout=False,
+    pipeline_mode="hash_only",
+    high_confidence_threshold=78.0,
+    medium_confidence_threshold=68.0,
+    hashing_threshold=65.0,
+    domain_similarity_threshold=0.85,
+    typo_top_k=10,
+    typo_min_score=0.45,
+    clip_margin_min=0.12,
+    dns_timeout=3.0,
+    dns_retries=1,
+    dns_max_workers=None,
 ):
     import time
     from tqdm import tqdm as tqdm_sync
     
     start_time = time.time()
     logger.info("🚀 Starting pipeline...")
+    pipeline_mode = str(pipeline_mode or "hash_only").strip().lower()
+    if pipeline_mode not in {"hash_only", "legacy_ocr"}:
+        raise ValueError(f"Unsupported pipeline_mode '{pipeline_mode}'. Use 'hash_only' or 'legacy_ocr'.")
+    if high_confidence_threshold < medium_confidence_threshold:
+        raise ValueError("high_confidence_threshold must be >= medium_confidence_threshold")
+    logger.info(
+        "Pipeline mode=%s | high_confidence_threshold=%.2f | medium_confidence_threshold=%.2f | "
+        "hashing_threshold=%.2f | domain_similarity_threshold=%.3f | typo_top_k=%d | "
+        "typo_min_score=%.3f | clip_margin_min=%.3f | dns_timeout=%.2f | dns_retries=%d | dns_max_workers=%s",
+        pipeline_mode,
+        high_confidence_threshold,
+        medium_confidence_threshold,
+        hashing_threshold,
+        domain_similarity_threshold,
+        int(typo_top_k),
+        typo_min_score,
+        clip_margin_min,
+        dns_timeout,
+        int(dns_retries),
+        dns_max_workers if dns_max_workers is not None else "adaptive",
+    )
     
     # Initialize semaphores here to be shared with process_urls
-    network_semaphore = asyncio.Semaphore(50)
+    network_semaphore = asyncio.Semaphore(NETWORK_SEMAPHORE_LIMIT)
     
     # Rate limiter: 20 requests per minute = 1 request every 3 seconds
     whois_rate_limiter = RateLimiter(requests_per_minute=20)
@@ -730,7 +1102,19 @@ async def run_pipeline(
                 holdout_folder,
                 limit=limit_target_urls,
             )
-            holdout_df = await run_hashing_shortlist_async(list(urls), threshold=65)
+            holdout_df = await run_hashing_shortlist_async(
+                list(urls),
+                threshold=hashing_threshold,
+                domain_similarity_threshold=domain_similarity_threshold,
+                high_confidence_threshold=high_confidence_threshold,
+                medium_confidence_threshold=medium_confidence_threshold,
+                typo_top_k=typo_top_k,
+                typo_min_score=typo_min_score,
+                clip_margin_min=clip_margin_min,
+                dns_timeout=dns_timeout,
+                dns_retries=dns_retries,
+                dns_max_workers=dns_max_workers,
+            )
             
             os.makedirs(os.path.dirname(holdout_csv_path), exist_ok=True)
             holdout_df.to_csv(holdout_csv_path, index=False)
@@ -756,7 +1140,9 @@ async def run_pipeline(
     df_holdout = pd.read_csv(holdout_csv_path)
 
     # --- Use the new column name ---
-    df_filtered = df_holdout[df_holdout["Legitimate Domains"].isin(ps02_df["Legitimate Domains"])]
+    df_filtered = df_holdout[
+        df_holdout["Legitimate Domains"].isin(ps02_df["Legitimate Domains"])
+    ].copy()
 
     # ── Resume from checkpoint if a previous run was interrupted ──────────
     done_domains = set()
@@ -777,6 +1163,27 @@ async def run_pipeline(
              .astype(str).str.strip().str.lower().isin(done_domains)
         ]
         logger.info("📋 %d domains remaining after checkpoint resume", len(df_filtered))
+
+    if pipeline_mode == "hash_only":
+        df_out = await _run_hash_only_pipeline(
+            df_filtered=df_filtered,
+            whois_rate_limiter=whois_rate_limiter,
+            high_confidence_threshold=high_confidence_threshold,
+            medium_confidence_threshold=medium_confidence_threshold,
+        )
+        if os.path.exists(CHECKPOINT_CSV):
+            try:
+                os.remove(CHECKPOINT_CSV)
+                logger.info("🗑 Removed checkpoint file (hash-only pipeline completed successfully)")
+            except Exception as e:
+                logger.warning("⚠ Could not remove checkpoint file: %s", e)
+        pipeline_time = time.time() - start_time
+        logger.info(
+            "✅ Hash-only pipeline complete in %.1fs (%d records)",
+            pipeline_time,
+            len(df_out),
+        )
+        return df_out
 
     # Define a temp file path inside the phishing_pipeline folder
     temp_csv_path = os.path.join(os.path.dirname(__file__), "holdout_temp.csv")
@@ -1071,7 +1478,7 @@ async def run_pipeline(
     # ── Create queue2, start Phase 2 workers and Phase 1 concurrently ────
     # queue2 is created HERE so phase2_workers can wait on it before Phase 1
     # even produces any items. They'll block on queue2.get() until OCR arrives.
-    PHASE2_QUEUE_DEPTH = MAX_CONCURRENT_RDAP * 2
+    PHASE2_QUEUE_DEPTH = max(MAX_CONCURRENT_RDAP * 4, MAX_CONCURRENT_OCR * 2)
     queue2: asyncio.Queue = asyncio.Queue(maxsize=PHASE2_QUEUE_DEPTH)
     DONE_P2 = object()  # Sentinel for phase2_workers
 
@@ -1198,15 +1605,55 @@ def package_results(output_file=FINAL_OUTPUT, zip_path="PS-02_ISS_NLP_Submission
         logger.error("❌ No output CSV file found to package: %s", csv_to_use)
         return
 
-    # --- Convert the final CSV to the new Excel file ---
+    # --- Convert the final CSV into the required submission Excel schema ---
     try:
-        df_final_output = pd.read_csv(csv_to_use)
-        
-        # --- NEW: Fill any remaining NaNs with "NA" before saving to Excel ---
-        # This is a final safeguard.
-        df_final_output.fillna("NA", inplace=True)
-        
-        df_final_output.to_excel(local_excel_path, index=False)
+        df_final_output = pd.read_csv(csv_to_use, dtype=str, keep_default_na=False)
+        df_final_output = df_final_output.replace(r"^\s*$", "NA", regex=True)
+
+        def _mapped_series(source_name: str) -> pd.Series:
+            if source_name in df_final_output.columns:
+                return df_final_output[source_name].astype(str).replace(r"^\s*$", "NA", regex=True)
+            return pd.Series(["NA"] * len(df_final_output), dtype="string")
+
+        def _relative_evidence_path(value: str) -> str:
+            text = str(value or "").strip()
+            if not text or text.upper() == "NA":
+                return "NA"
+            file_name = os.path.basename(text.replace("\\", "/"))
+            return str(pathlib.PurePosixPath(evidence_folder_name, file_name))
+
+        submission_df = pd.DataFrame(
+            {
+                "Identified Domain Name": _mapped_series("Identified Phishing/Suspected Domain Name"),
+                "Corresponding CSE Name": _mapped_series("Corresponding CSE Domain Name"),
+                "IP Address": _mapped_series("Hosting IP"),
+                "Hosting ISP": _mapped_series("Hosting ISP"),
+                "Hosting Country": _mapped_series("Hosting Country"),
+                "Registrant Name": _mapped_series("Registrant Name or Registrant Organisation"),
+                "Registrant Country": _mapped_series("Registrant Country"),
+                "Name Servers": _mapped_series("Name Servers"),
+                "Evidence File Path": _mapped_series("Evidence file name").map(_relative_evidence_path),
+                "Source of Detection": _mapped_series("Source of detection"),
+                "Remarks": _mapped_series("Remarks"),
+                "Phishing (Yes)": _mapped_series("Phishing/Suspected Domains (i.e. Class Label)"),
+            },
+            columns=[
+                "Identified Domain Name",
+                "Corresponding CSE Name",
+                "IP Address",
+                "Hosting ISP",
+                "Hosting Country",
+                "Registrant Name",
+                "Registrant Country",
+                "Name Servers",
+                "Evidence File Path",
+                "Source of Detection",
+                "Remarks",
+                "Phishing (Yes)",
+            ],
+        )
+        submission_df = submission_df.replace(r"^\s*$", "NA", regex=True)
+        submission_df.to_excel(local_excel_path, index=False)
         logger.info("✅ Converted final output CSV to %s", excel_file_name)
     except Exception as e:
         logger.error("❌ Failed to create Excel file: %s", e)
@@ -1335,6 +1782,12 @@ if __name__ == "__main__":
                         help="Optional: limit how many target URLs are loaded before hashing shortlist generation")
     parser.add_argument("--use-existing-holdout", action="store_true",
                         help="If set and holdout.csv exists, reuse it instead of regenerating.")
+    parser.add_argument("--pipeline-mode", choices=["hash_only", "legacy_ocr"], default="hash_only",
+                        help="Run hash-only architecture (default) or legacy OCR pipeline.")
+    parser.add_argument("--high-confidence-threshold", type=float, default=78.0,
+                        help="Hash score threshold for High confidence band (default=78.0).")
+    parser.add_argument("--medium-confidence-threshold", type=float, default=68.0,
+                        help="Hash score threshold for Medium confidence band (default=68.0).")
     
     # ---
     # --- FIX 2: Corrected 'addD-argument' to 'add_argument'
@@ -1356,7 +1809,10 @@ if __name__ == "__main__":
                 await run_pipeline(args.holdout_folder, args.ps02_whitelist_file,
                                    limit_whitelisted=args.limit,
                                    limit_target_urls=args.target_limit,
-                                   use_existing_holdout=args.use_existing_holdout)
+                                   use_existing_holdout=args.use_existing_holdout,
+                                   pipeline_mode=args.pipeline_mode,
+                                   high_confidence_threshold=args.high_confidence_threshold,
+                                   medium_confidence_threshold=args.medium_confidence_threshold)
             finally:
                 # Use the new async closer
                 from .visual_features import close_browser_async

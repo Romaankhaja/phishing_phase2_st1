@@ -39,6 +39,48 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _non_negative_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Value must be numeric") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("Value must be non-negative")
+    return parsed
+
+
+def _probability_float(value: str) -> float:
+    parsed = _non_negative_float(value)
+    if parsed > 1:
+        raise argparse.ArgumentTypeError("Value must be in [0, 1]")
+    return parsed
+
+
+def _non_negative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Value must be an integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("Value must be non-negative")
+    return parsed
+
+
+def _positive_int(value: str) -> int:
+    parsed = _non_negative_int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("Value must be > 0")
+    return parsed
+
+
+def _pipeline_mode(value: str) -> str:
+    normalized = str(value).strip().lower()
+    allowed = {"hash_only", "legacy_ocr"}
+    if normalized not in allowed:
+        raise argparse.ArgumentTypeError(f"pipeline mode must be one of {sorted(allowed)}")
+    return normalized
+
+
 def _load_runtime_components() -> dict[str, Any]:
     """
     Import pipeline modules lazily.
@@ -129,7 +171,47 @@ async def main():
                         help="Number of whitelisted domains to process (default = ALL)")
     parser.add_argument("--target-limit", type=int, default=None,
                         help="Number of target URLs to load from the shortlisting Excel input before hashing")
+    parser.add_argument("--pipeline-mode", type=_pipeline_mode, default="hash_only",
+                        help="Pipeline mode: hash_only (default) or legacy_ocr")
+    parser.add_argument("--hashing-threshold", type=_non_negative_float, default=65.0,
+                        help="Minimum final shortlist score required for a match (default=65)")
+    parser.add_argument("--domain-sim-threshold", type=_probability_float, default=0.85,
+                        help="Minimum domain similarity in [0,1] required before domain score is counted (default=0.85)")
+    parser.add_argument("--high-confidence-threshold", type=_non_negative_float, default=78.0,
+                        help="Hash score threshold for High confidence band (default=78)")
+    parser.add_argument("--medium-confidence-threshold", type=_non_negative_float, default=68.0,
+                        help="Hash score threshold for Medium confidence band (default=68)")
+    parser.add_argument("--typo-top-k", type=_positive_int, default=10,
+                        help="Top-K typosquat candidate CSEs retained before hash/CLIP scoring (default=10)")
+    parser.add_argument("--typo-min-score", type=_probability_float, default=0.45,
+                        help="Minimum typosquat similarity to count as typo anchor (default=0.45)")
+    parser.add_argument("--clip-margin-min", type=_non_negative_float, default=0.12,
+                        help="Minimum score margin for strong CLIP anchor (default=0.12)")
+    parser.add_argument("--dns-timeout", type=_non_negative_float, default=3.0,
+                        help="DNS gate timeout in seconds (default=3.0)")
+    parser.add_argument("--dns-retries", type=_non_negative_int, default=1,
+                        help="DNS gate retry count for timeout/resolver errors (default=1)")
+    parser.add_argument("--dns-max-workers", type=_positive_int, default=None,
+                        help="Optional fixed DNS gate worker count (default=adaptive)")
+    parser.add_argument("--weight-domain", type=_non_negative_float, default=30.0,
+                        help="Weight for domain similarity score contribution (default=30)")
+    parser.add_argument("--weight-screenshot", type=_non_negative_float, default=20.0,
+                        help="Weight for CLIP screenshot similarity contribution (default=20)")
+    parser.add_argument("--weight-favicon", type=_non_negative_float, default=14.0,
+                        help="Weight for favicon hash exact-match contribution (default=14)")
+    parser.add_argument("--weight-ssl-hash", type=_non_negative_float, default=12.0,
+                        help="Weight for SSL certificate hash exact-match contribution (default=12)")
+    parser.add_argument("--weight-html-hash", type=_non_negative_float, default=6.0,
+                        help="Weight for HTML hash exact-match contribution (default=6)")
+    parser.add_argument("--weight-domain-hash", type=_non_negative_float, default=8.0,
+                        help="Weight for domain hash exact-match contribution (default=8)")
+    parser.add_argument("--weight-keywords", type=_non_negative_float, default=10.0,
+                        help="Weight for keyword overlap contribution (default=10)")
     args = parser.parse_args()
+    if args.high_confidence_threshold < args.medium_confidence_threshold:
+        raise ValueError("high-confidence-threshold must be >= medium-confidence-threshold")
+    if args.dns_timeout <= 0:
+        raise ValueError("dns-timeout must be > 0")
 
     # ✅ Ensure whitelist file exists
     if not os.path.exists(args.whitelist):
@@ -165,6 +247,7 @@ async def main():
             os.path.join("output", "output_file.csv"),
             os.path.join("output", "output_file_filtered.csv"),
             os.path.join("output", "holdout.csv"),
+            os.path.join("output", "hash_review_queue.csv"),
             os.path.join("output", "checkpoint_records.csv"),
         ]:
             for f in glob.glob(pattern):
@@ -179,6 +262,31 @@ async def main():
             logger.info("Processing ALL whitelisted domains...")
         if args.target_limit is not None:
             logger.info("Limiting shortlist input to first %d target URLs...", args.target_limit)
+        logger.info(
+            "Runtime mode=%s | shortlist threshold=%.3f domain_sim_threshold=%.3f "
+            "confidence_bands={high>=%.3f, medium>=%.3f} "
+            "typo={top_k=%d,min_score=%.3f,clip_margin_min=%.3f} "
+            "dns={timeout=%.2f,retries=%d,max_workers=%s} "
+            "weights={domain=%.3f,screenshot=%.3f,favicon=%.3f,ssl_hash=%.3f,html_hash=%.3f,domain_hash=%.3f,keywords=%.3f}",
+            args.pipeline_mode,
+            args.hashing_threshold,
+            args.domain_sim_threshold,
+            args.high_confidence_threshold,
+            args.medium_confidence_threshold,
+            args.typo_top_k,
+            args.typo_min_score,
+            args.clip_margin_min,
+            args.dns_timeout,
+            args.dns_retries,
+            args.dns_max_workers if args.dns_max_workers is not None else "adaptive",
+            args.weight_domain,
+            args.weight_screenshot,
+            args.weight_favicon,
+            args.weight_ssl_hash,
+            args.weight_html_hash,
+            args.weight_domain_hash,
+            args.weight_keywords,
+        )
 
         df_out = None
 
@@ -190,8 +298,30 @@ async def main():
                 args.shortlisting,
                 limit=args.target_limit,
             )
+            shortlist_weights = {
+                "domain": args.weight_domain,
+                "screenshot": args.weight_screenshot,
+                "favicon": args.weight_favicon,
+                "ssl_hash": args.weight_ssl_hash,
+                "html_hash": args.weight_html_hash,
+                "domain_hash": args.weight_domain_hash,
+                "keywords": args.weight_keywords,
+            }
             
-            holdout_df = await run_hashing_shortlist_async(list(urls), threshold=65)
+            holdout_df = await run_hashing_shortlist_async(
+                list(urls),
+                threshold=args.hashing_threshold,
+                domain_similarity_threshold=args.domain_sim_threshold,
+                high_confidence_threshold=args.high_confidence_threshold,
+                medium_confidence_threshold=args.medium_confidence_threshold,
+                typo_top_k=args.typo_top_k,
+                typo_min_score=args.typo_min_score,
+                clip_margin_min=args.clip_margin_min,
+                dns_timeout=args.dns_timeout,
+                dns_retries=args.dns_retries,
+                dns_max_workers=args.dns_max_workers,
+                weights=shortlist_weights,
+            )
             
             # Save output to holdout.csv
             out_csv = os.path.join("output", "holdout.csv")
@@ -207,7 +337,18 @@ async def main():
                 ps02_whitelist_file=args.whitelist,
                 limit_whitelisted=args.limit if args.limit else None,
                 limit_target_urls=args.target_limit,
-                use_existing_holdout=True
+                use_existing_holdout=True,
+                pipeline_mode=args.pipeline_mode,
+                high_confidence_threshold=args.high_confidence_threshold,
+                medium_confidence_threshold=args.medium_confidence_threshold,
+                hashing_threshold=args.hashing_threshold,
+                domain_similarity_threshold=args.domain_sim_threshold,
+                typo_top_k=args.typo_top_k,
+                typo_min_score=args.typo_min_score,
+                clip_margin_min=args.clip_margin_min,
+                dns_timeout=args.dns_timeout,
+                dns_retries=args.dns_retries,
+                dns_max_workers=args.dns_max_workers,
             )
             
             logger.info("--- Finished Step 2: Main Pipeline Complete ---")
@@ -221,6 +362,17 @@ async def main():
                     ps02_whitelist_file=args.whitelist,
                     limit_whitelisted=args.limit if args.limit else None,
                     limit_target_urls=args.target_limit,
+                    pipeline_mode=args.pipeline_mode,
+                    high_confidence_threshold=args.high_confidence_threshold,
+                    medium_confidence_threshold=args.medium_confidence_threshold,
+                    hashing_threshold=args.hashing_threshold,
+                    domain_similarity_threshold=args.domain_sim_threshold,
+                    typo_top_k=args.typo_top_k,
+                    typo_min_score=args.typo_min_score,
+                    clip_margin_min=args.clip_margin_min,
+                    dns_timeout=args.dns_timeout,
+                    dns_retries=args.dns_retries,
+                    dns_max_workers=args.dns_max_workers,
                 )
             except TypeError:
                 df_out = await run_pipeline(args.shortlisting, args.whitelist, args.limit)
