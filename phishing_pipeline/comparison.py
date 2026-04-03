@@ -72,6 +72,19 @@ def _read_env_float(name: str, default: float, minimum: float = 0.0) -> float:
         return default
 
 
+def _read_env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return default
+    value = str(raw).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    _clip_logger.warning("Invalid boolean override for %s=%r; using %s", name, raw, default)
+    return default
+
+
 def _probe_runtime_resources() -> tuple[int, float, float]:
     cpu_count = _mp.cpu_count() or 4
     ram_gb = psutil.virtual_memory().total / (1024 ** 3)
@@ -86,10 +99,11 @@ def _probe_runtime_resources() -> tuple[int, float, float]:
 
 _CPU_COUNT, _RAM_GB, _VRAM_GB = _probe_runtime_resources()
 _SERVER_CLASS = _CPU_COUNT >= 32 and _RAM_GB >= 96
+_H100_SERVER_PROFILE = _SERVER_CLASS and _VRAM_GB >= 40
 
-if _SERVER_CLASS and _VRAM_GB >= 40:
-    _default_max_pages = 72
-    _default_page_concurrency = 12
+if _H100_SERVER_PROFILE:
+    _default_max_pages = 48
+    _default_page_concurrency = 8
 elif _CPU_COUNT >= 48:
     _default_max_pages = 120
     _default_page_concurrency = 16
@@ -106,9 +120,9 @@ SCRAPER_PAGE_CONCURRENCY = min(
     _read_env_int("PHISHING_HASH_PAGE_CONCURRENCY", _default_page_concurrency),
 )
 BROWSER_SHARDS = max(1, math.ceil(MAX_CONCURRENT_PAGES / SCRAPER_PAGE_CONCURRENCY))
-_default_nav_timeout_ms = 6000 if _SERVER_CLASS and _VRAM_GB >= 40 else 8000
-_default_screenshot_timeout_ms = 2000 if _SERVER_CLASS and _VRAM_GB >= 40 else 3000
-_default_fetch_timeout_s = 8.0 if _SERVER_CLASS and _VRAM_GB >= 40 else 10.0
+_default_nav_timeout_ms = 8000 if _H100_SERVER_PROFILE else 8000
+_default_screenshot_timeout_ms = 2500 if _H100_SERVER_PROFILE else 3000
+_default_fetch_timeout_s = 12.0 if _H100_SERVER_PROFILE else 10.0
 SCRAPER_NAV_TIMEOUT_MS = _read_env_int("PHISHING_HASH_NAV_TIMEOUT_MS", _default_nav_timeout_ms)
 SCRAPER_SCREENSHOT_TIMEOUT_MS = _read_env_int("PHISHING_HASH_SCREENSHOT_TIMEOUT_MS", _default_screenshot_timeout_ms)
 SCRAPER_FETCH_TIMEOUT_S = _read_env_float("PHISHING_HASH_FETCH_TIMEOUT_S", _default_fetch_timeout_s, minimum=1.0)
@@ -116,9 +130,24 @@ GPU_QUEUE_MAXSIZE = _read_env_int(
     "PHISHING_GPU_QUEUE_MAXSIZE",
     BROWSER_SHARDS * SCRAPER_PAGE_CONCURRENCY * (4 if _SERVER_CLASS else 2),
 )
-GPU_MAX_WAIT_MS = _read_env_int("PHISHING_GPU_MAX_WAIT_MS", 40 if _SERVER_CLASS else 50)
-_default_http_limit = 192 if _SERVER_CLASS and _VRAM_GB >= 40 else min(1024 if _SERVER_CLASS else 256, max(64, MAX_CONCURRENT_PAGES * 3))
+GPU_MAX_WAIT_MS = _read_env_int("PHISHING_GPU_MAX_WAIT_MS", 120 if _H100_SERVER_PROFILE else (40 if _SERVER_CLASS else 50))
+_default_http_limit = 128 if _H100_SERVER_PROFILE else min(1024 if _SERVER_CLASS else 256, max(64, MAX_CONCURRENT_PAGES * 3))
 _AIOHTTP_CONNECTOR_LIMIT = _read_env_int("PHISHING_HASH_HTTP_LIMIT", _default_http_limit)
+ADAPTIVE_FETCH_DOWNSHIFT_ENABLED = _read_env_bool("PHISHING_HASH_ADAPTIVE_DOWNSHIFT", _H100_SERVER_PROFILE)
+ACTIVE_FETCH_LIMIT_INITIAL = MAX_CONCURRENT_PAGES
+ACTIVE_FETCH_LIMIT_FLOOR = min(
+    MAX_CONCURRENT_PAGES,
+    _read_env_int(
+        "PHISHING_HASH_ACTIVE_PAGES_FLOOR",
+        24 if _H100_SERVER_PROFILE else MAX_CONCURRENT_PAGES,
+    ),
+)
+ACTIVE_FETCH_DOWNSHIFT_STEP = 8 if _H100_SERVER_PROFILE else max(1, MAX_CONCURRENT_PAGES // 4)
+_default_aux_net_limit = 24 if _H100_SERVER_PROFILE else max(8, MAX_CONCURRENT_PAGES * 2)
+AUX_NET_CONCURRENCY_LIMIT = _read_env_int("PHISHING_HASH_AUX_NET_LIMIT", _default_aux_net_limit)
+ADAPTIVE_FETCH_MIN_PROCESSED = 500
+ADAPTIVE_FETCH_PRESSURE_WINDOWS = 2
+GPU_QUEUE_BACKLOG_THRESHOLD = max(4, GPU_QUEUE_MAXSIZE // 4)
 
 
 def _probe_gpu_batch_size() -> int:
@@ -141,7 +170,7 @@ def _probe_gpu_batch_size() -> int:
 GPU_MAX_BATCH_SIZE = _read_env_int("PHISHING_GPU_BATCH_SIZE", _probe_gpu_batch_size())
 
 _clip_logger.info(
-    "Hash shortlist parallelism: pages=%d, shard_workers=%d, shards=%d, nav_timeout_ms=%d, screenshot_timeout_ms=%d, fetch_timeout_s=%.1f, gpu_batch=%d, gpu_queue=%d, http_limit=%d",
+    "Hash shortlist parallelism: pages=%d, shard_workers=%d, shards=%d, nav_timeout_ms=%d, screenshot_timeout_ms=%d, fetch_timeout_s=%.1f, gpu_batch=%d, gpu_queue=%d, http_limit=%d, active_fetch_limit=%d, active_fetch_floor=%d, aux_net_limit=%d, adaptive_downshift=%s",
     MAX_CONCURRENT_PAGES,
     SCRAPER_PAGE_CONCURRENCY,
     BROWSER_SHARDS,
@@ -151,7 +180,114 @@ _clip_logger.info(
     GPU_MAX_BATCH_SIZE,
     GPU_QUEUE_MAXSIZE,
     _AIOHTTP_CONNECTOR_LIMIT,
+    ACTIVE_FETCH_LIMIT_INITIAL,
+    ACTIVE_FETCH_LIMIT_FLOOR,
+    AUX_NET_CONCURRENCY_LIMIT,
+    ADAPTIVE_FETCH_DOWNSHIFT_ENABLED,
 )
+
+
+class _AdaptiveFetchLimiter:
+    def __init__(self, initial_limit: int):
+        self._limit = max(1, int(initial_limit))
+        self._active = 0
+        self._condition = asyncio.Condition()
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    @property
+    def active(self) -> int:
+        return self._active
+
+    async def acquire(self):
+        async with self._condition:
+            while self._active >= self._limit:
+                await self._condition.wait()
+            self._active += 1
+
+    async def release(self):
+        async with self._condition:
+            if self._active > 0:
+                self._active -= 1
+            self._condition.notify_all()
+
+    async def set_limit(self, new_limit: int):
+        async with self._condition:
+            self._limit = max(1, int(new_limit))
+            self._condition.notify_all()
+
+    async def __aenter__(self):
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.release()
+
+
+def _compute_stage1_downshift(
+    *,
+    current_limit: int,
+    floor_limit: int,
+    step: int,
+    processed_total: int,
+    window_processed: int,
+    window_failed: int,
+    window_timed_out: int,
+    gpu_queue_depth: int,
+    gpu_backlog_threshold: int,
+    consecutive_pressure_windows: int,
+) -> dict:
+    timeout_ratio = window_timed_out / max(1, window_processed)
+    failure_ratio = (window_failed + window_timed_out) / max(1, window_processed)
+    queue_clear = gpu_queue_depth <= gpu_backlog_threshold
+    over_threshold = (
+        processed_total >= ADAPTIVE_FETCH_MIN_PROCESSED
+        and window_processed > 0
+        and queue_clear
+        and (
+            timeout_ratio >= 0.35
+            or failure_ratio >= 0.70
+        )
+    )
+
+    if not over_threshold:
+        return {
+            "next_limit": current_limit,
+            "next_consecutive_pressure_windows": 0,
+            "should_downshift": False,
+            "timeout_ratio": timeout_ratio,
+            "failure_ratio": failure_ratio,
+        }
+
+    next_consecutive = consecutive_pressure_windows + 1
+    if next_consecutive < ADAPTIVE_FETCH_PRESSURE_WINDOWS or current_limit <= floor_limit:
+        return {
+            "next_limit": current_limit,
+            "next_consecutive_pressure_windows": next_consecutive,
+            "should_downshift": False,
+            "timeout_ratio": timeout_ratio,
+            "failure_ratio": failure_ratio,
+        }
+
+    return {
+        "next_limit": max(floor_limit, current_limit - step),
+        "next_consecutive_pressure_windows": 0,
+        "should_downshift": current_limit > floor_limit,
+        "timeout_ratio": timeout_ratio,
+        "failure_ratio": failure_ratio,
+    }
+
+
+_aux_net_semaphore = None
+
+
+def _get_aux_net_semaphore():
+    global _aux_net_semaphore
+    if _aux_net_semaphore is None:
+        _aux_net_semaphore = asyncio.Semaphore(AUX_NET_CONCURRENCY_LIMIT)
+    return _aux_net_semaphore
 
 # transformers and CLIP are optional; use fallback for environments without these deps.
 try:
@@ -1428,23 +1564,24 @@ async def _route_nonessential_requests(route):
 # â”€â”€ Async favicon fetching (non-blocking) â”€â”€
 async def favicon_hash_async(domain, session=None):
     """Fetch favicon hash using aiohttp (non-blocking) or requests fallback."""
-    if _has_aiohttp and session is not None:
-        try:
-            async with session.get(
-                f"https://{domain}/favicon.ico",
-                timeout=aiohttp.ClientTimeout(total=5),
-                ssl=False,
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.read()
-                    return hashlib.sha256(data).hexdigest()
-        except Exception:
-            pass
-        return None
-    else:
-        # Sync fallback â€” run in thread so we don't block the loop
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, _favicon_hash_sync, domain)
+    async with _get_aux_net_semaphore():
+        if _has_aiohttp and session is not None:
+            try:
+                async with session.get(
+                    f"https://{domain}/favicon.ico",
+                    timeout=aiohttp.ClientTimeout(total=5),
+                    ssl=False,
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.read()
+                        return hashlib.sha256(data).hexdigest()
+            except Exception:
+                pass
+            return None
+        else:
+            # Sync fallback run in thread so we don't block the loop.
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, _favicon_hash_sync, domain)
 
 
 def _favicon_hash_sync(domain):
@@ -1466,27 +1603,28 @@ def favicon_hash(domain):
 
 async def get_ssl_hash_async(domain):
     """Non-blocking SSL certificate hash fetch."""
-    try:
-        ctx = ssl.create_default_context()
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(domain, 443, ssl=ctx),
-            timeout=5,
-        )
-        # reader is intentionally unused; the connection side effect gives ssl_object.
-        _ = reader
-        ssl_obj = writer.get_extra_info("ssl_object")
-        if ssl_obj:
-            cert_der = ssl_obj.getpeercert(binary_form=True)
+    async with _get_aux_net_semaphore():
+        try:
+            ctx = ssl.create_default_context()
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(domain, 443, ssl=ctx),
+                timeout=5,
+            )
+            # reader is intentionally unused; the connection side effect gives ssl_object.
+            _ = reader
+            ssl_obj = writer.get_extra_info("ssl_object")
+            if ssl_obj:
+                cert_der = ssl_obj.getpeercert(binary_form=True)
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                if cert_der:
+                    return hashlib.sha256(cert_der).hexdigest()
             writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception:
-                pass
-            if cert_der:
-                return hashlib.sha256(cert_der).hexdigest()
-        writer.close()
-    except Exception:
-        pass
+        except Exception:
+            pass
     return None
 
 
@@ -1943,7 +2081,15 @@ def score_all_entities(
 # STREAMING FETCH PIPELINE
 ###############################################
 
-async def _fetch_url_payload(url, browser_context, semaphore, aio_session, scoring_config, prefetch_metrics=None):
+async def _fetch_url_payload(
+    url,
+    browser_context,
+    semaphore,
+    active_fetch_limiter,
+    aio_session,
+    scoring_config,
+    prefetch_metrics=None,
+):
     """
     Fetch one URL: navigate, screenshot, parse HTML, compute CPU-side scores.
     Returns payload dict for GPU queue on success, or a status dict on timeout/crash.
@@ -1958,28 +2104,29 @@ async def _fetch_url_payload(url, browser_context, semaphore, aio_session, scori
 
     async def _single_attempt():
         async with semaphore:
-            page = await browser_context.new_page()
-            try:
-                await page.goto(
-                    url,
-                    timeout=SCRAPER_NAV_TIMEOUT_MS,
-                    wait_until="domcontentloaded",
-                )
-                html_content = await page.content()
-                final_landing_url = page.url
-                screenshot_bytes = await page.screenshot(
-                    full_page=False,
-                    timeout=SCRAPER_SCREENSHOT_TIMEOUT_MS,
-                    animations="disabled",
-                    type="png",
-                )
-                return html_content, screenshot_bytes, final_landing_url
-            finally:
+            async with active_fetch_limiter:
+                page = await browser_context.new_page()
                 try:
-                    if not page.is_closed():
-                        await page.close()
-                except Exception:
-                    pass
+                    await page.goto(
+                        url,
+                        timeout=SCRAPER_NAV_TIMEOUT_MS,
+                        wait_until="domcontentloaded",
+                    )
+                    html_content = await page.content()
+                    final_landing_url = page.url
+                    screenshot_bytes = await page.screenshot(
+                        full_page=False,
+                        timeout=SCRAPER_SCREENSHOT_TIMEOUT_MS,
+                        animations="disabled",
+                        type="png",
+                    )
+                    return html_content, screenshot_bytes, final_landing_url
+                finally:
+                    try:
+                        if not page.is_closed():
+                            await page.close()
+                    except Exception:
+                        pass
 
     try:
         html_content, screenshot_bytes, final_landing_url = await asyncio.wait_for(
@@ -2201,6 +2348,7 @@ async def _run_browser_shard(
     decision_rows,
     prefetch_metrics_map,
     prefetch_admitted_failures,
+    active_fetch_limiter,
     aio_session,
     scoring_config,
 ):
@@ -2234,6 +2382,7 @@ async def _run_browser_shard(
                     url,
                     ctx,
                     semaphore,
+                    active_fetch_limiter,
                     aio_session,
                     scoring_config,
                     prefetch_metrics=prefetch_metrics,
@@ -2579,6 +2728,7 @@ def _build_progress_postfix(metrics):
         "gpu_batches": metrics["gpu_batches_flushed"],
         "gpu_items": metrics.get("gpu_items_scored", 0),
         "gpu_queue": metrics.get("gpu_queue_depth", 0),
+        "active_fetch": metrics.get("active_fetch_limit", 0),
         "urls_per_sec": round(metrics["processed"] / elapsed, 2),
     }
 
@@ -2588,9 +2738,11 @@ def _log_hashing_periodic_status(metrics, accepted_count):
     if processed <= 0:
         return
     timeout_ratio = metrics["fetch_timed_out"] / max(1, processed)
+    success_ratio = metrics["hashed_success"] / max(1, processed)
     _clip_logger.info(
         "Hashing progress | processed=%d/%d | ok=%d | fail=%d | tout=%d | park=%d | match=%d | "
-        "gpu_batches=%d | gpu_items=%d | gpu_queue=%d | urls_per_sec=%.2f | timeout_ratio=%.3f",
+        "gpu_batches=%d | gpu_items=%d | gpu_queue=%d | active_fetch_limit=%d | avg_gpu_batch=%.2f | "
+        "urls_per_sec=%.2f | success_ratio=%.3f | timeout_ratio=%.3f",
         processed,
         accepted_count,
         metrics["hashed_success"],
@@ -2601,7 +2753,10 @@ def _log_hashing_periodic_status(metrics, accepted_count):
         metrics["gpu_batches_flushed"],
         metrics.get("gpu_items_scored", 0),
         metrics.get("gpu_queue_depth", 0),
+        metrics.get("active_fetch_limit", 0),
+        metrics.get("avg_gpu_batch_size", 0.0),
         processed / max(float(metrics.get("stage_elapsed_s", 0.0)), 1e-6),
+        success_ratio,
         timeout_ratio,
     )
 
@@ -2727,6 +2882,7 @@ async def run_hashing_shortlist_streaming(
         "avg_gpu_batch_size": 0.0,
         "gpu_queue_depth": 0,
         "stage_elapsed_s": 0.0,
+        "active_fetch_limit": ACTIVE_FETCH_LIMIT_INITIAL,
     }
     decision_rows = []
     prefetch_metrics_map = {}
@@ -2796,7 +2952,8 @@ async def run_hashing_shortlist_streaming(
         _clip_logger.info(
             "Stage1 hashing parallelism | dns_workers=%d | total_pages=%d | page_workers_per_shard=%d | "
             "shards=%d | http_limit=%d | nav_timeout_ms=%d | screenshot_timeout_ms=%d | "
-            "fetch_timeout_s=%.1f | gpu_queue=%d | gpu_batch=%d",
+            "fetch_timeout_s=%.1f | gpu_queue=%d | gpu_batch=%d | active_fetch_limit=%d | "
+            "active_fetch_floor=%d | aux_net_limit=%d | adaptive_downshift_enabled=%s",
             effective_dns_workers,
             MAX_CONCURRENT_PAGES,
             SCRAPER_PAGE_CONCURRENCY,
@@ -2807,6 +2964,10 @@ async def run_hashing_shortlist_streaming(
             SCRAPER_FETCH_TIMEOUT_S,
             GPU_QUEUE_MAXSIZE,
             GPU_MAX_BATCH_SIZE,
+            ACTIVE_FETCH_LIMIT_INITIAL,
+            ACTIVE_FETCH_LIMIT_FLOOR,
+            AUX_NET_CONCURRENCY_LIMIT,
+            ADAPTIVE_FETCH_DOWNSHIFT_ENABLED,
         )
         _clip_logger.info(
             "Stage1 note | OCR/Screenshots/ImgProc/RDAP/WHOIS limits from phishing_pipeline.utils are not the active hashing-stage browser worker counts."
@@ -2894,9 +3055,14 @@ async def run_hashing_shortlist_streaming(
         t0 = time.perf_counter()
         url_queue = asyncio.Queue()
         gpu_queue = asyncio.Queue(maxsize=GPU_QUEUE_MAXSIZE)
+        active_fetch_limiter = _AdaptiveFetchLimiter(ACTIVE_FETCH_LIMIT_INITIAL)
         results = []
         prefetch_admitted_failures = []
         last_progress_log = t0
+        last_window_processed = 0
+        last_window_failed = 0
+        last_window_timed_out = 0
+        consecutive_pressure_windows = 0
 
         for u in shortlisted_urls:
             await url_queue.put(u)
@@ -2937,6 +3103,7 @@ async def run_hashing_shortlist_streaming(
                         decision_rows,
                         prefetch_metrics_map,
                         prefetch_admitted_failures,
+                        active_fetch_limiter,
                         aio_session,
                         scoring_config,
                     )
@@ -2962,6 +3129,7 @@ async def run_hashing_shortlist_streaming(
                 current = metrics["processed"]
                 metrics["stage_elapsed_s"] = now - t0
                 metrics["gpu_queue_depth"] = gpu_queue.qsize()
+                metrics["active_fetch_limit"] = active_fetch_limiter.limit
                 if progress_bar and current > last_processed:
                     progress_bar.update(current - last_processed)
                     progress_bar.set_postfix(
@@ -2969,7 +3137,38 @@ async def run_hashing_shortlist_streaming(
                     )
                     last_processed = current
                 if now - last_progress_log >= 15.0:
+                    window_processed = current - last_window_processed
+                    window_failed = metrics["fetch_failed"] - last_window_failed
+                    window_timed_out = metrics["fetch_timed_out"] - last_window_timed_out
+                    if ADAPTIVE_FETCH_DOWNSHIFT_ENABLED:
+                        downshift = _compute_stage1_downshift(
+                            current_limit=active_fetch_limiter.limit,
+                            floor_limit=ACTIVE_FETCH_LIMIT_FLOOR,
+                            step=ACTIVE_FETCH_DOWNSHIFT_STEP,
+                            processed_total=current,
+                            window_processed=window_processed,
+                            window_failed=window_failed,
+                            window_timed_out=window_timed_out,
+                            gpu_queue_depth=metrics["gpu_queue_depth"],
+                            gpu_backlog_threshold=GPU_QUEUE_BACKLOG_THRESHOLD,
+                            consecutive_pressure_windows=consecutive_pressure_windows,
+                        )
+                        consecutive_pressure_windows = downshift["next_consecutive_pressure_windows"]
+                        if downshift["should_downshift"] and downshift["next_limit"] < active_fetch_limiter.limit:
+                            previous_limit = active_fetch_limiter.limit
+                            await active_fetch_limiter.set_limit(downshift["next_limit"])
+                            metrics["active_fetch_limit"] = active_fetch_limiter.limit
+                            _clip_logger.info(
+                                "Stage1 adaptive downshift | active_fetch_limit %d -> %d | timeout_ratio=%.3f | success_ratio=%.3f",
+                                previous_limit,
+                                active_fetch_limiter.limit,
+                                downshift["timeout_ratio"],
+                                metrics["hashed_success"] / max(1, current),
+                            )
                     _log_hashing_periodic_status(metrics, len(shortlisted_urls))
+                    last_window_processed = current
+                    last_window_failed = metrics["fetch_failed"]
+                    last_window_timed_out = metrics["fetch_timed_out"]
                     last_progress_log = now
 
             await asyncio.gather(*shard_tasks)
@@ -2979,6 +3178,7 @@ async def run_hashing_shortlist_streaming(
                 current = metrics["processed"]
                 metrics["stage_elapsed_s"] = time.perf_counter() - t0
                 metrics["gpu_queue_depth"] = gpu_queue.qsize()
+                metrics["active_fetch_limit"] = active_fetch_limiter.limit
                 if current > last_processed:
                     progress_bar.update(current - last_processed)
                     progress_bar.set_postfix(

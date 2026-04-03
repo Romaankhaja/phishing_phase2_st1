@@ -13,6 +13,18 @@ from typing import Any
 # Event loop policy on Windows
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+    class _AsyncioPipeClosedNoiseFilter(logging.Filter):
+        """Suppress known-noisy Windows proactor pipe-close warnings."""
+
+        _SUPPRESSED_FRAGMENT = "pipe closed by peer or os.write(pipe, data) raised exception"
+
+        def filter(self, record: logging.LogRecord) -> bool:
+            try:
+                message = record.getMessage()
+            except Exception:
+                return True
+            return self._SUPPRESSED_FRAGMENT not in message
     
     # Silence "Event loop is closed" error on Windows
     from functools import wraps
@@ -37,6 +49,12 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
+
+if sys.platform.startswith("win"):
+    _asyncio_logger = logging.getLogger("asyncio")
+    if not getattr(_asyncio_logger, "_pipe_closed_noise_filter_installed", False):
+        _asyncio_logger.addFilter(_AsyncioPipeClosedNoiseFilter())
+        _asyncio_logger._pipe_closed_noise_filter_installed = True
 
 
 def _non_negative_float(value: str) -> float:
