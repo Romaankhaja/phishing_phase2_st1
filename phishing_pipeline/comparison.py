@@ -61,6 +61,17 @@ def _read_env_int(name: str, default: int, minimum: int = 1) -> int:
         return default
 
 
+def _read_env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return default
+    try:
+        return max(minimum, float(raw))
+    except ValueError:
+        _clip_logger.warning("Invalid float override for %s=%r; using %.3f", name, raw, default)
+        return default
+
+
 def _probe_runtime_resources() -> tuple[int, float, float]:
     cpu_count = _mp.cpu_count() or 4
     ram_gb = psutil.virtual_memory().total / (1024 ** 3)
@@ -77,8 +88,8 @@ _CPU_COUNT, _RAM_GB, _VRAM_GB = _probe_runtime_resources()
 _SERVER_CLASS = _CPU_COUNT >= 32 and _RAM_GB >= 96
 
 if _SERVER_CLASS and _VRAM_GB >= 40:
-    _default_max_pages = min(192, max(160, _CPU_COUNT * 4))
-    _default_page_concurrency = 24
+    _default_max_pages = 72
+    _default_page_concurrency = 12
 elif _CPU_COUNT >= 48:
     _default_max_pages = 120
     _default_page_concurrency = 16
@@ -95,15 +106,19 @@ SCRAPER_PAGE_CONCURRENCY = min(
     _read_env_int("PHISHING_HASH_PAGE_CONCURRENCY", _default_page_concurrency),
 )
 BROWSER_SHARDS = max(1, math.ceil(MAX_CONCURRENT_PAGES / SCRAPER_PAGE_CONCURRENCY))
-SCRAPER_NAV_TIMEOUT_MS = 8000
-SCRAPER_SCREENSHOT_TIMEOUT_MS = 3000
-SCRAPER_FETCH_TIMEOUT_S = 10.0
+_default_nav_timeout_ms = 6000 if _SERVER_CLASS and _VRAM_GB >= 40 else 8000
+_default_screenshot_timeout_ms = 2000 if _SERVER_CLASS and _VRAM_GB >= 40 else 3000
+_default_fetch_timeout_s = 8.0 if _SERVER_CLASS and _VRAM_GB >= 40 else 10.0
+SCRAPER_NAV_TIMEOUT_MS = _read_env_int("PHISHING_HASH_NAV_TIMEOUT_MS", _default_nav_timeout_ms)
+SCRAPER_SCREENSHOT_TIMEOUT_MS = _read_env_int("PHISHING_HASH_SCREENSHOT_TIMEOUT_MS", _default_screenshot_timeout_ms)
+SCRAPER_FETCH_TIMEOUT_S = _read_env_float("PHISHING_HASH_FETCH_TIMEOUT_S", _default_fetch_timeout_s, minimum=1.0)
 GPU_QUEUE_MAXSIZE = _read_env_int(
     "PHISHING_GPU_QUEUE_MAXSIZE",
     BROWSER_SHARDS * SCRAPER_PAGE_CONCURRENCY * (4 if _SERVER_CLASS else 2),
 )
 GPU_MAX_WAIT_MS = _read_env_int("PHISHING_GPU_MAX_WAIT_MS", 40 if _SERVER_CLASS else 50)
-_AIOHTTP_CONNECTOR_LIMIT = min(1024 if _SERVER_CLASS else 256, max(64, MAX_CONCURRENT_PAGES * 3))
+_default_http_limit = 192 if _SERVER_CLASS and _VRAM_GB >= 40 else min(1024 if _SERVER_CLASS else 256, max(64, MAX_CONCURRENT_PAGES * 3))
+_AIOHTTP_CONNECTOR_LIMIT = _read_env_int("PHISHING_HASH_HTTP_LIMIT", _default_http_limit)
 
 
 def _probe_gpu_batch_size() -> int:
@@ -126,10 +141,13 @@ def _probe_gpu_batch_size() -> int:
 GPU_MAX_BATCH_SIZE = _read_env_int("PHISHING_GPU_BATCH_SIZE", _probe_gpu_batch_size())
 
 _clip_logger.info(
-    "Hash shortlist parallelism: pages=%d, shard_workers=%d, shards=%d, gpu_batch=%d, gpu_queue=%d, http_limit=%d",
+    "Hash shortlist parallelism: pages=%d, shard_workers=%d, shards=%d, nav_timeout_ms=%d, screenshot_timeout_ms=%d, fetch_timeout_s=%.1f, gpu_batch=%d, gpu_queue=%d, http_limit=%d",
     MAX_CONCURRENT_PAGES,
     SCRAPER_PAGE_CONCURRENCY,
     BROWSER_SHARDS,
+    SCRAPER_NAV_TIMEOUT_MS,
+    SCRAPER_SCREENSHOT_TIMEOUT_MS,
+    SCRAPER_FETCH_TIMEOUT_S,
     GPU_MAX_BATCH_SIZE,
     GPU_QUEUE_MAXSIZE,
     _AIOHTTP_CONNECTOR_LIMIT,
@@ -2281,6 +2299,7 @@ async def _gpu_microbatch_scorer(gpu_queue, results, decision_rows, metrics, thr
 ###############################################
 
 def _build_progress_postfix(metrics):
+    elapsed = max(float(metrics.get("stage_elapsed_s", 0.0)), 1e-6)
     return {
         "proc": metrics["processed"],
         "dns": metrics["passed_dns_gate"],
@@ -2288,8 +2307,33 @@ def _build_progress_postfix(metrics):
         "fail": metrics["fetch_failed"],
         "tout": metrics["fetch_timed_out"],
         "match": metrics["final_matches_above_threshold"],
-        "gpu": metrics["gpu_batches_flushed"],
+        "gpu_batches": metrics["gpu_batches_flushed"],
+        "gpu_items": metrics.get("gpu_items_scored", 0),
+        "gpu_queue": metrics.get("gpu_queue_depth", 0),
+        "urls_per_sec": round(metrics["processed"] / elapsed, 2),
     }
+
+
+def _log_hashing_periodic_status(metrics, accepted_count):
+    processed = int(metrics["processed"])
+    if processed <= 0:
+        return
+    timeout_ratio = metrics["fetch_timed_out"] / max(1, processed)
+    _clip_logger.info(
+        "Hashing progress | processed=%d/%d | ok=%d | fail=%d | tout=%d | match=%d | "
+        "gpu_batches=%d | gpu_items=%d | gpu_queue=%d | urls_per_sec=%.2f | timeout_ratio=%.3f",
+        processed,
+        accepted_count,
+        metrics["hashed_success"],
+        metrics["fetch_failed"],
+        metrics["fetch_timed_out"],
+        metrics["final_matches_above_threshold"],
+        metrics["gpu_batches_flushed"],
+        metrics.get("gpu_items_scored", 0),
+        metrics.get("gpu_queue_depth", 0),
+        processed / max(float(metrics.get("stage_elapsed_s", 0.0)), 1e-6),
+        timeout_ratio,
+    )
 
 
 def _log_hashing_metrics_summary(
@@ -2302,7 +2346,7 @@ def _log_hashing_metrics_summary(
     _clip_logger.info(
         "Hashing shortlist completed | passed_dns_gate=%d | processed=%d | "
         "hashed_success=%d | fetch_failed=%d | fetch_timed_out=%d | "
-        "final_matches=%d | gpu_batches=%d | avg_gpu_batch=%.1f | "
+        "final_matches=%d | gpu_batches=%d | gpu_items=%d | avg_gpu_batch=%.1f | urls_per_sec=%.2f | "
         "threshold=%s | elapsed=%.1fs",
         metrics["passed_dns_gate"],
         metrics["processed"],
@@ -2311,7 +2355,9 @@ def _log_hashing_metrics_summary(
         metrics["fetch_timed_out"],
         metrics["final_matches_above_threshold"],
         metrics["gpu_batches_flushed"],
+        metrics.get("gpu_items_scored", 0),
         metrics["avg_gpu_batch_size"],
+        metrics["processed"] / max(elapsed, 1e-6),
         threshold,
         elapsed,
     )
@@ -2407,6 +2453,8 @@ async def run_hashing_shortlist_streaming(
         "gpu_batches_flushed": 0,
         "gpu_items_scored": 0,
         "avg_gpu_batch_size": 0.0,
+        "gpu_queue_depth": 0,
+        "stage_elapsed_s": 0.0,
     }
     decision_rows = []
     prefetch_metrics_map = {}
@@ -2419,6 +2467,7 @@ async def run_hashing_shortlist_streaming(
         from .dns_gate import (
             DEFAULT_DNS_TIMEOUT,
             DEFAULT_DNS_RETRIES,
+            _resolve_dns_worker_count,
             _gate_urls_for_hashing_async,
             write_dns_gate_audit,
         )
@@ -2470,6 +2519,25 @@ async def run_hashing_shortlist_streaming(
         _clip_logger.info(
             "Scoring weights | %s",
             _format_weights_for_logging(resolved_weights),
+        )
+        effective_dns_workers = _resolve_dns_worker_count(original_count, dns_max_workers_effective)
+        _clip_logger.info(
+            "Stage1 hashing parallelism | dns_workers=%d | total_pages=%d | page_workers_per_shard=%d | "
+            "shards=%d | http_limit=%d | nav_timeout_ms=%d | screenshot_timeout_ms=%d | "
+            "fetch_timeout_s=%.1f | gpu_queue=%d | gpu_batch=%d",
+            effective_dns_workers,
+            MAX_CONCURRENT_PAGES,
+            SCRAPER_PAGE_CONCURRENCY,
+            BROWSER_SHARDS,
+            _AIOHTTP_CONNECTOR_LIMIT,
+            SCRAPER_NAV_TIMEOUT_MS,
+            SCRAPER_SCREENSHOT_TIMEOUT_MS,
+            SCRAPER_FETCH_TIMEOUT_S,
+            GPU_QUEUE_MAXSIZE,
+            GPU_MAX_BATCH_SIZE,
+        )
+        _clip_logger.info(
+            "Stage1 note | OCR/Screenshots/ImgProc/RDAP/WHOIS limits from phishing_pipeline.utils are not the active hashing-stage browser worker counts."
         )
 
         shortlisted_urls, audit_rows = await _gate_urls_for_hashing_async(
@@ -2551,6 +2619,7 @@ async def run_hashing_shortlist_streaming(
         gpu_queue = asyncio.Queue(maxsize=GPU_QUEUE_MAXSIZE)
         results = []
         prefetch_admitted_failures = []
+        last_progress_log = t0
 
         for u in shortlisted_urls:
             await url_queue.put(u)
@@ -2612,19 +2681,27 @@ async def run_hashing_shortlist_streaming(
             last_processed = 0
             while not all(t.done() for t in shard_tasks):
                 await asyncio.sleep(0.5)
+                now = time.perf_counter()
                 current = metrics["processed"]
+                metrics["stage_elapsed_s"] = now - t0
+                metrics["gpu_queue_depth"] = gpu_queue.qsize()
                 if progress_bar and current > last_processed:
                     progress_bar.update(current - last_processed)
                     progress_bar.set_postfix(
                         _build_progress_postfix(metrics), refresh=False
                     )
                     last_processed = current
+                if now - last_progress_log >= 15.0:
+                    _log_hashing_periodic_status(metrics, len(shortlisted_urls))
+                    last_progress_log = now
 
             await asyncio.gather(*shard_tasks)
 
             # Final progress update before GPU flush
             if progress_bar:
                 current = metrics["processed"]
+                metrics["stage_elapsed_s"] = time.perf_counter() - t0
+                metrics["gpu_queue_depth"] = gpu_queue.qsize()
                 if current > last_processed:
                     progress_bar.update(current - last_processed)
                     progress_bar.set_postfix(
@@ -2644,6 +2721,8 @@ async def run_hashing_shortlist_streaming(
                 await aio_session.close()
 
         elapsed = time.perf_counter() - t0
+        metrics["stage_elapsed_s"] = elapsed
+        metrics["gpu_queue_depth"] = 0
         print(
             f"\nHashing shortlist completed in {elapsed:.1f}s "
             f"({metrics['processed']} processed, "
@@ -2657,7 +2736,9 @@ async def run_hashing_shortlist_streaming(
             f"fetch_failed={metrics['fetch_failed']} "
             f"fetch_timed_out={metrics['fetch_timed_out']} "
             f"gpu_batches_flushed={metrics['gpu_batches_flushed']} "
+            f"gpu_items_scored={metrics['gpu_items_scored']} "
             f"avg_gpu_batch_size={metrics['avg_gpu_batch_size']:.1f} "
+            f"urls_per_sec={metrics['processed'] / max(elapsed, 1e-6):.2f} "
             f"final_matches={metrics['final_matches_above_threshold']}"
         )
         _log_hashing_metrics_summary(
