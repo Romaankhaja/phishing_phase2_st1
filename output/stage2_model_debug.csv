@@ -1,0 +1,9 @@
+url,shortlisted_cse,shortlisted_domain,fetch_status,brand_model_top1,brand_model_confidence,domain_model_top1,domain_model_confidence,model_brand_agrees_with_shortlist,model_domain_agrees_with_shortlist,model_feature_status,model_input_error
+https://airtell.ai,Airtel,airtel.in,failed,NA,0.0,NA,0.0,False,False,ok,
+https://icicibank.net/login,ICICI Bank,icici.bank.in,failed,NA,0.0,NA,0.0,False,False,ok,
+https://axisupi.com,Axis Bank,axis.bank.in,failed,NA,0.0,NA,0.0,False,False,ok,
+https://airtel-merchants.club,Airtel,airtelpayments.bank.in,fetched,NA,0.0,NA,0.0,False,False,ok,
+https://roblox303.store,Coal India,coalindiatenders.nic.in,fetched,NA,0.0,NA,0.0,False,False,ok,
+https://uidaiaadhardownload.com,"Unique Identification Authority of India (UIDAI)
+",uidai.gov.in,fetched,NA,0.0,NA,0.0,False,False,ok,
+https://tuterrenoenchile.cl,Coal India,coalindiatenders.nic.in,fetched,NA,0.0,NA,0.0,False,False,ok,

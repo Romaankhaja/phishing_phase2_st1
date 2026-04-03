@@ -51,6 +51,7 @@ from .rate_limiter import RateLimiter
 from .utils import (
     MAX_CONCURRENT_RDAP, MAX_CONCURRENT_WHOIS, MAX_CONCURRENT_DNS_PREFILTER,
     _get_rdap_semaphore, _get_whois_semaphore, _get_dns_prefilter_semaphore,
+    _get_ocr_semaphore,
     CHUNK_SIZE,
     MAX_CONCURRENT_OCR, MAX_CONCURRENT_SCREENSHOTS,
     NETWORK_SEMAPHORE_LIMIT,
@@ -252,6 +253,8 @@ def _parse_rdap_to_fields(data: dict) -> dict:
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(BASE_DIR)
 HASH_REVIEW_QUEUE_PATH = os.path.join(ROOT_DIR, "output", "hash_review_queue.csv")
+STAGE2_MODEL_DEBUG_PATH = os.path.join(ROOT_DIR, "output", "stage2_model_debug.csv")
+STAGE3_CLASSIFICATION_DEBUG_PATH = os.path.join(ROOT_DIR, "output", "stage3_classification_debug.csv")
 # --- (End of Fix 1) ---
 
 warnings.filterwarnings("ignore", message=".*pin_memory.*")
@@ -779,17 +782,177 @@ def _is_suspicious_infra(registrar, hosting_isp):
     return any(r in reg for r in SUSPICIOUS_REGISTRARS) or any(h in isp for h in SUSPICIOUS_HOSTS)
 
 
+def _is_trusted_infra(registrar, hosting_isp):
+    reg = str(registrar or "").lower()
+    isp = str(hosting_isp or "").lower()
+    return any(r in reg for r in TRUSTED_REGISTRARS) or any(h in isp for h in TRUSTED_HOSTS)
+
+
 def _as_bool_flag(value) -> bool:
     if isinstance(value, bool):
         return value
     return str(value or "").strip().lower() in {"1", "true", "yes", "y"}
 
 
-def _hybrid_hash_classification(row: dict, registrar, hosting_isp, dns_records):
+def _safe_predict_top1(model, x_sc, classes) -> tuple[str, float]:
+    if model is None or x_sc is None:
+        return "NA", 0.0
+    try:
+        if hasattr(model, "predict_proba"):
+            probs = model.predict_proba(x_sc)[0]
+            idx = int(np.argmax(probs))
+            labels = list(classes)
+            return str(labels[idx]), float(probs[idx])
+        pred = model.predict(x_sc)[0]
+        labels = list(classes)
+        if isinstance(pred, (int, np.integer)) and 0 <= int(pred) < len(labels):
+            return str(labels[int(pred)]), 1.0
+        return str(pred), 1.0
+    except Exception:
+        return "NA", 0.0
+
+
+def _coerce_numeric_feature(value, default=0.0) -> float:
+    if value is None:
+        return float(default)
+    if isinstance(value, bool):
+        return float(int(value))
+    try:
+        if pd.isna(value):
+            return float(default)
+    except Exception:
+        pass
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _build_hash_only_model_frame(row: dict, network_feats: dict, geo_dict: dict, imputer) -> pd.DataFrame:
+    feature_names = list(getattr(imputer, "feature_names_in_", []))
+    if not feature_names:
+        raise ValueError("imputer is missing feature_names_in_")
+
+    model_row = {name: 0.0 for name in feature_names}
+    source_values = {}
+    if isinstance(network_feats, dict):
+        source_values.update(network_feats)
+
+    source_values["favicon_detected"] = int(
+        _as_bool_flag(source_values.get("favicon_detected"))
+        or _as_bool_flag(row.get("signal_hit_favicon"))
+    )
+    if isinstance(geo_dict, dict):
+        asn_value = geo_dict.get("asn")
+        if asn_value not in (None, "", "NA"):
+            source_values["asn"] = asn_value
+
+    for feature_name in feature_names:
+        if feature_name.startswith("ssl_issuer_"):
+            continue
+        model_row[feature_name] = _coerce_numeric_feature(source_values.get(feature_name), default=0.0)
+
+    ssl_issuer = str(source_values.get("ssl_issuer") or "").strip()
+    issuer_column = f"ssl_issuer_{ssl_issuer}"
+    if issuer_column in model_row:
+        model_row[issuer_column] = 1.0
+
+    return pd.DataFrame([model_row], columns=feature_names)
+
+
+def _write_debug_csv(records: list[dict], output_path: str):
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    df_debug = pd.DataFrame(records)
+    df_debug.to_csv(output_path, index=False, encoding="utf-8")
+
+
+async def _extract_hash_only_ocr_tvc(
+    domain_url: str,
+    screenshot_path: str,
+    shortlisted_cse: str = "",
+    shortlisted_domain: str = "",
+    html_text: str = "",
+) -> dict:
+    if not screenshot_path or not os.path.exists(screenshot_path):
+        return {
+            "ocr_text": "",
+            "ocr_header_text": "",
+            "ocr_footer_text": "",
+            "tvc_brand_detected": False,
+            "tvc_detected_brand": "none",
+            "tvc_domain_match": False,
+            "tvc_fuzzy_score": 0.0,
+            "tvc_brand_spoofed": False,
+        }
+
+    from .utils import _safe_preprocess_image, _safe_run_ocr, extract_tvc_features
+    from .visual_features import extract_spatial_ocr_features
+
+    loop = asyncio.get_running_loop()
+    ocr_sem = _get_ocr_semaphore()
+    async with ocr_sem:
+        try:
+            img_np = await loop.run_in_executor(None, _safe_preprocess_image, screenshot_path)
+            if img_np is None:
+                raise ValueError("image preprocessing returned None")
+            await wait_for_vram(min_free_gb=1.5)
+            ocr_text, ocr_raw = await loop.run_in_executor(None, _safe_run_ocr, img_np)
+            spatial_feats = extract_spatial_ocr_features(img_np, ocr_raw)
+            tvc_feats = extract_tvc_features(
+                domain_url,
+                spatial_feats.get("ocr_header_text", ""),
+                spatial_feats.get("ocr_footer_text", ""),
+                ocr_text or "",
+                html_text or "",
+                shortlisted_cse,
+                shortlisted_domain,
+            )
+            return {
+                "ocr_text": ocr_text or "",
+                "ocr_header_text": spatial_feats.get("ocr_header_text", ""),
+                "ocr_footer_text": spatial_feats.get("ocr_footer_text", ""),
+                **tvc_feats,
+            }
+        except Exception as exc:
+            logger.warning("Second-pass OCR/TVC failed for %s: %s", domain_url, exc)
+            return {
+                "ocr_text": "",
+                "ocr_header_text": "",
+                "ocr_footer_text": "",
+                "tvc_brand_detected": False,
+                "tvc_detected_brand": "none",
+                "tvc_domain_match": False,
+                "tvc_fuzzy_score": 0.0,
+                "tvc_brand_spoofed": False,
+            }
+
+
+def _hybrid_hash_classification(
+    row: dict,
+    registrar,
+    hosting_isp,
+    dns_records,
+    ocr_text_from_csv="",
+    tvc_brand_spoofed=False,
+    brand_model_agrees: bool = False,
+    domain_model_agrees: bool = False,
+    brand_model_confidence: float = 0.0,
+    domain_model_confidence: float = 0.0,
+):
     lexical_rule_hit = _as_bool_flag(row.get("lexical_rule_hit"))
     brand_token_hit = _as_bool_flag(row.get("brand_token_hit"))
-    lexical_valid = lexical_rule_hit or brand_token_hit
-    if not lexical_valid:
+    old_fuzzy_hit = _as_bool_flag(row.get("old_fuzzy_hit"))
+    hybrid_lexical_hit = _as_bool_flag(row.get("hybrid_lexical_hit"))
+    strict_lexical_hit = _as_bool_flag(row.get("strict_lexical_hit")) or lexical_rule_hit or brand_token_hit or old_fuzzy_hit or hybrid_lexical_hit
+    lexical_score_pass = _as_bool_flag(row.get("lexical_score_pass"))
+    fallback_rank_only = _as_bool_flag(row.get("fallback_rank_only"))
+    fetch_status = str(row.get("fetch_status", "fetched") or "fetched").strip().lower()
+    fetched = fetch_status == "fetched"
+
+    if fallback_rank_only and not strict_lexical_hit:
+        return "Legitimate"
+
+    if not strict_lexical_hit and not lexical_score_pass:
         return "Legitimate"
 
     confidence_band = str(row.get("confidence_band", "Low") or "Low")
@@ -799,28 +962,65 @@ def _hybrid_hash_classification(row: dict, registrar, hosting_isp, dns_records):
     keyword_hit = _as_bool_flag(row.get("signal_hit_keywords"))
     typo_anchor = _as_bool_flag(row.get("typo_anchor"))
     suspicious_infra = _is_suspicious_infra(registrar, hosting_isp)
+    trusted_infra = _is_trusted_infra(registrar, hosting_isp)
+    infra_unknown = str(registrar or "").strip().upper() == "NA" or str(hosting_isp or "").strip().upper() == "NA"
     lexical_score = pd.to_numeric(pd.Series([row.get("lexical_score", 0.0)]), errors="coerce").fillna(0.0).iloc[0]
-    lexical_strong = lexical_score >= 0.85 or typo_anchor
+    lexical_strong = lexical_score >= 0.85 or typo_anchor or old_fuzzy_hit
+    brand_aligned_clip = bool(clip_anchor and strict_lexical_hit)
 
     base_label = reclassify_label(
         row.get("Identified Phishing/Suspected Domain Name", ""),
         registrar,
         hosting_isp,
         dns_records,
-        "",
-        tvc_brand_spoofed=False,
+        ocr_text_from_csv,
+        tvc_brand_spoofed=bool(tvc_brand_spoofed),
     )
+    model_support = bool(brand_model_agrees or domain_model_agrees)
+    model_contradiction = bool(
+        (brand_model_confidence >= 0.75 and not brand_model_agrees)
+        or (domain_model_confidence >= 0.75 and not domain_model_agrees)
+    )
+    strong_corroborator = bool(hash_anchor or tvc_brand_spoofed or brand_aligned_clip)
+    suspicious_or_mismatched = bool(suspicious_infra or infra_unknown or model_contradiction or base_label == "Phishing")
 
-    if hash_anchor and (suspicious_infra or domain_hit or keyword_hit or clip_anchor):
+    if not fetched:
+        return "Suspected" if strict_lexical_hit else "Legitimate"
+
+    if strict_lexical_hit and strong_corroborator and suspicious_or_mismatched:
         return "Phishing"
 
-    if lexical_strong and clip_anchor and suspicious_infra and confidence_band == "High":
-        return "Phishing"
+    contradiction_strong = (
+        trusted_infra
+        and not suspicious_infra
+        and not infra_unknown
+        and not hash_anchor
+        and not domain_hit
+        and not keyword_hit
+        and not bool(tvc_brand_spoofed)
+        and not brand_aligned_clip
+        and not model_contradiction
+        and base_label == "Legitimate"
+    )
+    if contradiction_strong:
+        return "Legitimate"
 
-    if base_label == "Phishing" and hash_anchor and lexical_valid:
-        return "Phishing"
+    if strict_lexical_hit and (
+        suspicious_infra
+        or infra_unknown
+        or domain_hit
+        or keyword_hit
+        or brand_aligned_clip
+        or bool(tvc_brand_spoofed)
+        or model_support
+        or base_label in {"Phishing", "Suspected"}
+    ):
+        return "Suspected"
 
-    return "Suspected"
+    if lexical_score_pass and (suspicious_infra or infra_unknown or domain_hit or keyword_hit or model_support):
+        return "Suspected"
+
+    return "Legitimate"
 
 
 async def _run_hash_only_pipeline(
@@ -846,6 +1046,18 @@ async def _run_hash_only_pipeline(
         _normalize_evidence_tier(row)
         for row in df_filtered.to_dict("records")
     ]
+    df_filtered["review_reason"] = [
+        "fetch_failed_lexical_hit"
+        if str(row.get("fetch_status", "")).strip().lower() in {"failed", "timeout"} and _as_bool_flag(row.get("strict_lexical_hit"))
+        else "low_confidence_strict_lexical"
+        if _as_bool_flag(row.get("strict_lexical_hit"))
+        else "low_confidence_hash_bypass"
+        if _as_bool_flag(row.get("hash_anchor"))
+        else "low_confidence_lexical_score_pass"
+        if _as_bool_flag(row.get("lexical_score_pass"))
+        else "low_confidence_admitted"
+        for row in df_filtered.to_dict("records")
+    ]
 
     low_conf_df = df_filtered[df_filtered["confidence_band"] == "Low"].copy()
     low_conf_df.to_csv(HASH_REVIEW_QUEUE_PATH, index=False, encoding="utf-8")
@@ -858,10 +1070,28 @@ async def _run_hash_only_pipeline(
     if classified_df.empty:
         empty_df = pd.DataFrame(columns=_submission_record_columns())
         empty_df.to_csv(FINAL_OUTPUT, index=False, encoding="utf-8")
+        _write_debug_csv([], STAGE2_MODEL_DEBUG_PATH)
+        _write_debug_csv([], STAGE3_CLASSIFICATION_DEBUG_PATH)
         logger.info("No shortlisted rows to classify. Final output written as empty schema CSV.")
         return empty_df
 
+    try:
+        brand_model, domain_model, brand_label_encoder, source_classes, feature_cols, scaler, imputer = load_models_and_preproc()
+        brand_classes = list(getattr(brand_label_encoder, "classes_", []))
+        logger.info("Loaded supporting models for hash-only validation: brand/CSE model + target-domain model")
+    except Exception as exc:
+        brand_model = None
+        domain_model = None
+        brand_classes = []
+        source_classes = []
+        feature_cols = []
+        scaler = None
+        imputer = None
+        logger.warning("Supporting models unavailable for hash-only validation: %s", exc)
+
     records = []
+    stage2_model_debug_records = []
+    stage3_classification_debug_records = []
     records_lock = asyncio.Lock()
     serial_counter = [0]
     rdap_sem = _get_rdap_semaphore()
@@ -877,8 +1107,51 @@ async def _run_hash_only_pipeline(
         domain_url = str(row.get("Identified Phishing/Suspected Domain Name", "")).strip()
         host = urlparse(domain_url).hostname or domain_url
         host = host.split(":")[0]
+        screenshot_path = str(row.get("screenshot_path", "") or "").strip()
+        fetch_status = str(row.get("fetch_status", "fetched") or "fetched").strip().lower()
+        html_brand_text = " ".join(
+            part for part in [
+                str(row.get("html_title_text", "") or "").strip(),
+                str(row.get("visible_text_excerpt", "") or "").strip(),
+            ]
+            if part
+        )
+
+        ocr_tvc = await _extract_hash_only_ocr_tvc(
+            domain_url,
+            screenshot_path,
+            shortlisted_cse=str(row.get("Cooresponding CSE", "") or ""),
+            shortlisted_domain=str(row.get("Legitimate Domains", "") or ""),
+            html_text=html_brand_text,
+        ) if fetch_status == "fetched" else {
+            "ocr_text": "",
+            "ocr_header_text": "",
+            "ocr_footer_text": "",
+            "tvc_brand_detected": False,
+            "tvc_detected_brand": "none",
+            "tvc_domain_match": False,
+            "tvc_fuzzy_score": 0.0,
+            "tvc_brand_spoofed": False,
+        }
+
+        try:
+            net_feats = await extract_network_features_async(domain_url)
+        except Exception as exc:
+            logger.warning("Hash-only network feature extraction failed for %s: %s", domain_url, exc)
+            net_feats = {}
+
+        brand_model_top1 = "NA"
+        brand_model_confidence = 0.0
+        domain_model_top1 = "Unknown"
+        domain_model_confidence = 0.0
+        model_brand_agrees_with_shortlist = False
+        model_domain_agrees_with_shortlist = False
+        model_feature_status = "model_unavailable"
+        model_input_error = ""
 
         resolved_ip = None
+        if net_feats.get("ip_address"):
+            resolved_ip = str(net_feats.get("ip_address"))
         async with dns_sem:
             try:
                 loop = asyncio.get_running_loop()
@@ -955,6 +1228,30 @@ async def _run_hash_only_pipeline(
         hosting_isp = str(geo_dict.get("asn_org", "NA")) if geo_dict.get("asn_org") and not pd.isna(geo_dict.get("asn_org")) else "NA"
         hosting_country = str(geo_dict.get("country", "NA")) if geo_dict.get("country") and not pd.isna(geo_dict.get("country")) else "NA"
 
+        if feature_cols and scaler is not None and imputer is not None:
+            try:
+                x_frame = _build_hash_only_model_frame(row, net_feats, geo_dict, imputer)
+                x_imp = imputer.transform(x_frame)
+                x_sc = scaler.transform(x_imp)
+                brand_model_top1, brand_model_confidence = _safe_predict_top1(brand_model, x_sc, brand_classes)
+                domain_model_top1, domain_model_confidence = _safe_predict_top1(domain_model, x_sc, source_classes)
+                shortlisted_cse = str(row.get("Cooresponding CSE", "") or "").strip().lower()
+                shortlisted_domain = str(row.get("Legitimate Domains", "") or "").strip().lower()
+                model_brand_agrees_with_shortlist = (
+                    brand_model_top1 != "NA"
+                    and shortlisted_cse
+                    and str(brand_model_top1).strip().lower() == shortlisted_cse
+                )
+                model_domain_agrees_with_shortlist = (
+                    domain_model_top1 not in {"NA", "Unknown"}
+                    and shortlisted_domain
+                    and str(domain_model_top1).strip().lower() == shortlisted_domain
+                )
+                model_feature_status = "ok"
+            except Exception as exc:
+                model_feature_status = "feature_error"
+                model_input_error = str(exc)
+
         confidence_band = row.get("confidence_band", "Low")
         evidence_tier = _normalize_evidence_tier(row)
         classification = _hybrid_hash_classification(
@@ -962,11 +1259,17 @@ async def _run_hash_only_pipeline(
             registrar=registrar,
             hosting_isp=hosting_isp,
             dns_records=dns_records,
+            ocr_text_from_csv=ocr_tvc.get("ocr_text", ""),
+            tvc_brand_spoofed=bool(ocr_tvc.get("tvc_brand_spoofed", False)),
+            brand_model_agrees=model_brand_agrees_with_shortlist,
+            domain_model_agrees=model_domain_agrees_with_shortlist,
+            brand_model_confidence=brand_model_confidence,
+            domain_model_confidence=domain_model_confidence,
         )
         source_of_detection = adjust_source(
             row.get("Cooresponding CSE", ""),
             row.get("Legitimate Domains", ""),
-            "Unknown",
+            domain_model_top1 if domain_model_top1 not in {"NA", ""} else "Unknown",
         )
 
         if classification.lower() == "phishing":
@@ -1015,6 +1318,59 @@ async def _run_hash_only_pipeline(
         }
         async with records_lock:
             records.append(record)
+            stage2_model_debug_records.append(
+                {
+                    "url": domain_url,
+                    "shortlisted_cse": row.get("Cooresponding CSE", ""),
+                    "shortlisted_domain": row.get("Legitimate Domains", ""),
+                    "fetch_status": fetch_status,
+                    "brand_model_top1": brand_model_top1,
+                    "brand_model_confidence": round(float(brand_model_confidence), 4),
+                    "domain_model_top1": domain_model_top1,
+                    "domain_model_confidence": round(float(domain_model_confidence), 4),
+                    "model_brand_agrees_with_shortlist": model_brand_agrees_with_shortlist,
+                    "model_domain_agrees_with_shortlist": model_domain_agrees_with_shortlist,
+                    "model_feature_status": model_feature_status,
+                    "model_input_error": model_input_error,
+                }
+            )
+            stage3_classification_debug_records.append(
+                {
+                    "url": domain_url,
+                    "shortlisted_cse": row.get("Cooresponding CSE", ""),
+                    "shortlisted_domain": row.get("Legitimate Domains", ""),
+                    "fetch_status": fetch_status,
+                    "classification": classification,
+                    "confidence_band": confidence_band,
+                    "evidence_tier": evidence_tier,
+                    "lexical_score": row.get("lexical_score", 0.0),
+                    "hash_score": row.get("hash_score", 0.0),
+                    "old_fuzzy_hit": row.get("old_fuzzy_hit", False),
+                    "hybrid_lexical_hit": row.get("hybrid_lexical_hit", False),
+                    "strict_lexical_hit": row.get("strict_lexical_hit", False),
+                    "lexical_score_pass": row.get("lexical_score_pass", False),
+                    "fallback_rank_only": row.get("fallback_rank_only", False),
+                    "typo_anchor": row.get("typo_anchor", False),
+                    "hash_anchor": row.get("hash_anchor", False),
+                    "clip_anchor": row.get("clip_anchor", False),
+                    "tvc_brand_detected": ocr_tvc.get("tvc_brand_detected", False),
+                    "tvc_detected_brand": ocr_tvc.get("tvc_detected_brand", "none"),
+                    "tvc_brand_spoofed": ocr_tvc.get("tvc_brand_spoofed", False),
+                    "ocr_text_len": len(str(ocr_tvc.get("ocr_text", "") or "")),
+                    "registrar": registrar,
+                    "hosting_isp": hosting_isp,
+                    "hosting_country": hosting_country,
+                    "dns_records": dns_records,
+                    "brand_model_top1": brand_model_top1,
+                    "brand_model_confidence": round(float(brand_model_confidence), 4),
+                    "domain_model_top1": domain_model_top1,
+                    "domain_model_confidence": round(float(domain_model_confidence), 4),
+                    "model_brand_agrees_with_shortlist": model_brand_agrees_with_shortlist,
+                    "model_domain_agrees_with_shortlist": model_domain_agrees_with_shortlist,
+                    "model_feature_status": model_feature_status,
+                    "model_input_error": model_input_error,
+                }
+            )
             await asyncio.to_thread(_append_record_to_checkpoint, record, CHECKPOINT_CSV)
 
     async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
@@ -1029,6 +1385,10 @@ async def _run_hash_only_pipeline(
 
     df_out = pd.DataFrame(records, columns=_submission_record_columns())
     df_out.to_csv(FINAL_OUTPUT, index=False, encoding="utf-8")
+    _write_debug_csv(stage2_model_debug_records, STAGE2_MODEL_DEBUG_PATH)
+    _write_debug_csv(stage3_classification_debug_records, STAGE3_CLASSIFICATION_DEBUG_PATH)
+    logger.info("Stage2 model debug written to %s (%d rows)", STAGE2_MODEL_DEBUG_PATH, len(stage2_model_debug_records))
+    logger.info("Stage3 classification debug written to %s (%d rows)", STAGE3_CLASSIFICATION_DEBUG_PATH, len(stage3_classification_debug_records))
     logger.info("Hash-only final output written to %s (%d records)", FINAL_OUTPUT, len(df_out))
     return df_out
 
@@ -1048,10 +1408,12 @@ async def run_pipeline(
     domain_similarity_threshold=0.85,
     typo_top_k=10,
     typo_min_score=0.45,
+    lexical_pass_min_score=0.85,
     clip_margin_min=0.12,
     dns_timeout=3.0,
     dns_retries=1,
     dns_max_workers=None,
+    shortlist_debug_csv=None,
 ):
     import time
     from tqdm import tqdm as tqdm_sync
@@ -1066,7 +1428,8 @@ async def run_pipeline(
     logger.info(
         "Pipeline mode=%s | high_confidence_threshold=%.2f | medium_confidence_threshold=%.2f | "
         "hashing_threshold=%.2f | domain_similarity_threshold=%.3f | typo_top_k=%d | "
-        "typo_min_score=%.3f | clip_margin_min=%.3f | dns_timeout=%.2f | dns_retries=%d | dns_max_workers=%s",
+        "typo_min_score=%.3f | lexical_pass_min_score=%.3f | clip_margin_min=%.3f | "
+        "dns_timeout=%.2f | dns_retries=%d | dns_max_workers=%s",
         pipeline_mode,
         high_confidence_threshold,
         medium_confidence_threshold,
@@ -1074,6 +1437,7 @@ async def run_pipeline(
         domain_similarity_threshold,
         int(typo_top_k),
         typo_min_score,
+        lexical_pass_min_score,
         clip_margin_min,
         dns_timeout,
         int(dns_retries),
@@ -1110,10 +1474,12 @@ async def run_pipeline(
                 medium_confidence_threshold=medium_confidence_threshold,
                 typo_top_k=typo_top_k,
                 typo_min_score=typo_min_score,
+                lexical_pass_min_score=lexical_pass_min_score,
                 clip_margin_min=clip_margin_min,
                 dns_timeout=dns_timeout,
                 dns_retries=dns_retries,
                 dns_max_workers=dns_max_workers,
+                shortlist_debug_csv=shortlist_debug_csv,
             )
             
             os.makedirs(os.path.dirname(holdout_csv_path), exist_ok=True)
@@ -1236,8 +1602,8 @@ async def run_pipeline(
     
 
     # ================== PRE-LOAD MODELS (batch, fast) ==================
-    logger.info("🔧 Pre-loading ML models...")
-    model_label, model_source, le_label, source_classes, feature_cols, scaler, imputer = load_models_and_preproc()
+    logger.info("🔧 Pre-loading supporting models (brand_model + domain_model)...")
+    brand_model, domain_model, brand_label_encoder, source_classes, feature_cols, scaler, imputer = load_models_and_preproc()
 
     # ================== PHASE 1 + PHASE 2 STREAMING (fully overlapped) ==================
     logger.info("\n" + "="*70)
@@ -1382,14 +1748,14 @@ async def run_pipeline(
         hosting_isp     = str(feat_row.get("asn_org", "NA")) if feat_row.get("asn_org") and not pd.isna(feat_row.get("asn_org")) else "NA"
         hosting_country = str(feat_row.get("country", "NA"))  if feat_row.get("country")  and not pd.isna(feat_row.get("country"))  else "NA"
 
-        # ── 7. ML source prediction (per-domain, using pre-loaded models) ─
+        # ── 7. Supporting domain-model prediction (not final class labeling) ─
         ml_source = "Unknown"
         try:
             row_series = pd.Series(feat_row)
             X_row = row_series.reindex(feature_cols, fill_value=0).values.reshape(1, -1)
             X_imp = imputer.transform(X_row)
             X_sc  = scaler.transform(X_imp)
-            src_idx = model_source.predict(X_sc)[0]
+            src_idx = domain_model.predict(X_sc)[0]
             ml_source = source_classes[src_idx]
         except Exception:
             pass
@@ -1567,7 +1933,7 @@ def package_results(output_file=FINAL_OUTPUT, zip_path="PS-02_ISS_NLP_Submission
     Packages the final output Excel file and the evidence folder into
     a zip file matching the required submission structure.
     """
-    import zipfile, os, pathlib
+    import zipfile, os, pathlib, shutil
     
     # --- Define the paths for the new zip structure ---
     submission_root_folder = "PS-02_ISS_NLP_Submission"
@@ -1665,6 +2031,12 @@ def package_results(output_file=FINAL_OUTPUT, zip_path="PS-02_ISS_NLP_Submission
     output_dir = os.path.join(ROOT_DIR, "output")
     os.makedirs(output_dir, exist_ok=True)
     zip_path_full = os.path.join(output_dir, os.path.basename(zip_path))
+    submission_dir_full = os.path.join(output_dir, submission_root_folder)
+    if os.path.isdir(submission_dir_full):
+        shutil.rmtree(submission_dir_full, ignore_errors=True)
+    os.makedirs(submission_dir_full, exist_ok=True)
+    submission_evidence_dir = os.path.join(submission_dir_full, evidence_folder_name)
+    os.makedirs(submission_evidence_dir, exist_ok=True)
     
     with zipfile.ZipFile(zip_path_full, 'w', zipfile.ZIP_DEFLATED) as zipf:
         
@@ -1676,6 +2048,7 @@ def package_results(output_file=FINAL_OUTPUT, zip_path="PS-02_ISS_NLP_Submission
                     # Arcname places it inside the new structure
                     arcname = os.path.join(submission_root_folder, evidence_folder_name, file)
                     zipf.write(filepath, arcname)
+                    shutil.copy2(filepath, os.path.join(submission_evidence_dir, file))
                     files_added_count += 1
             logger.info("Added %d evidence files.", files_added_count)
         else:
@@ -1686,6 +2059,7 @@ def package_results(output_file=FINAL_OUTPUT, zip_path="PS-02_ISS_NLP_Submission
             #arcname = os.path.join(submission_root_folder, documentation_folder_name, excel_file_name)
             arcname = os.path.join(submission_root_folder, excel_file_name)
             zipf.write(local_excel_path, arcname)
+            shutil.copy2(local_excel_path, os.path.join(submission_dir_full, excel_file_name))
             files_added_count += 1
             logger.info("Added final Excel sheet.")
         else:

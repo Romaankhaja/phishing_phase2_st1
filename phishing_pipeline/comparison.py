@@ -27,6 +27,11 @@ import logging as _logging
 import warnings as _warnings
 import unicodedata
 import psutil
+from .shortlisting import (
+    normalize_url as _legacy_normalize_url,
+    get_primary_part as _legacy_get_primary_part,
+    is_similar_advanced as _legacy_is_similar_advanced,
+)
 
 try:
     import aiohttp
@@ -342,8 +347,12 @@ DEFAULT_HIGH_CONFIDENCE_THRESHOLD = 78.0
 DEFAULT_MEDIUM_CONFIDENCE_THRESHOLD = 68.0
 DEFAULT_TYPO_TOP_K = 10
 DEFAULT_TYPO_MIN_SCORE = 0.45
+DEFAULT_LEXICAL_PASS_MIN_SCORE = 0.85
 DEFAULT_CLIP_MARGIN_MIN = 0.12
 DEFAULT_CLIP_STRONG_SIMILARITY = 0.92
+DEFAULT_STAGE1_DEBUG_CSV = os.path.join(ROOT_DIR, "output", "stage1_lexical_debug.csv")
+FETCH_FAILED_LEXICAL_HITS_PATH = os.path.join(ROOT_DIR, "output", "fetch_failed_lexical_hits.csv")
+DNS_REJECTED_LEXICAL_HITS_PATH = os.path.join(ROOT_DIR, "output", "dns_rejected_lexical_hits.csv")
 DEFAULT_SCORING_WEIGHTS = {
     "domain": 30.0,
     "screenshot": 20.0,
@@ -367,6 +376,7 @@ def _resolve_scoring_config(
     medium_confidence_threshold: float = DEFAULT_MEDIUM_CONFIDENCE_THRESHOLD,
     typo_top_k: int = DEFAULT_TYPO_TOP_K,
     typo_min_score: float = DEFAULT_TYPO_MIN_SCORE,
+    lexical_pass_min_score: float = DEFAULT_LEXICAL_PASS_MIN_SCORE,
     clip_margin_min: float = DEFAULT_CLIP_MARGIN_MIN,
 ) -> dict:
     if not isinstance(domain_similarity_threshold, numbers.Real):
@@ -396,6 +406,11 @@ def _resolve_scoring_config(
     typo_min_score = float(typo_min_score)
     if typo_min_score < 0 or typo_min_score > 1:
         raise ValueError("typo_min_score must be in [0, 1]")
+    if not isinstance(lexical_pass_min_score, numbers.Real):
+        raise ValueError("lexical_pass_min_score must be numeric")
+    lexical_pass_min_score = float(lexical_pass_min_score)
+    if lexical_pass_min_score < 0 or lexical_pass_min_score > 1:
+        raise ValueError("lexical_pass_min_score must be in [0, 1]")
     if not isinstance(clip_margin_min, numbers.Real):
         raise ValueError("clip_margin_min must be numeric")
     clip_margin_min = float(clip_margin_min)
@@ -440,6 +455,7 @@ def _resolve_scoring_config(
         "medium_confidence_threshold": medium_confidence_threshold,
         "typo_top_k": typo_top_k,
         "typo_min_score": typo_min_score,
+        "lexical_pass_min_score": lexical_pass_min_score,
         "clip_margin_min": clip_margin_min,
         "clip_similarity_floor": DEFAULT_CLIP_STRONG_SIMILARITY,
     }
@@ -636,6 +652,19 @@ def _empty_shortlist_df():
             "brand_token_hit",
             "candidate_generation_reason",
             "dominant_signal_family",
+            "old_fuzzy_hit",
+            "old_fuzzy_cse",
+            "hybrid_lexical_hit",
+            "strict_lexical_hit",
+            "lexical_score_pass",
+            "fallback_rank_only",
+            "admission_reason",
+            "admission_path",
+            "fetch_status",
+            "best_score",
+            "domain_component",
+            "clip_component",
+            "hash_component",
             "typo_similarity",
             "typo_min_score_used",
             "typo_decision_reason",
@@ -652,58 +681,303 @@ def _empty_shortlist_df():
             "signal_hit_keywords",
             "signal_hit_typo",
             "screenshot_path",
+            "html_title_text",
+            "visible_text_excerpt",
         ]
     )
 
 
-def _build_excluded_url_rows(input_urls, audit_rows, matched_urls):
-    """Build rows for URLs excluded by DNS gate or hash shortlist scoring."""
-    matched_counts = Counter()
-    for matched_url in matched_urls:
-        matched_text = str(matched_url or "").strip()
-        if not matched_text:
-            continue
-        matched_counts[normalize_url(matched_text)] += 1
+def _legacy_fuzzy_similarity_score(candidate_primary: str, legit_primary: str) -> float:
+    if not candidate_primary or not legit_primary:
+        return 0.0
+    try:
+        jw_score = float(jellyfish.jaro_winkler_similarity(candidate_primary, legit_primary)) if jellyfish is not None else 0.0
+    except Exception:
+        jw_score = 0.0
+    try:
+        token_score = float(fuzz.token_set_ratio(candidate_primary, legit_primary)) / 100.0
+    except Exception:
+        token_score = 0.0
+    return max(jw_score, token_score)
 
-    excluded_rows = []
+
+def _compute_legacy_fuzzy_metrics(target_url: str) -> dict:
+    candidate_norm = _legacy_normalize_url(target_url)
+    candidate_primary = _legacy_get_primary_part(candidate_norm)
+    best_entity = ""
+    best_domain = ""
+    best_score = 0.0
+    best_hit = False
+
+    for idx, entity_name in enumerate(_entity_index["names"]):
+        entity_domains = _entity_index["domains"][idx]
+        for entity_domain in entity_domains:
+            legit_norm = _legacy_normalize_url(entity_domain)
+            legit_primary = _legacy_get_primary_part(legit_norm)
+            is_hit = _legacy_is_similar_advanced(
+                candidate_norm,
+                legit_norm,
+                candidate_primary,
+                legit_primary,
+                set(),
+            )
+            score = _legacy_fuzzy_similarity_score(candidate_primary, legit_primary)
+            if is_hit and (not best_hit or score > best_score):
+                best_entity = entity_name
+                best_domain = entity_domain
+                best_score = score
+                best_hit = True
+            elif not best_hit and score > best_score:
+                best_entity = entity_name
+                best_domain = entity_domain
+                best_score = score
+
+    return {
+        "old_fuzzy_hit": bool(best_hit),
+        "old_fuzzy_cse": best_entity if best_hit else "",
+        "old_fuzzy_domain": best_domain if best_hit else "",
+        "old_fuzzy_score": float(best_score),
+    }
+
+
+def _compute_prefetch_lexical_state(target_url: str, scoring_config: dict) -> dict:
+    normalized_url = normalize_url(target_url)
+    parsed = urlparse(normalized_url)
+    domain = parsed.netloc.lower() or normalized_url.lower()
+    n_entities = len(_entity_index["names"])
+
+    lexical_metrics = _compute_hybrid_lexical_metrics(
+        domain,
+        top_k=scoring_config["typo_top_k"],
+    )
+    legacy_metrics = _compute_legacy_fuzzy_metrics(domain)
+
+    candidate_mask = np.array(lexical_metrics["candidate_mask"], dtype=bool)
+    candidate_indices = np.where(candidate_mask)[0]
+    if candidate_indices.size == 0:
+        candidate_indices = np.arange(n_entities, dtype=int)
+
+    if candidate_indices.size > 0:
+        lexical_scores = np.asarray(lexical_metrics["lexical_scores"], dtype="float64")
+        best_local_idx = int(np.argmax(lexical_scores[candidate_indices]))
+        best_idx = int(candidate_indices[best_local_idx])
+    else:
+        best_idx = 0
+
+    best_lexical_score = float(lexical_metrics["lexical_scores"][best_idx]) if n_entities else 0.0
+    best_jw_score = float(lexical_metrics["jw_scores"][best_idx]) if n_entities else 0.0
+    best_token_score = float(lexical_metrics["token_scores"][best_idx]) if n_entities else 0.0
+    best_typo_similarity = float(lexical_metrics["skeleton_scores"][best_idx]) if n_entities else 0.0
+    lexical_rule_hit = bool(lexical_metrics["lexical_rule_hit"][best_idx]) if n_entities else False
+    brand_token_hit = bool(lexical_metrics["brand_token_hit"][best_idx]) if n_entities else False
+    hybrid_lexical_hit = bool(lexical_rule_hit or brand_token_hit)
+    strict_lexical_hit = bool(legacy_metrics["old_fuzzy_hit"] or hybrid_lexical_hit)
+    candidate_generation_reason = (
+        str(lexical_metrics["candidate_reasons"][best_idx] or "fallback_top_k")
+        if n_entities
+        else ""
+    )
+    fallback_rank_only = "fallback_top_k" in candidate_generation_reason and not strict_lexical_hit
+    lexical_score_pass = bool(
+        best_lexical_score >= scoring_config["lexical_pass_min_score"] and not fallback_rank_only
+    )
+
+    return {
+        "normalized_url": normalized_url,
+        "domain": domain,
+        "best_idx": int(best_idx),
+        "best_entity": _entity_index["names"][best_idx] if n_entities else "",
+        "best_lexical_score": best_lexical_score,
+        "best_jw_score": best_jw_score,
+        "best_token_score": best_token_score,
+        "best_typo_similarity": best_typo_similarity,
+        "candidate_generation_reason": candidate_generation_reason,
+        "lexical_rule_hit": lexical_rule_hit,
+        "brand_token_hit": brand_token_hit,
+        "hybrid_lexical_hit": hybrid_lexical_hit,
+        "strict_lexical_hit": strict_lexical_hit,
+        "lexical_score_pass": lexical_score_pass,
+        "fallback_rank_only": fallback_rank_only,
+        "lexical_scores": lexical_metrics["lexical_scores"],
+        "jw_scores": lexical_metrics["jw_scores"],
+        "token_scores": lexical_metrics["token_scores"],
+        "typo_scores": lexical_metrics["skeleton_scores"],
+        "lexical_rule_hits": lexical_metrics["lexical_rule_hit"],
+        "brand_token_hits": lexical_metrics["brand_token_hit"],
+        "candidate_mask": lexical_metrics["candidate_mask"],
+        "candidate_reasons": lexical_metrics["candidate_reasons"],
+        "old_fuzzy_hit": bool(legacy_metrics["old_fuzzy_hit"]),
+        "old_fuzzy_cse": legacy_metrics["old_fuzzy_cse"],
+        "old_fuzzy_domain": legacy_metrics["old_fuzzy_domain"],
+        "old_fuzzy_score": float(legacy_metrics["old_fuzzy_score"]),
+    }
+
+
+def _build_stage1_debug_rows(input_urls, audit_rows, decision_rows, prefetch_metrics_map=None):
+    decision_index = {}
+    for row in decision_rows:
+        normalized_url = str(row.get("normalized_url", "")).strip()
+        if normalized_url:
+            decision_index[normalized_url] = dict(row)
+
+    stage1_rows = []
     for idx, raw_url in enumerate(input_urls):
         input_text = str(raw_url or "").strip()
         normalized_url = normalize_url(input_text) if input_text else ""
         audit_row = audit_rows[idx] if idx < len(audit_rows) else {}
         dns_status = str(audit_row.get("dns_status", "")).strip()
         dns_decision = str(audit_row.get("decision", "")).strip()
+        prefetch_row = (prefetch_metrics_map or {}).get(normalized_url, {})
+        stage_row = {
+            "input_position": idx + 1,
+            "input_url": input_text,
+            "normalized_url": normalized_url,
+            "dns_status": dns_status,
+            "dns_decision": dns_decision or "accepted",
+            "fetch_status": "",
+            "admitted": False,
+            "exclusion_stage": "",
+            "reason": "",
+            "old_fuzzy_hit": bool(prefetch_row.get("old_fuzzy_hit", False)),
+            "old_fuzzy_cse": prefetch_row.get("old_fuzzy_cse", ""),
+            "hybrid_lexical_hit": bool(prefetch_row.get("hybrid_lexical_hit", False)),
+            "strict_lexical_hit": bool(prefetch_row.get("strict_lexical_hit", False)),
+            "lexical_score_pass": bool(prefetch_row.get("lexical_score_pass", False)),
+            "fallback_rank_only": bool(prefetch_row.get("fallback_rank_only", False)),
+            "admission_reason": "",
+            "admission_path": "",
+            "candidate_generation_reason": prefetch_row.get("candidate_generation_reason", ""),
+            "best_entity": prefetch_row.get("best_entity", ""),
+            "best_score": 0.0,
+            "confidence_band": "",
+            "lexical_score": round(float(prefetch_row.get("best_lexical_score", 0.0)), 4),
+            "clip_similarity": 0.0,
+            "typo_similarity": round(float(prefetch_row.get("best_typo_similarity", 0.0)), 4),
+            "domain_component": 0.0,
+            "clip_component": 0.0,
+            "hash_component": 0.0,
+        }
 
         if dns_decision and dns_decision != "accepted":
-            excluded_rows.append(
-                {
-                    "input_position": idx + 1,
-                    "input_url": input_text,
-                    "normalized_url": normalized_url,
-                    "exclusion_stage": "dns_gate",
-                    "reason": dns_status or "dns_rejected",
-                    "dns_status": dns_status,
-                    "dns_decision": dns_decision,
-                }
-            )
+            stage_row["exclusion_stage"] = "dns_gate"
+            stage_row["reason"] = "dns_rejected"
+            stage1_rows.append(stage_row)
             continue
 
-        if normalized_url and matched_counts.get(normalized_url, 0) > 0:
-            matched_counts[normalized_url] -= 1
-            continue
+        decision_row = decision_index.get(normalized_url, {})
+        stage_row.update(decision_row)
+        if stage_row.get("admitted"):
+            stage_row["exclusion_stage"] = ""
+            stage_row["reason"] = ""
+        else:
+            stage_row["exclusion_stage"] = "hashing_shortlist"
+            if stage_row.get("fetch_status") in {"timeout", "failed"}:
+                stage_row["reason"] = "fetch_timeout_or_fetch_failed"
+            else:
+                stage_row["reason"] = "not_admitted_after_lexical_and_hash_checks"
+        stage1_rows.append(stage_row)
 
+    return stage1_rows
+
+
+def _build_excluded_url_rows(stage1_debug_rows):
+    excluded_rows = []
+    for row in stage1_debug_rows:
+        if bool(row.get("admitted")):
+            continue
         excluded_rows.append(
             {
-                "input_position": idx + 1,
-                "input_url": input_text,
-                "normalized_url": normalized_url,
-                "exclusion_stage": "hashing_shortlist",
-                "reason": "below_threshold_or_fetch_failed",
-                "dns_status": dns_status,
-                "dns_decision": dns_decision or "accepted",
+                "input_position": row.get("input_position", ""),
+                "input_url": row.get("input_url", ""),
+                "normalized_url": row.get("normalized_url", ""),
+                "exclusion_stage": row.get("exclusion_stage", ""),
+                "reason": row.get("reason", ""),
+                "dns_status": row.get("dns_status", ""),
+                "dns_decision": row.get("dns_decision", ""),
+                "strict_lexical_hit": row.get("strict_lexical_hit", False),
+                "lexical_score_pass": row.get("lexical_score_pass", False),
+                "fallback_rank_only": row.get("fallback_rank_only", False),
+                "candidate_generation_reason": row.get("candidate_generation_reason", ""),
             }
         )
-
     return excluded_rows
+
+
+def _write_stage1_debug_csv(stage1_rows, output_path: str = DEFAULT_STAGE1_DEBUG_CSV) -> str:
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    fieldnames = [
+        "input_position",
+        "input_url",
+        "normalized_url",
+        "dns_status",
+        "dns_decision",
+        "fetch_status",
+        "admitted",
+        "exclusion_stage",
+        "reason",
+        "old_fuzzy_hit",
+        "old_fuzzy_cse",
+        "hybrid_lexical_hit",
+        "strict_lexical_hit",
+        "lexical_score_pass",
+        "fallback_rank_only",
+        "admission_reason",
+        "admission_path",
+        "candidate_generation_reason",
+        "best_entity",
+        "best_score",
+        "confidence_band",
+        "lexical_score",
+        "clip_similarity",
+        "typo_similarity",
+        "domain_component",
+        "clip_component",
+        "hash_component",
+    ]
+    with open(output_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(stage1_rows)
+    return output_path
+
+
+def _write_stage1_subset_csv(stage1_rows, output_path: str, predicate) -> str:
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    subset_rows = [row for row in stage1_rows if predicate(row)]
+    fieldnames = [
+        "input_position",
+        "input_url",
+        "normalized_url",
+        "dns_status",
+        "dns_decision",
+        "fetch_status",
+        "admitted",
+        "exclusion_stage",
+        "reason",
+        "old_fuzzy_hit",
+        "old_fuzzy_cse",
+        "hybrid_lexical_hit",
+        "strict_lexical_hit",
+        "lexical_score_pass",
+        "fallback_rank_only",
+        "admission_reason",
+        "admission_path",
+        "candidate_generation_reason",
+        "best_entity",
+        "best_score",
+        "confidence_band",
+        "lexical_score",
+        "clip_similarity",
+        "typo_similarity",
+        "domain_component",
+        "clip_component",
+        "hash_component",
+    ]
+    with open(output_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(subset_rows)
+    return output_path
 
 
 def _write_excluded_urls_audit(
@@ -722,6 +996,10 @@ def _write_excluded_urls_audit(
                 "reason",
                 "dns_status",
                 "dns_decision",
+                "strict_lexical_hit",
+                "lexical_score_pass",
+                "fallback_rank_only",
+                "candidate_generation_reason",
             ],
         )
         writer.writeheader()
@@ -1259,10 +1537,10 @@ def score_all_entities(
 # STREAMING FETCH PIPELINE
 ###############################################
 
-async def _fetch_url_payload(url, browser_context, semaphore, aio_session, scoring_config):
+async def _fetch_url_payload(url, browser_context, semaphore, aio_session, scoring_config, prefetch_metrics=None):
     """
     Fetch one URL: navigate, screenshot, parse HTML, compute CPU-side scores.
-    Returns payload dict for GPU queue, or None on timeout/crash.
+    Returns payload dict for GPU queue on success, or a status dict on timeout/crash.
     Retries once on TargetClosedError (browser crash).
     """
     url = normalize_url(url)
@@ -1270,6 +1548,7 @@ async def _fetch_url_payload(url, browser_context, semaphore, aio_session, scori
     domain = parsed.netloc.lower()
     resolved_weights = scoring_config["weights"]
     domain_similarity_floor = scoring_config["domain_similarity_threshold"]
+    prefetch_metrics = prefetch_metrics or _compute_prefetch_lexical_state(url, scoring_config)
 
     async def _single_attempt():
         async with semaphore:
@@ -1300,7 +1579,11 @@ async def _fetch_url_payload(url, browser_context, semaphore, aio_session, scori
             _single_attempt(), timeout=SCRAPER_FETCH_TIMEOUT_S
         )
     except asyncio.TimeoutError:
-        return None
+        return {
+            "url": url,
+            "normalized_url": url,
+            "fetch_status": "timeout",
+        }
     except Exception as exc:
         if "TargetClosedError" in type(exc).__name__:
             try:
@@ -1308,15 +1591,25 @@ async def _fetch_url_payload(url, browser_context, semaphore, aio_session, scori
                     _single_attempt(), timeout=SCRAPER_FETCH_TIMEOUT_S
                 )
             except Exception:
-                return None
+                return {
+                    "url": url,
+                    "normalized_url": url,
+                    "fetch_status": "failed",
+                }
         else:
-            return None
+            return {
+                "url": url,
+                "normalized_url": url,
+                "fetch_status": "failed",
+            }
 
     soup = BeautifulSoup(html_content, "html.parser")
+    title_text = soup.title.get_text(" ", strip=True).lower() if soup.title else ""
     visible_text = " ".join(
         [p.get_text() for p in soup.find_all(["p", "h1", "h2", "h3", "title"])]
     ).lower()
     words = set(visible_text.split())
+    visible_text_excerpt = visible_text[:500]
 
     ext = tldextract.extract(domain)
     screenshot_name = ".".join(part for part in [ext.domain, ext.suffix] if part) or domain
@@ -1335,18 +1628,14 @@ async def _fetch_url_payload(url, browser_context, semaphore, aio_session, scori
     fav_hash, ssl_hash = await asyncio.gather(fav_task, ssl_task)
 
     n_entities = len(_entity_index["names"])
-    lexical_metrics = _compute_hybrid_lexical_metrics(
-        domain,
-        top_k=scoring_config["typo_top_k"],
-    )
-    typo_scores = lexical_metrics["skeleton_scores"]
-    candidate_mask = lexical_metrics["candidate_mask"].copy()
-    lexical_scores = lexical_metrics["lexical_scores"]
-    jw_scores = lexical_metrics["jw_scores"]
-    token_scores = lexical_metrics["token_scores"]
-    lexical_rule_hit = lexical_metrics["lexical_rule_hit"]
-    brand_token_hit = lexical_metrics["brand_token_hit"]
-    candidate_reasons = list(lexical_metrics["candidate_reasons"])
+    typo_scores = np.asarray(prefetch_metrics["typo_scores"], dtype="float64")
+    candidate_mask = np.array(prefetch_metrics["candidate_mask"], dtype=bool).copy()
+    lexical_scores = np.asarray(prefetch_metrics["lexical_scores"], dtype="float64")
+    jw_scores = np.asarray(prefetch_metrics["jw_scores"], dtype="float64")
+    token_scores = np.asarray(prefetch_metrics["token_scores"], dtype="float64")
+    lexical_rule_hit = np.array(prefetch_metrics["lexical_rule_hits"], dtype=bool)
+    brand_token_hit = np.array(prefetch_metrics["brand_token_hits"], dtype=bool)
+    candidate_reasons = list(prefetch_metrics["candidate_reasons"])
 
     hash_bypass_mask = np.zeros(n_entities, dtype=bool)
     if fav_hash:
@@ -1431,8 +1720,12 @@ async def _fetch_url_payload(url, browser_context, semaphore, aio_session, scori
 
     return {
         "url": url,
+        "normalized_url": url,
         "domain": domain,
+        "fetch_status": "fetched",
         "screenshot_path": screenshot_path,
+        "html_title_text": title_text,
+        "visible_text_excerpt": visible_text_excerpt,
         "screenshot_bytes": screenshot_bytes,
         "cpu_scores": cpu_scores,
         "cpu_denominators": cpu_denominators,
@@ -1451,6 +1744,13 @@ async def _fetch_url_payload(url, browser_context, semaphore, aio_session, scori
         "typo_scores": typo_scores,
         "candidate_mask": candidate_mask,
         "candidate_reasons": candidate_reasons,
+        "old_fuzzy_hit": prefetch_metrics["old_fuzzy_hit"],
+        "old_fuzzy_cse": prefetch_metrics["old_fuzzy_cse"],
+        "old_fuzzy_domain": prefetch_metrics["old_fuzzy_domain"],
+        "old_fuzzy_score": prefetch_metrics["old_fuzzy_score"],
+        "strict_lexical_hit": prefetch_metrics["strict_lexical_hit"],
+        "lexical_score_pass": prefetch_metrics["lexical_score_pass"],
+        "fallback_rank_only": prefetch_metrics["fallback_rank_only"],
     }
 
 
@@ -1463,6 +1763,9 @@ async def _run_browser_shard(
     url_queue,
     gpu_queue,
     metrics,
+    decision_rows,
+    prefetch_metrics_map,
+    prefetch_admitted_failures,
     aio_session,
     scoring_config,
 ):
@@ -1487,20 +1790,208 @@ async def _run_browser_shard(
                 url_queue.task_done()
                 break
             try:
+                normalized_url = normalize_url(url)
+                prefetch_metrics = prefetch_metrics_map.get(normalized_url)
+                if prefetch_metrics is None:
+                    prefetch_metrics = _compute_prefetch_lexical_state(url, scoring_config)
+                    prefetch_metrics_map[normalized_url] = prefetch_metrics
                 payload = await _fetch_url_payload(
                     url,
                     ctx,
                     semaphore,
                     aio_session,
                     scoring_config,
+                    prefetch_metrics=prefetch_metrics,
                 )
-                if payload is None:
-                    metrics["fetch_timed_out"] += 1
+                if str(payload.get("fetch_status", "")).strip() in {"timeout", "failed"}:
+                    strict_lexical_hit = bool(prefetch_metrics.get("strict_lexical_hit", False))
+                    lexical_score_pass = bool(prefetch_metrics.get("lexical_score_pass", False))
+                    fallback_rank_only = bool(prefetch_metrics.get("fallback_rank_only", False))
+                    admission_paths = []
+                    if strict_lexical_hit:
+                        admission_paths.append("strict_lexical_hit")
+                    elif lexical_score_pass and not fallback_rank_only:
+                        admission_paths.append("lexical_score_pass")
+                    admitted = bool(strict_lexical_hit)
+                    lexical_contribution = float(prefetch_metrics.get("best_lexical_score", 0.0)) * scoring_config["weights"]["domain"]
+                    decision_rows.append(
+                        {
+                            "normalized_url": payload.get("normalized_url", normalized_url),
+                            "fetch_status": payload.get("fetch_status", "failed"),
+                            "admitted": admitted,
+                            "old_fuzzy_hit": bool(prefetch_metrics.get("old_fuzzy_hit", False)),
+                            "old_fuzzy_cse": prefetch_metrics.get("old_fuzzy_cse", ""),
+                            "hybrid_lexical_hit": bool(prefetch_metrics.get("hybrid_lexical_hit", False)),
+                            "strict_lexical_hit": strict_lexical_hit,
+                            "lexical_score_pass": lexical_score_pass,
+                            "fallback_rank_only": fallback_rank_only,
+                            "admission_reason": "|".join(admission_paths),
+                            "admission_path": "|".join(admission_paths),
+                            "candidate_generation_reason": prefetch_metrics.get("candidate_generation_reason", ""),
+                            "best_entity": prefetch_metrics.get("best_entity", ""),
+                            "best_score": 0.0,
+                            "confidence_band": "Low",
+                            "lexical_score": round(float(prefetch_metrics.get("best_lexical_score", 0.0)), 4),
+                            "clip_similarity": 0.0,
+                            "typo_similarity": round(float(prefetch_metrics.get("best_typo_similarity", 0.0)), 4),
+                            "domain_component": round(lexical_contribution, 4),
+                            "clip_component": 0.0,
+                            "hash_component": 0.0,
+                        }
+                    )
+                    if admitted:
+                        metrics["final_matches_above_threshold"] += 1
+                        prefetch_admitted_failures.append(
+                            {
+                                "url": payload.get("url", normalized_url),
+                                "best_entity": prefetch_metrics.get("best_entity", ""),
+                                "best_score": 0.0,
+                                "score_margin": 0.0,
+                                "confidence_band": "Low",
+                                "evidence_tier": "weak_evidence",
+                                "lexical_score": float(prefetch_metrics.get("best_lexical_score", 0.0)),
+                                "jw_primary": float(prefetch_metrics.get("best_jw_score", 0.0)),
+                                "token_set_primary": float(prefetch_metrics.get("best_token_score", 0.0)),
+                                "skeleton_similarity": float(prefetch_metrics.get("best_typo_similarity", 0.0)),
+                                "lexical_rule_hit": bool(prefetch_metrics.get("lexical_rule_hit", False)),
+                                "brand_token_hit": bool(prefetch_metrics.get("brand_token_hit", False)),
+                                "candidate_generation_reason": prefetch_metrics.get("candidate_generation_reason", ""),
+                                "dominant_signal_family": "lexical",
+                                "old_fuzzy_hit": bool(prefetch_metrics.get("old_fuzzy_hit", False)),
+                                "old_fuzzy_cse": prefetch_metrics.get("old_fuzzy_cse", ""),
+                                "hybrid_lexical_hit": bool(prefetch_metrics.get("hybrid_lexical_hit", False)),
+                                "strict_lexical_hit": strict_lexical_hit,
+                                "lexical_score_pass": lexical_score_pass,
+                                "fallback_rank_only": fallback_rank_only,
+                                "admission_reason": "|".join(admission_paths),
+                                "admission_path": "|".join(admission_paths),
+                                "fetch_status": payload.get("fetch_status", "failed"),
+                                "domain_component": lexical_contribution,
+                                "clip_component": 0.0,
+                                "hash_component": 0.0,
+                                "typo_similarity": float(prefetch_metrics.get("best_typo_similarity", 0.0)),
+                                "clip_similarity": 0.0,
+                                "typo_anchor": bool(
+                                    prefetch_metrics.get("lexical_rule_hit", False)
+                                    and float(prefetch_metrics.get("best_typo_similarity", 0.0)) >= scoring_config["typo_min_score"]
+                                ),
+                                "hash_anchor": False,
+                                "clip_anchor": False,
+                                "signal_hit_screenshot": False,
+                                "signal_hit_typo": bool(
+                                    prefetch_metrics.get("lexical_rule_hit", False)
+                                    and float(prefetch_metrics.get("best_typo_similarity", 0.0)) >= scoring_config["typo_min_score"]
+                                ),
+                                "signal_hit_domain": False,
+                                "signal_hit_favicon": False,
+                                "signal_hit_ssl_hash": False,
+                                "signal_hit_html_hash": False,
+                                "signal_hit_domain_hash": False,
+                                "signal_hit_keywords": False,
+                                "screenshot_path": "",
+                                "html_title_text": "",
+                                "visible_text_excerpt": "",
+                            }
+                        )
+                    if payload.get("fetch_status") == "timeout":
+                        metrics["fetch_timed_out"] += 1
+                    else:
+                        metrics["fetch_failed"] += 1
                 else:
+                    decision_rows.append(
+                        {
+                            "normalized_url": payload.get("normalized_url", normalized_url),
+                            "fetch_status": "fetched",
+                        }
+                    )
                     metrics["hashed_success"] += 1
                     await gpu_queue.put(payload)
                 metrics["processed"] += 1
             except Exception as exc:
+                normalized_url = normalize_url(url)
+                prefetch_metrics = prefetch_metrics_map.get(normalized_url)
+                if prefetch_metrics is None:
+                    prefetch_metrics = _compute_prefetch_lexical_state(url, scoring_config)
+                    prefetch_metrics_map[normalized_url] = prefetch_metrics
+                strict_lexical_hit = bool(prefetch_metrics.get("strict_lexical_hit", False))
+                lexical_score_pass = bool(prefetch_metrics.get("lexical_score_pass", False))
+                fallback_rank_only = bool(prefetch_metrics.get("fallback_rank_only", False))
+                admission_paths = ["strict_lexical_hit"] if strict_lexical_hit else []
+                admitted = bool(strict_lexical_hit)
+                lexical_contribution = float(prefetch_metrics.get("best_lexical_score", 0.0)) * scoring_config["weights"]["domain"]
+                decision_rows.append(
+                    {
+                        "normalized_url": normalized_url,
+                        "fetch_status": "failed",
+                        "admitted": admitted,
+                        "old_fuzzy_hit": bool(prefetch_metrics.get("old_fuzzy_hit", False)),
+                        "old_fuzzy_cse": prefetch_metrics.get("old_fuzzy_cse", ""),
+                        "hybrid_lexical_hit": bool(prefetch_metrics.get("hybrid_lexical_hit", False)),
+                        "strict_lexical_hit": strict_lexical_hit,
+                        "lexical_score_pass": lexical_score_pass,
+                        "fallback_rank_only": fallback_rank_only,
+                        "admission_reason": "|".join(admission_paths),
+                        "admission_path": "|".join(admission_paths),
+                        "candidate_generation_reason": prefetch_metrics.get("candidate_generation_reason", ""),
+                        "best_entity": prefetch_metrics.get("best_entity", ""),
+                        "best_score": 0.0,
+                        "confidence_band": "Low",
+                        "lexical_score": round(float(prefetch_metrics.get("best_lexical_score", 0.0)), 4),
+                        "clip_similarity": 0.0,
+                        "typo_similarity": round(float(prefetch_metrics.get("best_typo_similarity", 0.0)), 4),
+                        "domain_component": round(lexical_contribution, 4),
+                        "clip_component": 0.0,
+                        "hash_component": 0.0,
+                    }
+                )
+                if admitted:
+                    metrics["final_matches_above_threshold"] += 1
+                    prefetch_admitted_failures.append(
+                        {
+                            "url": normalized_url,
+                            "best_entity": prefetch_metrics.get("best_entity", ""),
+                            "best_score": 0.0,
+                            "score_margin": 0.0,
+                            "confidence_band": "Low",
+                            "evidence_tier": "weak_evidence",
+                            "lexical_score": float(prefetch_metrics.get("best_lexical_score", 0.0)),
+                            "jw_primary": float(prefetch_metrics.get("best_jw_score", 0.0)),
+                            "token_set_primary": float(prefetch_metrics.get("best_token_score", 0.0)),
+                            "skeleton_similarity": float(prefetch_metrics.get("best_typo_similarity", 0.0)),
+                            "lexical_rule_hit": bool(prefetch_metrics.get("lexical_rule_hit", False)),
+                            "brand_token_hit": bool(prefetch_metrics.get("brand_token_hit", False)),
+                            "candidate_generation_reason": prefetch_metrics.get("candidate_generation_reason", ""),
+                            "dominant_signal_family": "lexical",
+                            "old_fuzzy_hit": bool(prefetch_metrics.get("old_fuzzy_hit", False)),
+                            "old_fuzzy_cse": prefetch_metrics.get("old_fuzzy_cse", ""),
+                            "hybrid_lexical_hit": bool(prefetch_metrics.get("hybrid_lexical_hit", False)),
+                            "strict_lexical_hit": strict_lexical_hit,
+                            "lexical_score_pass": lexical_score_pass,
+                            "fallback_rank_only": fallback_rank_only,
+                            "admission_reason": "|".join(admission_paths),
+                            "admission_path": "|".join(admission_paths),
+                            "fetch_status": "failed",
+                            "domain_component": lexical_contribution,
+                            "clip_component": 0.0,
+                            "hash_component": 0.0,
+                            "typo_similarity": float(prefetch_metrics.get("best_typo_similarity", 0.0)),
+                            "clip_similarity": 0.0,
+                            "typo_anchor": False,
+                            "hash_anchor": False,
+                            "clip_anchor": False,
+                            "signal_hit_screenshot": False,
+                            "signal_hit_typo": False,
+                            "signal_hit_domain": False,
+                            "signal_hit_favicon": False,
+                            "signal_hit_ssl_hash": False,
+                            "signal_hit_html_hash": False,
+                            "signal_hit_domain_hash": False,
+                            "signal_hit_keywords": False,
+                            "screenshot_path": "",
+                            "html_title_text": "",
+                            "visible_text_excerpt": "",
+                        }
+                    )
                 metrics["fetch_failed"] += 1
                 metrics["processed"] += 1
                 _clip_logger.warning(
@@ -1526,7 +2017,7 @@ async def _run_browser_shard(
 # GPU MICROBATCH SCORER
 ###############################################
 
-async def _gpu_microbatch_scorer(gpu_queue, results, metrics, threshold, scoring_config):
+async def _gpu_microbatch_scorer(gpu_queue, results, decision_rows, metrics, threshold, scoring_config):
     """
     Single GPU scorer. Flushes on GPU_MAX_BATCH_SIZE or GPU_MAX_WAIT_MS.
     """
@@ -1641,6 +2132,19 @@ async def _gpu_microbatch_scorer(gpu_queue, results, metrics, threshold, scoring
                 and best_clip_similarity >= scoring_config["clip_similarity_floor"]
                 and score_margin >= scoring_config["clip_margin_min"]
             )
+            old_fuzzy_hit = bool(payload.get("old_fuzzy_hit", False))
+            old_fuzzy_cse = str(payload.get("old_fuzzy_cse", "") or "")
+            hybrid_lexical_hit = bool(lexical_rule_hit or brand_token_hit)
+            strict_lexical_hit = bool(payload.get("strict_lexical_hit", False) or old_fuzzy_hit or hybrid_lexical_hit)
+            candidate_generation_reason = payload["candidate_reasons"][best_idx] or "fallback_top_k"
+            fallback_rank_only = bool(
+                payload.get("fallback_rank_only", False)
+                or ("fallback_top_k" in candidate_generation_reason and not strict_lexical_hit)
+            )
+            lexical_score_pass = bool(
+                payload.get("lexical_score_pass", False)
+                or (best_lexical_score >= scoring_config["lexical_pass_min_score"] and not fallback_rank_only)
+            )
             evidence_tier = (
                 "strong_evidence"
                 if lexical_rule_hit and (hash_anchor or clip_anchor)
@@ -1662,9 +2166,45 @@ async def _gpu_microbatch_scorer(gpu_queue, results, metrics, threshold, scoring
                 ),
                 key=lambda item: item[1],
             )[0]
-            candidate_generation_reason = payload["candidate_reasons"][best_idx] or "fallback_top_k"
+            admission_paths = []
+            if strict_lexical_hit:
+                admission_paths.append("strict_lexical_hit")
+            elif lexical_score_pass:
+                admission_paths.append("lexical_score_pass")
+            if hash_anchor:
+                admission_paths.append("hash_bypass_hit")
+            admitted = bool(admission_paths)
+            admission_reasons = list(admission_paths)
+            if admitted and best_score > threshold:
+                admission_reasons.append("score_threshold")
 
-            if best_score > threshold:
+            decision_rows.append(
+                {
+                    "normalized_url": payload.get("normalized_url", payload["url"]),
+                    "fetch_status": payload.get("fetch_status", "fetched"),
+                    "admitted": admitted,
+                    "old_fuzzy_hit": old_fuzzy_hit,
+                    "old_fuzzy_cse": old_fuzzy_cse,
+                    "hybrid_lexical_hit": hybrid_lexical_hit,
+                    "strict_lexical_hit": strict_lexical_hit,
+                    "lexical_score_pass": lexical_score_pass,
+                    "fallback_rank_only": fallback_rank_only,
+                    "admission_reason": "|".join(dict.fromkeys(admission_reasons)),
+                    "admission_path": "|".join(dict.fromkeys(admission_paths)),
+                    "candidate_generation_reason": candidate_generation_reason,
+                    "best_entity": best_entity,
+                    "best_score": round(best_score, 4),
+                    "confidence_band": confidence_band,
+                    "lexical_score": round(best_lexical_score, 4),
+                    "clip_similarity": round(best_clip_similarity, 4),
+                    "typo_similarity": round(best_typo_similarity, 4),
+                    "domain_component": round(lexical_contribution, 4),
+                    "clip_component": round(visual_contribution, 4),
+                    "hash_component": round(hash_contribution, 4),
+                }
+            )
+
+            if admitted:
                 metrics["final_matches_above_threshold"] += 1
                 results.append(
                     {
@@ -1682,6 +2222,19 @@ async def _gpu_microbatch_scorer(gpu_queue, results, metrics, threshold, scoring
                         "brand_token_hit": bool(brand_token_hit),
                         "candidate_generation_reason": candidate_generation_reason,
                         "dominant_signal_family": dominant_signal_family,
+                        "old_fuzzy_hit": old_fuzzy_hit,
+                        "old_fuzzy_cse": old_fuzzy_cse,
+                        "hybrid_lexical_hit": hybrid_lexical_hit,
+                        "strict_lexical_hit": strict_lexical_hit,
+                        "lexical_score_pass": lexical_score_pass,
+                        "fallback_rank_only": fallback_rank_only,
+                        "admission_reason": "|".join(dict.fromkeys(admission_reasons)),
+                        "admission_path": "|".join(dict.fromkeys(admission_paths)),
+                        "fetch_status": payload.get("fetch_status", "fetched"),
+                        "best_score": best_score,
+                        "domain_component": lexical_contribution,
+                        "clip_component": visual_contribution,
+                        "hash_component": hash_contribution,
                         "typo_similarity": best_typo_similarity,
                         "clip_similarity": best_clip_similarity,
                         "typo_anchor": bool(typo_anchor),
@@ -1696,6 +2249,8 @@ async def _gpu_microbatch_scorer(gpu_queue, results, metrics, threshold, scoring
                         "signal_hit_domain_hash": bool(payload["domain_hash_hit"][best_idx]),
                         "signal_hit_keywords": bool(payload["keyword_hit"][best_idx]),
                         "screenshot_path": payload.get("screenshot_path", ""),
+                        "html_title_text": payload.get("html_title_text", ""),
+                        "visible_text_excerpt": payload.get("visible_text_excerpt", ""),
                     }
                 )
 
@@ -1807,11 +2362,13 @@ async def run_hashing_shortlist_streaming(
     medium_confidence_threshold=DEFAULT_MEDIUM_CONFIDENCE_THRESHOLD,
     typo_top_k=DEFAULT_TYPO_TOP_K,
     typo_min_score=DEFAULT_TYPO_MIN_SCORE,
+    lexical_pass_min_score=DEFAULT_LEXICAL_PASS_MIN_SCORE,
     clip_margin_min=DEFAULT_CLIP_MARGIN_MIN,
     dns_timeout=None,
     dns_retries=None,
     dns_max_workers=None,
     weights=None,
+    shortlist_debug_csv: str | None = DEFAULT_STAGE1_DEBUG_CSV,
 ):
     """
     Streaming hashing shortlist engine. Uses long-lived browser shards
@@ -1832,6 +2389,7 @@ async def run_hashing_shortlist_streaming(
         medium_confidence_threshold=medium_confidence_threshold,
         typo_top_k=typo_top_k,
         typo_min_score=typo_min_score,
+        lexical_pass_min_score=lexical_pass_min_score,
         clip_margin_min=clip_margin_min,
     )
     resolved_weights = scoring_config["weights"]
@@ -1850,6 +2408,12 @@ async def run_hashing_shortlist_streaming(
         "gpu_items_scored": 0,
         "avg_gpu_batch_size": 0.0,
     }
+    decision_rows = []
+    prefetch_metrics_map = {}
+    for raw_url in input_urls:
+        normalized_url = normalize_url(raw_url)
+        if normalized_url and normalized_url not in prefetch_metrics_map:
+            prefetch_metrics_map[normalized_url] = _compute_prefetch_lexical_state(raw_url, scoring_config)
 
     try:
         from .dns_gate import (
@@ -1889,7 +2453,7 @@ async def run_hashing_shortlist_streaming(
             "Hashing shortlist (streaming) started | urls=%d | threshold=%s | "
             "domain_similarity_threshold=%.3f | high_confidence_threshold=%.2f | "
             "medium_confidence_threshold=%.2f | typo_top_k=%d | typo_min_score=%.3f | "
-            "clip_margin_min=%.3f | dns_timeout=%.2f | dns_retries=%d | dns_max_workers=%s",
+            "lexical_pass_min_score=%.3f | clip_margin_min=%.3f | dns_timeout=%.2f | dns_retries=%d | dns_max_workers=%s",
             original_count,
             threshold,
             scoring_config["domain_similarity_threshold"],
@@ -1897,6 +2461,7 @@ async def run_hashing_shortlist_streaming(
             scoring_config["medium_confidence_threshold"],
             scoring_config["typo_top_k"],
             scoring_config["typo_min_score"],
+            scoring_config["lexical_pass_min_score"],
             scoring_config["clip_margin_min"],
             dns_timeout_effective,
             dns_retries_effective,
@@ -1943,12 +2508,27 @@ async def run_hashing_shortlist_streaming(
         print(f"Hashing log: {log_path}")
 
         if not shortlisted_urls:
-            excluded_rows = _build_excluded_url_rows(
+            stage1_rows = _build_stage1_debug_rows(
                 input_urls,
                 audit_rows,
-                matched_urls=[],
+                decision_rows=[],
+                prefetch_metrics_map=prefetch_metrics_map,
             )
+            if shortlist_debug_csv:
+                debug_path = _write_stage1_debug_csv(stage1_rows, output_path=shortlist_debug_csv)
+                _clip_logger.info("Stage1 debug CSV written to %s with %d rows", debug_path, len(stage1_rows))
+            excluded_rows = _build_excluded_url_rows(stage1_rows)
             excluded_path = _write_excluded_urls_audit(excluded_rows)
+            _write_stage1_subset_csv(
+                stage1_rows,
+                DNS_REJECTED_LEXICAL_HITS_PATH,
+                lambda row: row.get("reason") == "dns_rejected" and bool(row.get("strict_lexical_hit")),
+            )
+            _write_stage1_subset_csv(
+                stage1_rows,
+                FETCH_FAILED_LEXICAL_HITS_PATH,
+                lambda row: str(row.get("fetch_status", "")).strip().lower() in {"failed", "timeout"} and bool(row.get("strict_lexical_hit")),
+            )
             _clip_logger.info(
                 "Excluded URL audit written to %s with %d rows",
                 excluded_path,
@@ -1970,6 +2550,7 @@ async def run_hashing_shortlist_streaming(
         url_queue = asyncio.Queue()
         gpu_queue = asyncio.Queue(maxsize=GPU_QUEUE_MAXSIZE)
         results = []
+        prefetch_admitted_failures = []
 
         for u in shortlisted_urls:
             await url_queue.put(u)
@@ -2007,6 +2588,9 @@ async def run_hashing_shortlist_streaming(
                         url_queue,
                         gpu_queue,
                         metrics,
+                        decision_rows,
+                        prefetch_metrics_map,
+                        prefetch_admitted_failures,
                         aio_session,
                         scoring_config,
                     )
@@ -2017,6 +2601,7 @@ async def run_hashing_shortlist_streaming(
                 _gpu_microbatch_scorer(
                     gpu_queue,
                     results,
+                    decision_rows,
                     metrics,
                     threshold,
                     scoring_config,
@@ -2049,6 +2634,8 @@ async def run_hashing_shortlist_streaming(
             # Signal scorer to flush remaining batch and exit
             await gpu_queue.put(None)
             await scorer_task
+            if prefetch_admitted_failures:
+                results.extend(prefetch_admitted_failures)
 
         finally:
             if progress_bar:
@@ -2116,6 +2703,19 @@ async def run_hashing_shortlist_streaming(
                 "brand_token_hit": bool(match.get("brand_token_hit", False)),
                 "candidate_generation_reason": match.get("candidate_generation_reason", ""),
                 "dominant_signal_family": match.get("dominant_signal_family", "lexical"),
+                "old_fuzzy_hit": bool(match.get("old_fuzzy_hit", False)),
+                "old_fuzzy_cse": match.get("old_fuzzy_cse", ""),
+                "hybrid_lexical_hit": bool(match.get("hybrid_lexical_hit", False)),
+                "strict_lexical_hit": bool(match.get("strict_lexical_hit", False)),
+                "lexical_score_pass": bool(match.get("lexical_score_pass", False)),
+                "fallback_rank_only": bool(match.get("fallback_rank_only", False)),
+                "admission_reason": match.get("admission_reason", ""),
+                "admission_path": match.get("admission_path", ""),
+                "fetch_status": match.get("fetch_status", "fetched"),
+                "best_score": round(float(match.get("best_score", best_score)), 4),
+                "domain_component": round(float(match.get("domain_component", 0.0)), 4),
+                "clip_component": round(float(match.get("clip_component", 0.0)), 4),
+                "hash_component": round(float(match.get("hash_component", 0.0)), 4),
                 "typo_similarity": round(float(match.get("typo_similarity", 0.0)), 4),
                 "typo_min_score_used": round(float(scoring_config["typo_min_score"]), 4),
                 "typo_decision_reason": (
@@ -2134,14 +2734,31 @@ async def run_hashing_shortlist_streaming(
                 "signal_hit_domain_hash": bool(match["signal_hit_domain_hash"]),
                 "signal_hit_keywords": bool(match["signal_hit_keywords"]),
                 "screenshot_path": match.get("screenshot_path", ""),
+                "html_title_text": match.get("html_title_text", ""),
+                "visible_text_excerpt": match.get("visible_text_excerpt", ""),
             })
 
-        matched_urls = [match["url"] for match in results]
-        excluded_rows = _build_excluded_url_rows(
+        stage1_rows = _build_stage1_debug_rows(
             input_urls,
             audit_rows,
-            matched_urls=matched_urls,
+            decision_rows=decision_rows,
+            prefetch_metrics_map=prefetch_metrics_map,
         )
+        if shortlist_debug_csv:
+            debug_path = _write_stage1_debug_csv(stage1_rows, output_path=shortlist_debug_csv)
+            _clip_logger.info("Stage1 debug CSV written to %s with %d rows", debug_path, len(stage1_rows))
+            print(f"Stage1 debug: {debug_path} ({len(stage1_rows)} rows)")
+        _write_stage1_subset_csv(
+            stage1_rows,
+            DNS_REJECTED_LEXICAL_HITS_PATH,
+            lambda row: row.get("reason") == "dns_rejected" and bool(row.get("strict_lexical_hit")),
+        )
+        _write_stage1_subset_csv(
+            stage1_rows,
+            FETCH_FAILED_LEXICAL_HITS_PATH,
+            lambda row: str(row.get("fetch_status", "")).strip().lower() in {"failed", "timeout"} and bool(row.get("strict_lexical_hit")),
+        )
+        excluded_rows = _build_excluded_url_rows(stage1_rows)
         excluded_path = _write_excluded_urls_audit(excluded_rows)
         _clip_logger.info(
             "Excluded URL audit written to %s with %d rows",
@@ -2173,11 +2790,13 @@ def run_hashing_shortlist(
     medium_confidence_threshold=DEFAULT_MEDIUM_CONFIDENCE_THRESHOLD,
     typo_top_k=DEFAULT_TYPO_TOP_K,
     typo_min_score=DEFAULT_TYPO_MIN_SCORE,
+    lexical_pass_min_score=DEFAULT_LEXICAL_PASS_MIN_SCORE,
     clip_margin_min=DEFAULT_CLIP_MARGIN_MIN,
     dns_timeout=None,
     dns_retries=None,
     dns_max_workers=None,
     weights=None,
+    shortlist_debug_csv: str | None = DEFAULT_STAGE1_DEBUG_CSV,
 ):
     """Synchronous entry point for hashing shortlist."""
     return asyncio.run(
@@ -2189,11 +2808,13 @@ def run_hashing_shortlist(
             medium_confidence_threshold=medium_confidence_threshold,
             typo_top_k=typo_top_k,
             typo_min_score=typo_min_score,
+            lexical_pass_min_score=lexical_pass_min_score,
             clip_margin_min=clip_margin_min,
             dns_timeout=dns_timeout,
             dns_retries=dns_retries,
             dns_max_workers=dns_max_workers,
             weights=weights,
+            shortlist_debug_csv=shortlist_debug_csv,
         )
     )
 
@@ -2206,11 +2827,13 @@ async def run_hashing_shortlist_async(
     medium_confidence_threshold=DEFAULT_MEDIUM_CONFIDENCE_THRESHOLD,
     typo_top_k=DEFAULT_TYPO_TOP_K,
     typo_min_score=DEFAULT_TYPO_MIN_SCORE,
+    lexical_pass_min_score=DEFAULT_LEXICAL_PASS_MIN_SCORE,
     clip_margin_min=DEFAULT_CLIP_MARGIN_MIN,
     dns_timeout=None,
     dns_retries=None,
     dns_max_workers=None,
     weights=None,
+    shortlist_debug_csv: str | None = DEFAULT_STAGE1_DEBUG_CSV,
 ):
     """Async entry point for hashing shortlist."""
     return await run_hashing_shortlist_streaming(
@@ -2221,11 +2844,13 @@ async def run_hashing_shortlist_async(
         medium_confidence_threshold=medium_confidence_threshold,
         typo_top_k=typo_top_k,
         typo_min_score=typo_min_score,
+        lexical_pass_min_score=lexical_pass_min_score,
         clip_margin_min=clip_margin_min,
         dns_timeout=dns_timeout,
         dns_retries=dns_retries,
         dns_max_workers=dns_max_workers,
         weights=weights,
+        shortlist_debug_csv=shortlist_debug_csv,
     )
 
 

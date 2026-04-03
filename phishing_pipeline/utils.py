@@ -17,7 +17,7 @@ except ImportError:
     TORCH_AVAILABLE = False
  
 
-from .config import SCREENS_DIR
+from .config import ROOT_DIR, SCREENS_DIR, WHITELISTS_DIR
 from .features import (
     extract_url_features,
     extract_subdomain_features,
@@ -569,86 +569,216 @@ def _safe_extract_laplacian(path: str) -> float:
 # Textual-Visual Consistency (TVC) Features
 # =====================================================================
 
-# Brand â†’ known legitimate domains mapping
-BRAND_DOMAIN_MAP = {
-    "sbi":       ["sbi.co.in", "onlinesbi.com", "onlinesbi.sbi"],
-    "icici":     ["icicibank.com"],
-    "hdfc":      ["hdfcbank.com"],
-    "axis":      ["axisbank.com"],
-    "kotak":     ["kotak.com", "kotakbank.com"],
-    "pnb":       ["pnbindia.in"],
-    "canara":    ["canarabank.com"],
-    "bob":       ["bankofbaroda.in", "bankofbaroda.com"],
-    "airtel":    ["airtel.in", "airtel.com"],
-    "irctc":     ["irctc.co.in"],
-    "nic":       ["nic.in", "gov.in"],
-    "iocl":      ["iocl.com"],
-    "lic":       ["licindia.in"],
-    "google":    ["google.com", "google.co.in"],
-    "facebook":  ["facebook.com", "fb.com"],
-    "instagram": ["instagram.com"],
-    "microsoft": ["microsoft.com", "live.com", "outlook.com", "microsoftonline.com"],
-    "paypal":    ["paypal.com"],
-    "amazon":    ["amazon.com", "amazon.in"],
-    "whatsapp":  ["whatsapp.com"],
-    "telegram":  ["telegram.org"],
+# Canonical TVC brand families. The whitelist/entity data is merged into this at runtime.
+TVC_BRAND_OVERRIDES = {
+    "sbi": {"aliases": {"sbi", "state bank of india", "onlinesbi"}, "domains": {"sbi.co.in", "onlinesbi.com", "onlinesbi.sbi"}},
+    "icici": {"aliases": {"icici", "icici bank", "icicibank"}, "domains": {"icicibank.com"}},
+    "hdfc": {"aliases": {"hdfc", "hdfc bank", "hdfcbank"}, "domains": {"hdfcbank.com"}},
+    "axis": {"aliases": {"axis", "axis bank", "axisbank", "axis upi", "axisupi"}, "domains": {"axisbank.com"}},
+    "kotak": {"aliases": {"kotak", "kotak bank", "kotakbank"}, "domains": {"kotak.com", "kotakbank.com"}},
+    "pnb": {"aliases": {"pnb", "punjab national bank", "pnbindia"}, "domains": {"pnbindia.in"}},
+    "canara": {"aliases": {"canara", "canara bank", "canarabank"}, "domains": {"canarabank.com"}},
+    "bob": {"aliases": {"bank of baroda", "baroda", "bankofbaroda", "bob"}, "domains": {"bankofbaroda.in", "bankofbaroda.com"}},
+    "airtel": {"aliases": {"airtel", "bharti airtel"}, "domains": {"airtel.in", "airtel.com"}},
+    "irctc": {"aliases": {"irctc"}, "domains": {"irctc.co.in"}},
+    "nic": {"aliases": {"nic", "national informatics centre"}, "domains": {"nic.in", "gov.in"}},
+    "iocl": {"aliases": {"iocl", "indian oil", "indianoil"}, "domains": {"iocl.com"}},
+    "lic": {"aliases": {"lic", "life insurance corporation", "licindia"}, "domains": {"licindia.in"}},
+    "uidai": {"aliases": {"uidai", "aadhaar", "aadhaar india"}, "domains": {"uidai.gov.in", "myaadhaar.uidai.gov.in"}},
+    "eci": {"aliases": {"eci", "election commission", "election commission of india"}, "domains": {"eci.gov.in"}},
+    "cams": {"aliases": {"cams", "camsonline"}, "domains": {"camsonline.com"}},
+    "kfintech": {"aliases": {"kfintech", "kfin"}, "domains": {"kfintech.com"}},
+    "coalindia": {"aliases": {"coal india", "coalindia"}, "domains": {"coalindia.in"}},
+    "incometax": {"aliases": {"income tax", "income tax india", "incometax"}, "domains": {"incometax.gov.in"}},
+    "isro": {"aliases": {"isro", "indian space research organisation", "indian space research organization"}, "domains": {"isro.gov.in"}},
+    "google": {"aliases": {"google"}, "domains": {"google.com", "google.co.in"}},
+    "facebook": {"aliases": {"facebook", "fb"}, "domains": {"facebook.com", "fb.com"}},
+    "instagram": {"aliases": {"instagram"}, "domains": {"instagram.com"}},
+    "microsoft": {"aliases": {"microsoft", "outlook", "live"}, "domains": {"microsoft.com", "live.com", "outlook.com", "microsoftonline.com"}},
+    "paypal": {"aliases": {"paypal"}, "domains": {"paypal.com"}},
+    "amazon": {"aliases": {"amazon"}, "domains": {"amazon.com", "amazon.in"}},
+    "whatsapp": {"aliases": {"whatsapp"}, "domains": {"whatsapp.com"}},
+    "telegram": {"aliases": {"telegram"}, "domains": {"telegram.org"}},
 }
+_TVC_BRAND_CATALOG = None
 
 
-def extract_tvc_features(url: str, ocr_header_text: str, ocr_footer_text: str) -> dict:
+def _normalize_tvc_text(value: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", str(value or "").lower())).strip()
+
+
+def _add_brand_catalog_entry(catalog: dict, canonical: str, aliases=None, domains=None):
+    key = _normalize_tvc_text(canonical).replace(" ", "")
+    if not key:
+        return
+    entry = catalog.setdefault(key, {"aliases": set(), "domains": set()})
+    for alias in aliases or []:
+        alias_norm = _normalize_tvc_text(alias)
+        if alias_norm:
+            entry["aliases"].add(alias_norm)
+            entry["aliases"].add(alias_norm.replace(" ", ""))
+    for domain in domains or []:
+        domain_norm = str(domain or "").strip().lower()
+        if domain_norm:
+            entry["domains"].add(domain_norm)
+            primary = tldextract.extract(domain_norm).domain.lower()
+            if primary:
+                entry["aliases"].add(primary)
+
+
+def _get_tvc_brand_catalog() -> dict:
+    global _TVC_BRAND_CATALOG
+    if _TVC_BRAND_CATALOG is not None:
+        return _TVC_BRAND_CATALOG
+
+    catalog = {}
+    for canonical, payload in TVC_BRAND_OVERRIDES.items():
+        _add_brand_catalog_entry(catalog, canonical, payload.get("aliases"), payload.get("domains"))
+
+    whitelist_path = os.path.join(WHITELISTS_DIR, "Stage_2_Legitimate_Domains_80.xlsx")
+    if os.path.exists(whitelist_path):
+        try:
+            import pandas as pd
+
+            wl_df = pd.read_excel(whitelist_path, usecols=["Cooresponding CSE", "Legitimate Domains"])
+            wl_df["Cooresponding CSE"] = wl_df["Cooresponding CSE"].ffill()
+            for _, row in wl_df.iterrows():
+                cse_name = str(row.get("Cooresponding CSE", "") or "").strip()
+                legit_domain = str(row.get("Legitimate Domains", "") or "").strip().lower()
+                primary = tldextract.extract(legit_domain).domain.lower()
+                canonical = primary or cse_name
+                aliases = {cse_name, primary, cse_name.replace(" ", "")}
+                _add_brand_catalog_entry(catalog, canonical, aliases, {legit_domain})
+        except Exception as exc:
+            logger.warning("Failed to load TVC whitelist brand map: %s", exc)
+
+    entity_db_path = os.path.join(ROOT_DIR, "data", "entity_hash_db.json")
+    if os.path.exists(entity_db_path):
+        try:
+            import json
+
+            with open(entity_db_path, "r", encoding="utf-8") as fh:
+                entity_db = json.load(fh)
+            for entity_name, payload in entity_db.items():
+                domains = payload.get("domains", []) if isinstance(payload, dict) else []
+                primary = ""
+                if domains:
+                    primary = tldextract.extract(str(domains[0])).domain.lower()
+                canonical = primary or entity_name
+                aliases = {entity_name, entity_name.replace(" ", ""), primary}
+                _add_brand_catalog_entry(catalog, canonical, aliases, domains)
+        except Exception as exc:
+            logger.warning("Failed to load TVC entity brand map: %s", exc)
+
+    _TVC_BRAND_CATALOG = catalog
+    return _TVC_BRAND_CATALOG
+
+
+def _resolve_tvc_brand(shortlisted_cse: str, shortlisted_domain: str) -> str | None:
+    catalog = _get_tvc_brand_catalog()
+    shortlisted_domain = str(shortlisted_domain or "").strip().lower()
+    shortlisted_cse_norm = _normalize_tvc_text(shortlisted_cse)
+    shortlisted_cse_compact = shortlisted_cse_norm.replace(" ", "")
+    best_brand = None
+    best_score = -1
+    for canonical, payload in catalog.items():
+        domains = payload["domains"]
+        aliases = payload["aliases"]
+        if shortlisted_domain:
+            matching_domains = [
+                legit_domain
+                for legit_domain in domains
+                if shortlisted_domain == legit_domain or shortlisted_domain.endswith("." + legit_domain)
+            ]
+            if matching_domains:
+                domain_score = max(len(match) for match in matching_domains)
+                if domain_score > best_score:
+                    best_brand = canonical
+                    best_score = domain_score
+        if shortlisted_cse_norm and (shortlisted_cse_norm in aliases or shortlisted_cse_compact in aliases):
+            alias_score = max(len(shortlisted_cse_norm), len(shortlisted_cse_compact))
+            if alias_score > best_score:
+                best_brand = canonical
+                best_score = alias_score
+    return best_brand
+
+
+def extract_tvc_features(
+    url: str,
+    ocr_header_text: str,
+    ocr_footer_text: str,
+    ocr_full_text: str = "",
+    html_text: str = "",
+    shortlisted_cse: str = "",
+    shortlisted_domain: str = "",
+) -> dict:
     """
     Textual-Visual Consistency: checks if visual brand signals match the actual domain.
 
-    Compares brand names found in OCR header/footer text against the website's
-    actual domain using the BRAND_DOMAIN_MAP lookup table.
+    Compares brand names found in OCR/header/footer/html text against the website's
+    actual domain using the runtime TVC brand catalog.
 
     Args:
         url:             The URL being analyzed
         ocr_header_text: OCR text from the header zone (brand/logo area)
         ocr_footer_text: OCR text from the footer zone (legal/copyright area)
 
-    Returns:
-        dict with TVC features:
-            tvc_brand_detected  (bool)  â€” any known brand found in visual text
-            tvc_detected_brand  (str)   â€” which brand was detected (or "none")
-            tvc_domain_match    (bool)  â€” actual domain is a legitimate domain for the brand
-            tvc_fuzzy_score     (float) â€” fuzzy string similarity (0.0â€”1.0)
-            tvc_brand_spoofed   (bool)  â€” brand detected but domain DOESN'T match (phishing signal)
+    Search order:
+        1. header/footer OCR
+        2. full OCR
+        3. HTML title / visible text fallback
+
+    The spoof flag is only raised when the detected brand aligns with the
+    shortlisted CSE/domain family and the actual domain does not.
     """
     from rapidfuzz import fuzz
 
+    catalog = _get_tvc_brand_catalog()
     ext = tldextract.extract(url)
     actual_domain = f"{ext.domain}.{ext.suffix}".lower()
-
-    # Combine header + footer as primary brand surface
-    brand_surface = re.sub(r"[^a-z0-9\s]", " ", (ocr_header_text + " " + ocr_footer_text).lower())
-
+    shortlist_brand = _resolve_tvc_brand(shortlisted_cse, shortlisted_domain)
+    search_surfaces = [
+        _normalize_tvc_text(f"{ocr_header_text} {ocr_footer_text}"),
+        _normalize_tvc_text(ocr_full_text),
+        _normalize_tvc_text(html_text),
+    ]
     best_brand_hit = None
     best_match_score = 0.0
     domain_matches_brand = False
 
-    for brand, legit_domains in BRAND_DOMAIN_MAP.items():
-        if brand in brand_surface:
-            # Check if actual domain is a known legitimate domain
+    for surface in search_surfaces:
+        if not surface:
+            continue
+        for brand, payload in catalog.items():
+            aliases = payload["aliases"]
+            legit_domains = payload["domains"]
+            if not aliases or not legit_domains:
+                continue
+            if not any(alias and alias in surface for alias in aliases):
+                continue
+
             is_legit = any(
-                actual_domain == ld or actual_domain.endswith("." + ld)
-                for ld in legit_domains
+                actual_domain == legit_domain or actual_domain.endswith("." + legit_domain)
+                for legit_domain in legit_domains
             )
+            fuzzy_scores = [fuzz.ratio(actual_domain, legit_domain) for legit_domain in legit_domains]
+            score = (max(fuzzy_scores) / 100.0) if fuzzy_scores else 0.0
 
-            # Fuzzy match: how similar is actual_domain to expected domains?
-            fuzzy_scores = [fuzz.ratio(actual_domain, ld) for ld in legit_domains]
-            score = max(fuzzy_scores) / 100.0
-
-            if score > best_match_score:
+            if (
+                best_brand_hit is None
+                or (brand == shortlist_brand and best_brand_hit != shortlist_brand)
+                or score > best_match_score
+            ):
                 best_match_score = score
                 best_brand_hit = brand
                 domain_matches_brand = is_legit
 
+    aligned_to_shortlist = bool(best_brand_hit) and (shortlist_brand is None or best_brand_hit == shortlist_brand)
     return {
         "tvc_brand_detected": best_brand_hit is not None,
         "tvc_detected_brand": best_brand_hit or "none",
         "tvc_domain_match": domain_matches_brand,
         "tvc_fuzzy_score": round(best_match_score, 4),
-        "tvc_brand_spoofed": (best_brand_hit is not None) and (not domain_matches_brand),
+        "tvc_brand_spoofed": bool(best_brand_hit) and aligned_to_shortlist and (not domain_matches_brand),
     }
 

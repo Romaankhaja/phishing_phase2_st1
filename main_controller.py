@@ -81,6 +81,14 @@ def _pipeline_mode(value: str) -> str:
     return normalized
 
 
+def _stage_smoke_mode(value: str) -> str:
+    normalized = str(value).strip().lower()
+    allowed = {"off", "dns", "fetch", "lexical", "score", "classify", "all"}
+    if normalized not in allowed:
+        raise argparse.ArgumentTypeError(f"stage smoke test must be one of {sorted(allowed)}")
+    return normalized
+
+
 def _load_runtime_components() -> dict[str, Any]:
     """
     Import pipeline modules lazily.
@@ -185,6 +193,8 @@ async def main():
                         help="Top-K typosquat candidate CSEs retained before hash/CLIP scoring (default=10)")
     parser.add_argument("--typo-min-score", type=_probability_float, default=0.45,
                         help="Minimum typosquat similarity to count as typo anchor (default=0.45)")
+    parser.add_argument("--lexical-pass-min-score", type=_probability_float, default=0.85,
+                        help="Minimum lexical score allowed to pass Stage 1 admission even below hash threshold (default=0.85)")
     parser.add_argument("--clip-margin-min", type=_non_negative_float, default=0.12,
                         help="Minimum score margin for strong CLIP anchor (default=0.12)")
     parser.add_argument("--dns-timeout", type=_non_negative_float, default=3.0,
@@ -207,6 +217,10 @@ async def main():
                         help="Weight for domain hash exact-match contribution (default=8)")
     parser.add_argument("--weight-keywords", type=_non_negative_float, default=10.0,
                         help="Weight for keyword overlap contribution (default=10)")
+    parser.add_argument("--shortlist-debug-csv", type=str, default=os.path.join("output", "stage1_lexical_debug.csv"),
+                        help="Path for Stage 1 lexical/debug CSV (default=output/stage1_lexical_debug.csv)")
+    parser.add_argument("--stage-smoke-test", type=_stage_smoke_mode, default="off",
+                        help="Optional partial-run mode: off, dns, fetch, lexical, score, classify, all (default=off)")
     args = parser.parse_args()
     if args.high_confidence_threshold < args.medium_confidence_threshold:
         raise ValueError("high-confidence-threshold must be >= medium-confidence-threshold")
@@ -232,24 +246,32 @@ async def main():
         import glob
 
         evidence_dir = os.path.join("phishing_pipeline", "PS-02_ISS_NLP_Evidences")
+        packaged_submission_dir = os.path.join("output", "PS-02_ISS_NLP_Submission")
         if os.path.isdir(evidence_dir):
             shutil.rmtree(evidence_dir, ignore_errors=True)
             logger.info("🧹 Cleared previous evidence directory: %s", evidence_dir)
-
+        if os.path.isdir(packaged_submission_dir):
+            shutil.rmtree(packaged_submission_dir, ignore_errors=True)
+            logger.info("🧹 Cleared stale packaged submission directory: %s", packaged_submission_dir)
         # Remove old submission xlsx (temp file in phishing_pipeline/)
         for xlsx in glob.glob(os.path.join("phishing_pipeline", "PS-02_*_Submission_Set.xlsx")):
             os.remove(xlsx)
             logger.info("🧹 Removed old submission xlsx: %s", xlsx)
 
         # Remove old submission zip and output CSVs
-        for pattern in [
+        cleanup_patterns = [
             os.path.join("output", "*.zip"),
             os.path.join("output", "output_file.csv"),
             os.path.join("output", "output_file_filtered.csv"),
-            os.path.join("output", "holdout.csv"),
             os.path.join("output", "hash_review_queue.csv"),
             os.path.join("output", "checkpoint_records.csv"),
-        ]:
+            os.path.join("output", "stage1_lexical_debug.csv"),
+            os.path.join("output", "stage2_model_debug.csv"),
+            os.path.join("output", "stage3_classification_debug.csv"),
+        ]
+        if args.stage_smoke_test != "classify":
+            cleanup_patterns.append(os.path.join("output", "holdout.csv"))
+        for pattern in cleanup_patterns:
             for f in glob.glob(pattern):
                 os.remove(f)
                 logger.info("🧹 Removed old output: %s", f)
@@ -265,9 +287,10 @@ async def main():
         logger.info(
             "Runtime mode=%s | shortlist threshold=%.3f domain_sim_threshold=%.3f "
             "confidence_bands={high>=%.3f, medium>=%.3f} "
-            "typo={top_k=%d,min_score=%.3f,clip_margin_min=%.3f} "
+            "typo={top_k=%d,min_score=%.3f,lexical_pass_min_score=%.3f,clip_margin_min=%.3f} "
             "dns={timeout=%.2f,retries=%d,max_workers=%s} "
-            "weights={domain=%.3f,screenshot=%.3f,favicon=%.3f,ssl_hash=%.3f,html_hash=%.3f,domain_hash=%.3f,keywords=%.3f}",
+            "weights={domain=%.3f,screenshot=%.3f,favicon=%.3f,ssl_hash=%.3f,html_hash=%.3f,domain_hash=%.3f,keywords=%.3f} "
+            "stage_smoke_test=%s shortlist_debug_csv=%s",
             args.pipeline_mode,
             args.hashing_threshold,
             args.domain_sim_threshold,
@@ -275,6 +298,7 @@ async def main():
             args.medium_confidence_threshold,
             args.typo_top_k,
             args.typo_min_score,
+            args.lexical_pass_min_score,
             args.clip_margin_min,
             args.dns_timeout,
             args.dns_retries,
@@ -286,72 +310,110 @@ async def main():
             args.weight_html_hash,
             args.weight_domain_hash,
             args.weight_keywords,
+            args.stage_smoke_test,
+            args.shortlist_debug_csv,
         )
 
         df_out = None
 
         # Try the new-style orchestration (controller -> comparison -> pipeline)
         if run_hashing_shortlist_async and shortlisting:
+            if args.stage_smoke_test == "classify":
+                existing_holdout = os.path.join("output", "holdout.csv")
+                if not os.path.exists(existing_holdout):
+                    raise FileNotFoundError("stage-smoke-test=classify requires an existing output/holdout.csv")
+                logger.info("--- Stage Smoke Test classify: Reusing existing holdout.csv ---")
+                df_out = await run_pipeline(
+                    holdout_folder=args.shortlisting,
+                    ps02_whitelist_file=args.whitelist,
+                    limit_whitelisted=args.limit if args.limit else None,
+                    limit_target_urls=args.target_limit,
+                    use_existing_holdout=True,
+                    pipeline_mode=args.pipeline_mode,
+                    high_confidence_threshold=args.high_confidence_threshold,
+                    medium_confidence_threshold=args.medium_confidence_threshold,
+                    hashing_threshold=args.hashing_threshold,
+                    domain_similarity_threshold=args.domain_sim_threshold,
+                    typo_top_k=args.typo_top_k,
+                    typo_min_score=args.typo_min_score,
+                    lexical_pass_min_score=args.lexical_pass_min_score,
+                    clip_margin_min=args.clip_margin_min,
+                    dns_timeout=args.dns_timeout,
+                    dns_retries=args.dns_retries,
+                    dns_max_workers=args.dns_max_workers,
+                    shortlist_debug_csv=args.shortlist_debug_csv,
+                )
+                logger.info("--- Finished Stage Smoke Test classify ---")
+            else:
             # 1. Run Shortlisting using phishing_pipeline.comparison
-            logger.info("--- Starting Step 1: Running Hashing-based Shortlisting ---")
-            urls = shortlisting.load_urls_from_excel_folder(
-                args.shortlisting,
-                limit=args.target_limit,
-            )
-            shortlist_weights = {
-                "domain": args.weight_domain,
-                "screenshot": args.weight_screenshot,
-                "favicon": args.weight_favicon,
-                "ssl_hash": args.weight_ssl_hash,
-                "html_hash": args.weight_html_hash,
-                "domain_hash": args.weight_domain_hash,
-                "keywords": args.weight_keywords,
-            }
-            
-            holdout_df = await run_hashing_shortlist_async(
-                list(urls),
-                threshold=args.hashing_threshold,
-                domain_similarity_threshold=args.domain_sim_threshold,
-                high_confidence_threshold=args.high_confidence_threshold,
-                medium_confidence_threshold=args.medium_confidence_threshold,
-                typo_top_k=args.typo_top_k,
-                typo_min_score=args.typo_min_score,
-                clip_margin_min=args.clip_margin_min,
-                dns_timeout=args.dns_timeout,
-                dns_retries=args.dns_retries,
-                dns_max_workers=args.dns_max_workers,
-                weights=shortlist_weights,
-            )
-            
-            # Save output to holdout.csv
-            out_csv = os.path.join("output", "holdout.csv")
-            os.makedirs("output", exist_ok=True)
-            holdout_df.to_csv(out_csv, index=False)
-            logger.info(f"--- Finished Step 1: Shortlisting Complete ({len(holdout_df)} matched) ---")
-            
-            # 2. Run Pipeline
-            logger.info("--- Starting Step 2: Running Main Pipeline ---")
-            
-            df_out = await run_pipeline(
-                holdout_folder=args.shortlisting, 
-                ps02_whitelist_file=args.whitelist,
-                limit_whitelisted=args.limit if args.limit else None,
-                limit_target_urls=args.target_limit,
-                use_existing_holdout=True,
-                pipeline_mode=args.pipeline_mode,
-                high_confidence_threshold=args.high_confidence_threshold,
-                medium_confidence_threshold=args.medium_confidence_threshold,
-                hashing_threshold=args.hashing_threshold,
-                domain_similarity_threshold=args.domain_sim_threshold,
-                typo_top_k=args.typo_top_k,
-                typo_min_score=args.typo_min_score,
-                clip_margin_min=args.clip_margin_min,
-                dns_timeout=args.dns_timeout,
-                dns_retries=args.dns_retries,
-                dns_max_workers=args.dns_max_workers,
-            )
-            
-            logger.info("--- Finished Step 2: Main Pipeline Complete ---")
+                logger.info("--- Starting Step 1: Running Hashing-based Shortlisting ---")
+                urls = shortlisting.load_urls_from_excel_folder(
+                    args.shortlisting,
+                    limit=args.target_limit,
+                )
+                shortlist_weights = {
+                    "domain": args.weight_domain,
+                    "screenshot": args.weight_screenshot,
+                    "favicon": args.weight_favicon,
+                    "ssl_hash": args.weight_ssl_hash,
+                    "html_hash": args.weight_html_hash,
+                    "domain_hash": args.weight_domain_hash,
+                    "keywords": args.weight_keywords,
+                }
+                
+                holdout_df = await run_hashing_shortlist_async(
+                    list(urls),
+                    threshold=args.hashing_threshold,
+                    domain_similarity_threshold=args.domain_sim_threshold,
+                    high_confidence_threshold=args.high_confidence_threshold,
+                    medium_confidence_threshold=args.medium_confidence_threshold,
+                    typo_top_k=args.typo_top_k,
+                    typo_min_score=args.typo_min_score,
+                    lexical_pass_min_score=args.lexical_pass_min_score,
+                    clip_margin_min=args.clip_margin_min,
+                    dns_timeout=args.dns_timeout,
+                    dns_retries=args.dns_retries,
+                    dns_max_workers=args.dns_max_workers,
+                    weights=shortlist_weights,
+                    shortlist_debug_csv=args.shortlist_debug_csv,
+                )
+                
+                # Save output to holdout.csv
+                out_csv = os.path.join("output", "holdout.csv")
+                os.makedirs("output", exist_ok=True)
+                holdout_df.to_csv(out_csv, index=False)
+                logger.info(f"--- Finished Step 1: Shortlisting Complete ({len(holdout_df)} matched) ---")
+
+                if args.stage_smoke_test in {"dns", "fetch", "lexical", "score"}:
+                    logger.info("Stage smoke test '%s' requested. Stopping after Step 1.", args.stage_smoke_test)
+                    df_out = holdout_df
+                    return
+                
+                # 2. Run Pipeline
+                logger.info("--- Starting Step 2: Running Main Pipeline ---")
+                
+                df_out = await run_pipeline(
+                    holdout_folder=args.shortlisting, 
+                    ps02_whitelist_file=args.whitelist,
+                    limit_whitelisted=args.limit if args.limit else None,
+                    limit_target_urls=args.target_limit,
+                    use_existing_holdout=True,
+                    pipeline_mode=args.pipeline_mode,
+                    high_confidence_threshold=args.high_confidence_threshold,
+                    medium_confidence_threshold=args.medium_confidence_threshold,
+                    hashing_threshold=args.hashing_threshold,
+                    domain_similarity_threshold=args.domain_sim_threshold,
+                    typo_top_k=args.typo_top_k,
+                    typo_min_score=args.typo_min_score,
+                    lexical_pass_min_score=args.lexical_pass_min_score,
+                    clip_margin_min=args.clip_margin_min,
+                    dns_timeout=args.dns_timeout,
+                    dns_retries=args.dns_retries,
+                    dns_max_workers=args.dns_max_workers,
+                    shortlist_debug_csv=args.shortlist_debug_csv,
+                )
+                
+                logger.info("--- Finished Step 2: Main Pipeline Complete ---")
 
         # Fallback to old style (pipeline does everything)
         elif run_pipeline is not None:
@@ -369,10 +431,12 @@ async def main():
                     domain_similarity_threshold=args.domain_sim_threshold,
                     typo_top_k=args.typo_top_k,
                     typo_min_score=args.typo_min_score,
+                    lexical_pass_min_score=args.lexical_pass_min_score,
                     clip_margin_min=args.clip_margin_min,
                     dns_timeout=args.dns_timeout,
                     dns_retries=args.dns_retries,
                     dns_max_workers=args.dns_max_workers,
+                    shortlist_debug_csv=args.shortlist_debug_csv,
                 )
             except TypeError:
                 df_out = await run_pipeline(args.shortlisting, args.whitelist, args.limit)
@@ -419,3 +483,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
