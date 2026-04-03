@@ -268,6 +268,7 @@ async def main():
             os.path.join("output", "stage1_lexical_debug.csv"),
             os.path.join("output", "stage2_model_debug.csv"),
             os.path.join("output", "stage3_classification_debug.csv"),
+            os.path.join("output", "parked_page_exclusions.csv"),
         ]
         if args.stage_smoke_test != "classify":
             cleanup_patterns.append(os.path.join("output", "holdout.csv"))

@@ -46,6 +46,7 @@ from .utils import extract_all_features_async
 from .visual_features import close_browser
 from .geoip_utils import enrich_with_geoip
 from .model_utils import load_models_and_preproc
+from .comparison import detect_parked_page_signals
 # from .shortlisting import generate_shortlisted_csv # REMOVED: Using hashing_ml instead
 from .rate_limiter import RateLimiter
 from .utils import (
@@ -707,6 +708,27 @@ def reclassify_label(domain, registrar, host, dns, ocr_text_from_csv, tvc_brand_
     return "Legitimate"
 
 
+def _detect_stored_parked_page(row: dict) -> dict:
+    domain_url = str(row.get("Identified Phishing/Suspected Domain Name", "") or "").strip()
+    final_landing_url = str(row.get("final_landing_url", "") or "").strip()
+    stored_provider = str(row.get("parking_provider", "") or "").strip()
+    stored_reason = str(row.get("parking_reason", "") or "").strip()
+    if stored_provider or stored_reason:
+        return {
+            "is_parked": True,
+            "parking_provider": stored_provider or "GenericParking",
+            "parking_reason": stored_reason or "stored_parking_signal",
+            "final_landing_url": final_landing_url or domain_url,
+            "matched_signals": [],
+        }
+    return detect_parked_page_signals(
+        original_url=domain_url,
+        final_landing_url=final_landing_url,
+        title_text=str(row.get("html_title_text", "") or ""),
+        visible_text=str(row.get("visible_text_excerpt", "") or ""),
+    )
+
+
 def _submission_record_columns() -> list[str]:
     return [
         "Application_ID",
@@ -985,7 +1007,18 @@ def _hybrid_hash_classification(
     suspicious_or_mismatched = bool(suspicious_infra or infra_unknown or model_contradiction or base_label == "Phishing")
 
     if not fetched:
-        return "Suspected" if strict_lexical_hit else "Legitimate"
+        if (
+            suspicious_infra
+            or domain_hit
+            or keyword_hit
+            or bool(tvc_brand_spoofed)
+            or brand_aligned_clip
+            or hash_anchor
+            or clip_anchor
+            or model_support
+        ):
+            return "Suspected"
+        return "Legitimate"
 
     if strict_lexical_hit and strong_corroborator and suspicious_or_mismatched:
         return "Phishing"
@@ -1109,6 +1142,69 @@ async def _run_hash_only_pipeline(
         host = host.split(":")[0]
         screenshot_path = str(row.get("screenshot_path", "") or "").strip()
         fetch_status = str(row.get("fetch_status", "fetched") or "fetched").strip().lower()
+        stored_parking = _detect_stored_parked_page(row)
+        if stored_parking["is_parked"]:
+            async with records_lock:
+                stage2_model_debug_records.append(
+                    {
+                        "url": domain_url,
+                        "shortlisted_cse": row.get("Cooresponding CSE", ""),
+                        "shortlisted_domain": row.get("Legitimate Domains", ""),
+                        "fetch_status": fetch_status,
+                        "final_landing_url": stored_parking.get("final_landing_url", ""),
+                        "parking_provider": stored_parking.get("parking_provider", ""),
+                        "parking_reason": stored_parking.get("parking_reason", ""),
+                        "brand_model_top1": "NA",
+                        "brand_model_confidence": 0.0,
+                        "domain_model_top1": "Unknown",
+                        "domain_model_confidence": 0.0,
+                        "model_brand_agrees_with_shortlist": False,
+                        "model_domain_agrees_with_shortlist": False,
+                        "model_feature_status": "skipped_parked_page",
+                        "model_input_error": stored_parking.get("parking_reason", ""),
+                    }
+                )
+                stage3_classification_debug_records.append(
+                    {
+                        "url": domain_url,
+                        "shortlisted_cse": row.get("Cooresponding CSE", ""),
+                        "shortlisted_domain": row.get("Legitimate Domains", ""),
+                        "fetch_status": fetch_status,
+                        "final_landing_url": stored_parking.get("final_landing_url", ""),
+                        "parking_provider": stored_parking.get("parking_provider", ""),
+                        "parking_reason": stored_parking.get("parking_reason", ""),
+                        "classification": "SKIPPED_PARKED_PAGE",
+                        "confidence_band": row.get("confidence_band", "Low"),
+                        "evidence_tier": row.get("evidence_tier", ""),
+                        "lexical_score": row.get("lexical_score", 0.0),
+                        "hash_score": row.get("hash_score", 0.0),
+                        "old_fuzzy_hit": row.get("old_fuzzy_hit", False),
+                        "hybrid_lexical_hit": row.get("hybrid_lexical_hit", False),
+                        "strict_lexical_hit": row.get("strict_lexical_hit", False),
+                        "lexical_score_pass": row.get("lexical_score_pass", False),
+                        "fallback_rank_only": row.get("fallback_rank_only", False),
+                        "typo_anchor": row.get("typo_anchor", False),
+                        "hash_anchor": row.get("hash_anchor", False),
+                        "clip_anchor": row.get("clip_anchor", False),
+                        "tvc_brand_detected": False,
+                        "tvc_detected_brand": "none",
+                        "tvc_brand_spoofed": False,
+                        "ocr_text_len": 0,
+                        "registrar": "NA",
+                        "hosting_isp": "NA",
+                        "hosting_country": "NA",
+                        "dns_records": "NA",
+                        "brand_model_top1": "NA",
+                        "brand_model_confidence": 0.0,
+                        "domain_model_top1": "Unknown",
+                        "domain_model_confidence": 0.0,
+                        "model_brand_agrees_with_shortlist": False,
+                        "model_domain_agrees_with_shortlist": False,
+                        "model_feature_status": "skipped_parked_page",
+                        "model_input_error": stored_parking.get("parking_reason", ""),
+                    }
+                )
+            return
         html_brand_text = " ".join(
             part for part in [
                 str(row.get("html_title_text", "") or "").strip(),
@@ -1324,6 +1420,9 @@ async def _run_hash_only_pipeline(
                     "shortlisted_cse": row.get("Cooresponding CSE", ""),
                     "shortlisted_domain": row.get("Legitimate Domains", ""),
                     "fetch_status": fetch_status,
+                    "final_landing_url": row.get("final_landing_url", ""),
+                    "parking_provider": row.get("parking_provider", ""),
+                    "parking_reason": row.get("parking_reason", ""),
                     "brand_model_top1": brand_model_top1,
                     "brand_model_confidence": round(float(brand_model_confidence), 4),
                     "domain_model_top1": domain_model_top1,
@@ -1340,6 +1439,9 @@ async def _run_hash_only_pipeline(
                     "shortlisted_cse": row.get("Cooresponding CSE", ""),
                     "shortlisted_domain": row.get("Legitimate Domains", ""),
                     "fetch_status": fetch_status,
+                    "final_landing_url": row.get("final_landing_url", ""),
+                    "parking_provider": row.get("parking_provider", ""),
+                    "parking_reason": row.get("parking_reason", ""),
                     "classification": classification,
                     "confidence_band": confidence_band,
                     "evidence_tier": evidence_tier,
