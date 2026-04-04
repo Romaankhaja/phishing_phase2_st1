@@ -1,0 +1,82 @@
+2026-04-04 14:15:56,694 | INFO | Hashing shortlist (streaming) started | urls=230 | threshold=65.0 | domain_similarity_threshold=0.850 | high_confidence_threshold=78.00 | medium_confidence_threshold=68.00 | typo_top_k=10 | typo_min_score=0.450 | lexical_pass_min_score=0.850 | clip_margin_min=0.120 | dns_timeout=3.00 | dns_retries=1 | dns_max_workers=adaptive
+2026-04-04 14:15:56,694 | INFO | Scoring weights | domain=30, screenshot=20, favicon=14, ssl_hash=12, html_hash=6, domain_hash=8, keywords=10
+2026-04-04 14:15:56,694 | INFO | Stage1 hashing parallelism | dns_workers=128 | total_pages=16 | page_workers_per_shard=4 | shards=4 | http_limit=64 | nav_timeout_ms=8000 | screenshot_timeout_ms=3000 | fetch_timeout_s=10.0 | gpu_queue=32 | gpu_batch=16 | active_fetch_limit=16 | active_fetch_floor=16 | aux_net_limit=32 | adaptive_downshift_enabled=False
+2026-04-04 14:15:56,694 | INFO | Stage1 note | OCR/Screenshots/ImgProc/RDAP/WHOIS limits from phishing_pipeline.utils are not the active hashing-stage browser worker counts.
+2026-04-04 14:16:03,043 | INFO | DNS gate details | urls=230 | kept=176 | timeout=3.0s | retries=1 | workers=128 | resolved=176 timeout=1 resolver_error=5 no_records=23 dns_error=25 retry_success=45
+2026-04-04 14:16:03,044 | INFO | DNS gate kept 176/230 URLs at 3.0s timeout (retries=1, retry_success=45) | resolved=176 timeout=1 resolver_error=5 no_records=23 dns_error=25
+2026-04-04 14:16:03,044 | INFO | Hashing log file: c:\Users\SATWIK\Documents\Phishing\output\hashing_shortlist.log
+2026-04-04 14:16:07,337 | INFO | ðŸš€ Loading CLIP model (openai/clip-vit-base-patch32) on cuda...
+2026-04-04 14:16:12,686 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001BEBFFD5300>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-04 14:16:15,924 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001BEBA880100>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-04 14:16:17,160 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001BE9E3EC1C0>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-04 14:16:18,424 | INFO | Hashing progress | processed=51/176 | ok=33 | fail=16 | tout=0 | park=2 | match=1 | gpu_batches=1 | gpu_items=0 | gpu_queue=32 | active_fetch_limit=16 | avg_gpu_batch=0.00 | urls_per_sec=3.32 | success_ratio=0.647 | timeout_ratio=0.000
+2026-04-04 14:16:18,828 | INFO | âœ… CLIP model ready (dtype=torch.float16)
+2026-04-04 14:16:19,944 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001BE9E476560>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-04 14:16:20,405 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001BEC1239BA0>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-04 14:16:21,405 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001BE9E3AD0C0>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-04 14:16:22,734 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001BEC8537A60>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-04 14:16:28,667 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001BEC84E0700>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-04 14:16:28,781 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001BEC08BF2E0>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-04 14:16:29,276 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001BEBFCCAEC0>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-04 14:16:30,023 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001BEC02E69E0>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-04 14:16:30,461 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001BEC006EDA0>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-04 14:16:30,958 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001BEBA8197E0>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-04 14:16:31,209 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001BEBA81AD40>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-04 14:16:32,685 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001BEBFC46BC0>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-04 14:16:33,925 | INFO | Hashing progress | processed=122/176 | ok=88 | fail=30 | tout=0 | park=4 | match=5 | gpu_batches=33 | gpu_items=87 | gpu_queue=0 | active_fetch_limit=16 | avg_gpu_batch=2.64 | urls_per_sec=3.95 | success_ratio=0.721 | timeout_ratio=0.000
+2026-04-04 14:16:33,926 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001BEC8535120>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-04 14:16:33,927 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001BED5BFF640>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-04 14:16:36,369 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001BEBFCC9840>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-04 14:16:37,921 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001BEBF7A6F20>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-04 14:16:39,523 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001BEC0DAE380>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-04 14:16:45,063 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001BEC02E5780>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-04 14:16:47,005 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000001BF22BFB100>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-04 14:16:47,763 | INFO | Hashing shortlist completed | passed_dns_gate=176 | processed=176 | hashed_success=126 | fetch_failed=45 | fetch_timed_out=0 | fetch_parked=5 | final_matches=7 | gpu_batches=58 | gpu_items=126 | avg_gpu_batch=2.2 | urls_per_sec=3.94 | threshold=65.0 | elapsed=44.7s
+2026-04-04 14:16:47,763 | INFO | Anchor summary (shortlisted) | typo_anchor=4 | hash_anchor=2 | clip_anchor=0 | shortlisted=7
+2026-04-04 14:16:47,772 | INFO | Typo similarity summary (shortlisted) | min=0.2500 | avg=0.6106 | p95=0.9231 | max=0.9231 | typo_min_score=0.4500
+2026-04-04 14:16:47,781 | INFO | Stage1 debug CSV written to output\stage1_lexical_debug.csv with 230 rows
+2026-04-04 14:16:47,790 | INFO | Excluded URL audit written to c:\Users\SATWIK\Documents\Phishing\output\hashing_shortlist_excluded_urls.csv with 223 rows
