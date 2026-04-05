@@ -15,8 +15,8 @@ from .config import OUTPUT_DIR
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DNS_TIMEOUT = 3.0
-DEFAULT_DNS_RETRIES = 1
+DEFAULT_DNS_TIMEOUT = 5.0
+DEFAULT_DNS_RETRIES = 2
 DEFAULT_AUDIT_PATH = os.path.join(OUTPUT_DIR, "dns_gate_audit.csv")
 DEFAULT_FALLBACK_NAMESERVERS = ("1.1.1.1", "8.8.8.8")
 
@@ -287,6 +287,7 @@ def write_dns_gate_audit(
             fh,
             fieldnames=[
                 "target_url",
+                "source_workbook",
                 "hostname",
                 "resolved_ips",
                 "dns_status",

@@ -121,11 +121,13 @@ def _load_runtime_components() -> dict[str, Any]:
         "package_results": None,
         "shortlisting": None,
         "run_hashing_shortlist_async": None,
+        "STAGE1_HTTP_CONFIG": {},
     }
 
     try:
-        from phishing_pipeline.config import FINAL_OUTPUT
+        from phishing_pipeline.config import FINAL_OUTPUT, STAGE1_HTTP_CONFIG
         components["FINAL_OUTPUT"] = FINAL_OUTPUT
+        components["STAGE1_HTTP_CONFIG"] = STAGE1_HTTP_CONFIG
     except Exception as exc:
         logger.warning("Could not import FINAL_OUTPUT from config: %s", exc)
 
@@ -186,6 +188,7 @@ async def main():
     package_results = components["package_results"]
     shortlisting = components["shortlisting"]
     run_hashing_shortlist_async = components["run_hashing_shortlist_async"]
+    stage1_http_config = components["STAGE1_HTTP_CONFIG"] or {}
 
     parser = argparse.ArgumentParser(description="Phishing Detection CLI Controller")
     
@@ -199,32 +202,52 @@ async def main():
                         help="Number of target URLs to load from the shortlisting Excel input before hashing")
     parser.add_argument("--pipeline-mode", type=_pipeline_mode, default="hash_only",
                         help="Pipeline mode: hash_only (default) or legacy_ocr")
-    parser.add_argument("--hashing-threshold", type=_non_negative_float, default=65.0,
-                        help="Minimum final shortlist score required for a match (default=65)")
-    parser.add_argument("--domain-sim-threshold", type=_probability_float, default=0.85,
+    parser.add_argument("--hashing-threshold", type=_non_negative_float, default=58.0,
+                        help="Minimum final shortlist score required for a match (default=58)")
+    parser.add_argument("--domain-sim-threshold", type=_probability_float, default=0.80,
                         help="Minimum domain similarity in [0,1] required before domain score is counted (default=0.85)")
     parser.add_argument("--high-confidence-threshold", type=_non_negative_float, default=78.0,
                         help="Hash score threshold for High confidence band (default=78)")
     parser.add_argument("--medium-confidence-threshold", type=_non_negative_float, default=68.0,
                         help="Hash score threshold for Medium confidence band (default=68)")
     parser.add_argument("--typo-top-k", type=_positive_int, default=10,
-                        help="Top-K typosquat candidate CSEs retained before hash/CLIP scoring (default=10)")
-    parser.add_argument("--typo-min-score", type=_probability_float, default=0.45,
+                        help="Top-K typosquat candidate CSEs retained before deep hash scoring (default=10)")
+    parser.add_argument("--typo-min-score", type=_probability_float, default=0.75,
                         help="Minimum typosquat similarity to count as typo anchor (default=0.45)")
     parser.add_argument("--lexical-pass-min-score", type=_probability_float, default=0.85,
                         help="Minimum lexical score allowed to pass Stage 1 admission even below hash threshold (default=0.85)")
-    parser.add_argument("--clip-margin-min", type=_non_negative_float, default=0.12,
-                        help="Minimum score margin for strong CLIP anchor (default=0.12)")
-    parser.add_argument("--dns-timeout", type=_non_negative_float, default=3.0,
-                        help="DNS gate timeout in seconds (default=3.0)")
-    parser.add_argument("--dns-retries", type=_non_negative_int, default=1,
-                        help="DNS gate retry count for timeout/resolver errors (default=1)")
+    parser.add_argument("--clip-margin-min", type=_non_negative_float, default=0.20,
+                        help="Deprecated compatibility no-op. CLIP routing is disabled.")
+    parser.add_argument("--dns-timeout", type=_non_negative_float, default=5.0,
+                        help="DNS gate timeout in seconds (default=5.0)")
+    parser.add_argument("--dns-retries", type=_non_negative_int, default=2,
+                        help="DNS gate retry count for timeout/resolver errors (default=2)")
     parser.add_argument("--dns-max-workers", type=_positive_int, default=None,
                         help="Optional fixed DNS gate worker count (default=adaptive)")
+    parser.add_argument("--stage1-escalate-total-threshold", type=_non_negative_int, default=None,
+                        help="Override Stage1 HTTP escalate_total_threshold (default=config)")
+    parser.add_argument("--stage1-brand-min", type=_non_negative_int, default=None,
+                        help="Override Stage1 HTTP brand_min (default=config)")
+    parser.add_argument("--stage1-credential-min", type=_non_negative_int, default=None,
+                        help="Override Stage1 HTTP credential_min (default=config)")
+    parser.add_argument("--stage1-low-band-min", type=_non_negative_int, default=None,
+                        help="Override Stage1 HTTP low_band_min (default=config)")
+    parser.add_argument("--stage1-hard-trigger-brand-min", type=_non_negative_int, default=None,
+                        help="Override Stage1 HTTP hard_trigger_brand_min (default=config)")
+    parser.add_argument("--keep-stage1-suspected", action="store_true",
+                        help="Keep Stage1 suspected_non_escalated rows as weak holdout candidates")
+    parser.add_argument("--keep-dns-rejected-strict-lexical", action="store_true",
+                        help="Keep strict-lexical DNS rejected rows as weak holdout candidates")
+    parser.add_argument("--keep-fetch-failed-strict-lexical", action="store_true",
+                        help="Keep strict-lexical fetch failed/timeout rows as weak holdout candidates")
+    parser.add_argument("--failed-fetch-suspected-min", type=_probability_float, default=None,
+                        help="Lexical score rescue threshold for Suspected on non-fetched strict-lexical rows")
+    parser.add_argument("--failed-fetch-review-min", type=_probability_float, default=None,
+                        help="Lexical score rescue threshold for REVIEW_ONLY on non-fetched strict-lexical rows")
     parser.add_argument("--weight-domain", type=_non_negative_float, default=30.0,
                         help="Weight for domain similarity score contribution (default=30)")
     parser.add_argument("--weight-screenshot", type=_non_negative_float, default=20.0,
-                        help="Weight for CLIP screenshot similarity contribution (default=20)")
+                        help="Deprecated compatibility no-op. Screenshot/CLIP routing weight is ignored.")
     parser.add_argument("--weight-favicon", type=_non_negative_float, default=14.0,
                         help="Weight for favicon hash exact-match contribution (default=14)")
     parser.add_argument("--weight-ssl-hash", type=_non_negative_float, default=12.0,
@@ -244,6 +267,17 @@ async def main():
         raise ValueError("high-confidence-threshold must be >= medium-confidence-threshold")
     if args.dns_timeout <= 0:
         raise ValueError("dns-timeout must be > 0")
+    if (
+        args.failed_fetch_suspected_min is not None
+        and args.failed_fetch_review_min is not None
+        and args.failed_fetch_suspected_min < args.failed_fetch_review_min
+    ):
+        raise ValueError("failed-fetch-suspected-min must be >= failed-fetch-review-min")
+    logger.info(
+        "Deprecated CLI compatibility | clip_margin_min=%.3f ignored | weight_screenshot=%.3f ignored",
+        args.clip_margin_min,
+        args.weight_screenshot,
+    )
 
     # ✅ Ensure whitelist file exists
     if not os.path.exists(args.whitelist):
@@ -284,6 +318,8 @@ async def main():
             os.path.join("output", "hash_review_queue.csv"),
             os.path.join("output", "checkpoint_records.csv"),
             os.path.join("output", "stage1_lexical_debug.csv"),
+            os.path.join("output", "stage1_methods_debug.csv"),
+            os.path.join("output", "stage1_deep_analysis_candidates.csv"),
             os.path.join("output", "stage2_model_debug.csv"),
             os.path.join("output", "stage3_classification_debug.csv"),
             os.path.join("output", "parked_page_exclusions.csv"),
@@ -303,12 +339,42 @@ async def main():
             logger.info("Processing ALL whitelisted domains...")
         if args.target_limit is not None:
             logger.info("Limiting shortlist input to first %d target URLs...", args.target_limit)
+        effective_stage1_thresholds = {
+            "escalate_total_threshold": (
+                args.stage1_escalate_total_threshold
+                if args.stage1_escalate_total_threshold is not None
+                else stage1_http_config.get("escalate_total_threshold", "NA")
+            ),
+            "brand_min": (
+                args.stage1_brand_min
+                if args.stage1_brand_min is not None
+                else stage1_http_config.get("brand_min", "NA")
+            ),
+            "credential_min": (
+                args.stage1_credential_min
+                if args.stage1_credential_min is not None
+                else stage1_http_config.get("credential_min", "NA")
+            ),
+            "low_band_min": (
+                args.stage1_low_band_min
+                if args.stage1_low_band_min is not None
+                else stage1_http_config.get("low_band_min", "NA")
+            ),
+            "hard_trigger_brand_min": (
+                args.stage1_hard_trigger_brand_min
+                if args.stage1_hard_trigger_brand_min is not None
+                else stage1_http_config.get("hard_trigger_brand_min", "NA")
+            ),
+        }
         logger.info(
             "Runtime mode=%s | shortlist threshold=%.3f domain_sim_threshold=%.3f "
             "confidence_bands={high>=%.3f, medium>=%.3f} "
-            "typo={top_k=%d,min_score=%.3f,lexical_pass_min_score=%.3f,clip_margin_min=%.3f} "
+            "typo={top_k=%d,min_score=%.3f,lexical_pass_min_score=%.3f} "
             "dns={timeout=%.2f,retries=%d,max_workers=%s} "
-            "weights={domain=%.3f,screenshot=%.3f,favicon=%.3f,ssl_hash=%.3f,html_hash=%.3f,domain_hash=%.3f,keywords=%.3f} "
+            "stage1_http={url_concurrency=%s,http=%s,dns=%s,rdap=%s,tls=%s,max_html_bytes=%s,max_redirects=%s,escalate_total=%s,brand_min=%s,credential_min=%s,low_band_min=%s,hard_trigger_brand_min=%s} "
+            "recall_passthroughs={stage1_suspected=%s,dns_rejected_strict_lexical=%s,fetch_failed_strict_lexical=%s} "
+            "failed_fetch_rescue={suspected_min=%s,review_min=%s} "
+            "weights={domain=%.3f,favicon=%.3f,ssl_hash=%.3f,html_hash=%.3f,domain_hash=%.3f,keywords=%.3f} "
             "stage_smoke_test=%s shortlist_debug_csv=%s",
             args.pipeline_mode,
             args.hashing_threshold,
@@ -318,12 +384,27 @@ async def main():
             args.typo_top_k,
             args.typo_min_score,
             args.lexical_pass_min_score,
-            args.clip_margin_min,
             args.dns_timeout,
             args.dns_retries,
             args.dns_max_workers if args.dns_max_workers is not None else "adaptive",
+            stage1_http_config.get("concurrency", "NA"),
+            stage1_http_config.get("http_concurrency", "NA"),
+            stage1_http_config.get("dns_concurrency", "NA"),
+            stage1_http_config.get("rdap_concurrency", "NA"),
+            stage1_http_config.get("tls_concurrency", "NA"),
+            stage1_http_config.get("max_html_bytes", "NA"),
+            stage1_http_config.get("max_redirects", "NA"),
+            effective_stage1_thresholds["escalate_total_threshold"],
+            effective_stage1_thresholds["brand_min"],
+            effective_stage1_thresholds["credential_min"],
+            effective_stage1_thresholds["low_band_min"],
+            effective_stage1_thresholds["hard_trigger_brand_min"],
+            args.keep_stage1_suspected,
+            args.keep_dns_rejected_strict_lexical,
+            args.keep_fetch_failed_strict_lexical,
+            args.failed_fetch_suspected_min if args.failed_fetch_suspected_min is not None else "off",
+            args.failed_fetch_review_min if args.failed_fetch_review_min is not None else "off",
             args.weight_domain,
-            args.weight_screenshot,
             args.weight_favicon,
             args.weight_ssl_hash,
             args.weight_html_hash,
@@ -361,15 +442,30 @@ async def main():
                     dns_retries=args.dns_retries,
                     dns_max_workers=args.dns_max_workers,
                     shortlist_debug_csv=args.shortlist_debug_csv,
+                    stage1_escalate_total_threshold=args.stage1_escalate_total_threshold,
+                    stage1_brand_min=args.stage1_brand_min,
+                    stage1_credential_min=args.stage1_credential_min,
+                    stage1_low_band_min=args.stage1_low_band_min,
+                    stage1_hard_trigger_brand_min=args.stage1_hard_trigger_brand_min,
+                    keep_stage1_suspected=args.keep_stage1_suspected,
+                    keep_dns_rejected_strict_lexical=args.keep_dns_rejected_strict_lexical,
+                    keep_fetch_failed_strict_lexical=args.keep_fetch_failed_strict_lexical,
+                    failed_fetch_suspected_min=args.failed_fetch_suspected_min,
+                    failed_fetch_review_min=args.failed_fetch_review_min,
                 )
                 logger.info("--- Finished Stage Smoke Test classify ---")
             else:
             # 1. Run Shortlisting using phishing_pipeline.comparison
                 logger.info("--- Starting Step 1: Running Hashing-based Shortlisting ---")
-                urls = shortlisting.load_urls_from_excel_folder(
+                url_records = shortlisting.load_url_records_from_excel_folder(
                     args.shortlisting,
                     limit=args.target_limit,
                 )
+                urls = [record["url"] for record in url_records]
+                url_sources = {
+                    record["url"]: record.get("source_workbooks", [])
+                    for record in url_records
+                }
                 shortlist_weights = {
                     "domain": args.weight_domain,
                     "screenshot": args.weight_screenshot,
@@ -395,6 +491,15 @@ async def main():
                     dns_max_workers=args.dns_max_workers,
                     weights=shortlist_weights,
                     shortlist_debug_csv=args.shortlist_debug_csv,
+                    url_sources=url_sources,
+                    keep_stage1_suspected=args.keep_stage1_suspected,
+                    keep_dns_rejected_strict_lexical=args.keep_dns_rejected_strict_lexical,
+                    keep_fetch_failed_strict_lexical=args.keep_fetch_failed_strict_lexical,
+                    stage1_escalate_total_threshold=args.stage1_escalate_total_threshold,
+                    stage1_brand_min=args.stage1_brand_min,
+                    stage1_credential_min=args.stage1_credential_min,
+                    stage1_low_band_min=args.stage1_low_band_min,
+                    stage1_hard_trigger_brand_min=args.stage1_hard_trigger_brand_min,
                 )
                 
                 # Save output to holdout.csv
@@ -430,6 +535,16 @@ async def main():
                     dns_retries=args.dns_retries,
                     dns_max_workers=args.dns_max_workers,
                     shortlist_debug_csv=args.shortlist_debug_csv,
+                    stage1_escalate_total_threshold=args.stage1_escalate_total_threshold,
+                    stage1_brand_min=args.stage1_brand_min,
+                    stage1_credential_min=args.stage1_credential_min,
+                    stage1_low_band_min=args.stage1_low_band_min,
+                    stage1_hard_trigger_brand_min=args.stage1_hard_trigger_brand_min,
+                    keep_stage1_suspected=args.keep_stage1_suspected,
+                    keep_dns_rejected_strict_lexical=args.keep_dns_rejected_strict_lexical,
+                    keep_fetch_failed_strict_lexical=args.keep_fetch_failed_strict_lexical,
+                    failed_fetch_suspected_min=args.failed_fetch_suspected_min,
+                    failed_fetch_review_min=args.failed_fetch_review_min,
                 )
                 
                 logger.info("--- Finished Step 2: Main Pipeline Complete ---")
@@ -456,6 +571,16 @@ async def main():
                     dns_retries=args.dns_retries,
                     dns_max_workers=args.dns_max_workers,
                     shortlist_debug_csv=args.shortlist_debug_csv,
+                    stage1_escalate_total_threshold=args.stage1_escalate_total_threshold,
+                    stage1_brand_min=args.stage1_brand_min,
+                    stage1_credential_min=args.stage1_credential_min,
+                    stage1_low_band_min=args.stage1_low_band_min,
+                    stage1_hard_trigger_brand_min=args.stage1_hard_trigger_brand_min,
+                    keep_stage1_suspected=args.keep_stage1_suspected,
+                    keep_dns_rejected_strict_lexical=args.keep_dns_rejected_strict_lexical,
+                    keep_fetch_failed_strict_lexical=args.keep_fetch_failed_strict_lexical,
+                    failed_fetch_suspected_min=args.failed_fetch_suspected_min,
+                    failed_fetch_review_min=args.failed_fetch_review_min,
                 )
             except TypeError:
                 df_out = await run_pipeline(args.shortlisting, args.whitelist, args.limit)
@@ -502,4 +627,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-

@@ -258,6 +258,54 @@ STAGE2_MODEL_DEBUG_PATH = os.path.join(ROOT_DIR, "output", "stage2_model_debug.c
 STAGE3_CLASSIFICATION_DEBUG_PATH = os.path.join(ROOT_DIR, "output", "stage3_classification_debug.csv")
 # --- (End of Fix 1) ---
 
+_STAGE1_DEBUG_COMPAT_FIELDS = (
+    "lexical_hit",
+    "brand_score",
+    "credential_score",
+    "infra_score",
+    "evasion_score",
+    "total_stage1_score",
+    "hard_trigger_hit",
+    "stage1_reasons",
+    "page_has_password_field",
+    "page_has_login_form",
+    "form_action_mismatch",
+    "csc_mention_count",
+    "redirect_count",
+    "final_domain",
+    "favicon_domain",
+    "html_bytes_read",
+    "escalate_to_hashing",
+    "escalate_reason",
+)
+
+
+def _stage1_debug_compat_payload(row: dict) -> dict:
+    defaults = {
+        "lexical_hit": False,
+        "brand_score": 0,
+        "credential_score": 0,
+        "infra_score": 0,
+        "evasion_score": 0,
+        "total_stage1_score": 0,
+        "hard_trigger_hit": False,
+        "stage1_reasons": "",
+        "page_has_password_field": False,
+        "page_has_login_form": False,
+        "form_action_mismatch": False,
+        "csc_mention_count": 0,
+        "redirect_count": 0,
+        "final_domain": "",
+        "favicon_domain": "",
+        "html_bytes_read": 0,
+        "escalate_to_hashing": False,
+        "escalate_reason": "",
+    }
+    return {
+        field: row.get(field, defaults[field])
+        for field in _STAGE1_DEBUG_COMPAT_FIELDS
+    }
+
 warnings.filterwarnings("ignore", message=".*pin_memory.*")
 
 # ------------------------------------------------------------------
@@ -708,16 +756,54 @@ def reclassify_label(domain, registrar, host, dns, ocr_text_from_csv, tvc_brand_
     return "Legitimate"
 
 
+# Override the legacy helper above with the current precision-first policy.
+def reclassify_label(domain, registrar, host, dns, ocr_text_from_csv, tvc_brand_spoofed=False):
+    """
+    Precision-first reclassification used by the current pipeline.
+    TVC spoofing is suspicious supporting evidence, not a direct phishing
+    override. Final phishing escalation is handled by the Stage 3 hybrid gate.
+    """
+    reg = str(registrar or "").lower()
+    hst = str(host or "").lower()
+    dns_str = str(dns or "").lower()
+    dom = str(domain or "").lower()
+    ocr_text = str(ocr_text_from_csv or "").lower()
+
+    ssl_present = "ssl" in dns_str or "tls" in dns_str
+
+    if tvc_brand_spoofed:
+        return "Suspected"
+
+    brand_hit_domain = any(b in dom for b in BRAND_KEYWORDS)
+    brand_hit_ocr = any(b in ocr_text for b in BRAND_KEYWORDS)
+    brand_hit = brand_hit_domain or brand_hit_ocr
+
+    if brand_hit:
+        if (any(r in reg for r in TRUSTED_REGISTRARS) or any(h in hst for h in TRUSTED_HOSTS)) and ssl_present:
+            return "Legitimate"
+        return "Suspected"
+
+    if any(r in reg for r in SUSPICIOUS_REGISTRARS) or any(h in hst for h in SUSPICIOUS_HOSTS):
+        return "Suspected"
+
+    if reg == "na" and hst == "na":
+        return "Suspected"
+
+    return "Legitimate"
+
+
 def _detect_stored_parked_page(row: dict) -> dict:
-    domain_url = str(row.get("Identified Phishing/Suspected Domain Name", "") or "").strip()
-    final_landing_url = str(row.get("final_landing_url", "") or "").strip()
-    stored_provider = str(row.get("parking_provider", "") or "").strip()
-    stored_reason = str(row.get("parking_reason", "") or "").strip()
-    if stored_provider or stored_reason:
+    domain_url = _normalize_replayed_text(row.get("Identified Phishing/Suspected Domain Name", ""))
+    final_landing_url = _normalize_replayed_text(row.get("final_landing_url", ""))
+    stored_provider = _normalize_replayed_text(row.get("parking_provider", ""))
+    stored_reason = _normalize_replayed_text(row.get("parking_reason", ""))
+    placeholder_reason = _normalize_replayed_text(row.get("placeholder_or_parking_reason", ""))
+    effective_reason = stored_reason or placeholder_reason
+    if stored_provider or effective_reason:
         return {
             "is_parked": True,
             "parking_provider": stored_provider or "GenericParking",
-            "parking_reason": stored_reason or "stored_parking_signal",
+            "parking_reason": effective_reason or "stored_parking_signal",
             "final_landing_url": final_landing_url or domain_url,
             "matched_signals": [],
         }
@@ -816,6 +902,67 @@ def _as_bool_flag(value) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "y"}
 
 
+_REPLAY_EMPTY_TEXT_VALUES = {"", "nan", "none", "null", "na"}
+
+
+def _normalize_replayed_text(value) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    text = str(value).strip()
+    if text.lower() in _REPLAY_EMPTY_TEXT_VALUES:
+        return ""
+    return text
+
+
+def _normalize_replayed_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    for column in columns:
+        if column in df.columns:
+            df[column] = df[column].map(_normalize_replayed_text)
+    return df
+
+
+_REVIEW_QUEUE_KEY_COLUMNS = [
+    "Identified Phishing/Suspected Domain Name",
+    "Cooresponding CSE",
+    "Legitimate Domains",
+]
+
+
+def _read_existing_review_queue(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _merge_review_queue_frames(*frames: pd.DataFrame) -> pd.DataFrame:
+    usable_frames = [frame.copy() for frame in frames if isinstance(frame, pd.DataFrame) and not frame.empty]
+    if not usable_frames:
+        return pd.DataFrame()
+    merged = pd.concat(usable_frames, ignore_index=True, sort=False)
+    if "review_reason" not in merged.columns:
+        merged["review_reason"] = ""
+    dedupe_columns = [column for column in _REVIEW_QUEUE_KEY_COLUMNS if column in merged.columns]
+    if dedupe_columns:
+        merged = merged.drop_duplicates(subset=dedupe_columns, keep="last")
+    return merged
+
+
+def _write_hash_review_queue(review_df: pd.DataFrame) -> pd.DataFrame:
+    os.makedirs(os.path.dirname(HASH_REVIEW_QUEUE_PATH), exist_ok=True)
+    output_df = review_df.copy() if isinstance(review_df, pd.DataFrame) else pd.DataFrame()
+    output_df.to_csv(HASH_REVIEW_QUEUE_PATH, index=False, encoding="utf-8")
+    logger.info("Hash review queue written to %s (%d rows)", HASH_REVIEW_QUEUE_PATH, len(output_df))
+    return output_df
+
+
 def _safe_predict_top1(model, x_sc, classes) -> tuple[str, float]:
     if model is None or x_sc is None:
         return "NA", 0.0
@@ -905,6 +1052,9 @@ async def _extract_hash_only_ocr_tvc(
             "tvc_domain_match": False,
             "tvc_fuzzy_score": 0.0,
             "tvc_brand_spoofed": False,
+            "tvc_match_surface": "none",
+            "tvc_matched_alias": "",
+            "tvc_spoof_strong": False,
         }
 
     from .utils import _safe_preprocess_image, _safe_run_ocr, extract_tvc_features
@@ -946,7 +1096,126 @@ async def _extract_hash_only_ocr_tvc(
                 "tvc_domain_match": False,
                 "tvc_fuzzy_score": 0.0,
                 "tvc_brand_spoofed": False,
+                "tvc_match_surface": "none",
+                "tvc_matched_alias": "",
+                "tvc_spoof_strong": False,
             }
+
+
+def _hybrid_hash_decision(
+    row: dict,
+    registrar,
+    hosting_isp,
+    dns_records,
+    ocr_text_from_csv="",
+    tvc_brand_spoofed=False,
+    tvc_brand_spoof_strong=False,
+    brand_model_agrees: bool = False,
+    domain_model_agrees: bool = False,
+    brand_model_confidence: float = 0.0,
+    domain_model_confidence: float = 0.0,
+    failed_fetch_suspected_min: float | None = None,
+    failed_fetch_review_min: float | None = None,
+):
+    lexical_rule_hit = _as_bool_flag(row.get("lexical_rule_hit"))
+    brand_token_hit = _as_bool_flag(row.get("brand_token_hit"))
+    old_fuzzy_hit = _as_bool_flag(row.get("old_fuzzy_hit"))
+    hybrid_lexical_hit = _as_bool_flag(row.get("hybrid_lexical_hit"))
+    strict_lexical_hit = _as_bool_flag(row.get("strict_lexical_hit")) or lexical_rule_hit or brand_token_hit or old_fuzzy_hit or hybrid_lexical_hit
+    lexical_score_pass = _as_bool_flag(row.get("lexical_score_pass"))
+    fallback_rank_only = _as_bool_flag(row.get("fallback_rank_only"))
+    stage1_passthrough = _as_bool_flag(row.get("stage1_passthrough")) or "stage1_suspected_passthrough" in str(row.get("admission_path", "") or "")
+    fetch_status = str(row.get("fetch_status", "fetched") or "fetched").strip().lower()
+    fetched = fetch_status in {"fetched", "fetched_visual_missing"}
+    parking_reason = _normalize_replayed_text(
+        row.get("placeholder_or_parking_reason")
+        or row.get("parking_reason")
+        or ""
+    )
+
+    decision = {
+        "classification": "Legitimate",
+        "emit_output": False,
+        "classification_gate_reason": "",
+        "review_only_reason": "",
+        "non_lexical_corroboration_count": 0,
+    }
+
+    if parking_reason:
+        decision["classification"] = "SKIPPED_PARKING_OR_PLACEHOLDER"
+        decision["classification_gate_reason"] = "parking_or_placeholder_excluded"
+        decision["review_only_reason"] = parking_reason
+        return decision
+
+    if fallback_rank_only and not strict_lexical_hit and not stage1_passthrough:
+        decision["classification_gate_reason"] = "fallback_rank_only_without_strict_lexical"
+        return decision
+
+    lexical_survivor = bool(strict_lexical_hit or lexical_score_pass or stage1_passthrough)
+    if not lexical_survivor:
+        decision["classification_gate_reason"] = "no_lexical_gate"
+        return decision
+
+    if not fetched:
+        lexical_score = _coerce_numeric_feature(row.get("lexical_score"), default=0.0)
+        if strict_lexical_hit and not fallback_rank_only:
+            if failed_fetch_suspected_min is not None and lexical_score >= float(failed_fetch_suspected_min):
+                decision["classification"] = "Suspected"
+                decision["emit_output"] = True
+                decision["classification_gate_reason"] = "failed_fetch_strict_lexical_rescue"
+                return decision
+            if failed_fetch_review_min is not None and lexical_score >= float(failed_fetch_review_min):
+                decision["classification"] = "REVIEW_ONLY"
+                decision["classification_gate_reason"] = "failed_fetch_strict_lexical_review"
+                decision["review_only_reason"] = "failed_fetch_strict_lexical_review"
+                return decision
+        decision["classification_gate_reason"] = "invalid_fetch_state_without_direct_evidence"
+        return decision
+
+    hash_anchor = _as_bool_flag(row.get("hash_anchor"))
+    clip_anchor = _as_bool_flag(row.get("clip_anchor"))
+    clip_corroborated = bool(_as_bool_flag(row.get("clip_corroborated")) and clip_anchor)
+    keyword_hit = _as_bool_flag(row.get("signal_hit_keywords"))
+    try:
+        direct_brand_evidence_count = int(row.get("direct_brand_evidence_count", 0) or 0)
+    except (TypeError, ValueError):
+        direct_brand_evidence_count = 0
+    tvc_spoof_strong = bool(_as_bool_flag(row.get("tvc_brand_spoof_strong")) or tvc_brand_spoof_strong)
+    weak_tvc_spoof = bool(tvc_brand_spoofed) and not tvc_spoof_strong
+    strong_direct_evidence = bool(hash_anchor or tvc_spoof_strong or clip_corroborated)
+    weak_direct_evidence = bool(
+        strong_direct_evidence
+        or weak_tvc_spoof
+        or direct_brand_evidence_count > 0
+        or keyword_hit
+    )
+    non_lexical_corroborators = [
+        hash_anchor,
+        clip_corroborated,
+        tvc_spoof_strong,
+        weak_tvc_spoof,
+        direct_brand_evidence_count > 0,
+        keyword_hit,
+    ]
+    non_lexical_corroboration_count = sum(1 for flag in non_lexical_corroborators if flag)
+    decision["non_lexical_corroboration_count"] = non_lexical_corroboration_count
+
+    if strict_lexical_hit and strong_direct_evidence:
+        decision["classification"] = "Phishing"
+        decision["emit_output"] = True
+        decision["classification_gate_reason"] = "strict_lexical_plus_direct_evidence"
+        return decision
+
+    if lexical_survivor and weak_direct_evidence:
+        decision["classification"] = "Suspected"
+        decision["emit_output"] = True
+        decision["classification_gate_reason"] = "lexical_gate_plus_weak_direct_evidence"
+        return decision
+
+    decision["classification"] = "Legitimate"
+    decision["emit_output"] = True
+    decision["classification_gate_reason"] = "lexical_without_direct_evidence"
+    return decision
 
 
 def _hybrid_hash_classification(
@@ -956,104 +1225,29 @@ def _hybrid_hash_classification(
     dns_records,
     ocr_text_from_csv="",
     tvc_brand_spoofed=False,
+    tvc_brand_spoof_strong=False,
     brand_model_agrees: bool = False,
     domain_model_agrees: bool = False,
     brand_model_confidence: float = 0.0,
     domain_model_confidence: float = 0.0,
 ):
-    lexical_rule_hit = _as_bool_flag(row.get("lexical_rule_hit"))
-    brand_token_hit = _as_bool_flag(row.get("brand_token_hit"))
-    old_fuzzy_hit = _as_bool_flag(row.get("old_fuzzy_hit"))
-    hybrid_lexical_hit = _as_bool_flag(row.get("hybrid_lexical_hit"))
-    strict_lexical_hit = _as_bool_flag(row.get("strict_lexical_hit")) or lexical_rule_hit or brand_token_hit or old_fuzzy_hit or hybrid_lexical_hit
-    lexical_score_pass = _as_bool_flag(row.get("lexical_score_pass"))
-    fallback_rank_only = _as_bool_flag(row.get("fallback_rank_only"))
-    fetch_status = str(row.get("fetch_status", "fetched") or "fetched").strip().lower()
-    fetched = fetch_status == "fetched"
-
-    if fallback_rank_only and not strict_lexical_hit:
-        return "Legitimate"
-
-    if not strict_lexical_hit and not lexical_score_pass:
-        return "Legitimate"
-
-    confidence_band = str(row.get("confidence_band", "Low") or "Low")
-    hash_anchor = _as_bool_flag(row.get("hash_anchor"))
-    clip_anchor = _as_bool_flag(row.get("clip_anchor"))
-    domain_hit = _as_bool_flag(row.get("signal_hit_domain"))
-    keyword_hit = _as_bool_flag(row.get("signal_hit_keywords"))
-    typo_anchor = _as_bool_flag(row.get("typo_anchor"))
-    suspicious_infra = _is_suspicious_infra(registrar, hosting_isp)
-    trusted_infra = _is_trusted_infra(registrar, hosting_isp)
-    infra_unknown = str(registrar or "").strip().upper() == "NA" or str(hosting_isp or "").strip().upper() == "NA"
-    lexical_score = pd.to_numeric(pd.Series([row.get("lexical_score", 0.0)]), errors="coerce").fillna(0.0).iloc[0]
-    lexical_strong = lexical_score >= 0.85 or typo_anchor or old_fuzzy_hit
-    brand_aligned_clip = bool(clip_anchor and strict_lexical_hit)
-
-    base_label = reclassify_label(
-        row.get("Identified Phishing/Suspected Domain Name", ""),
-        registrar,
-        hosting_isp,
-        dns_records,
-        ocr_text_from_csv,
-        tvc_brand_spoofed=bool(tvc_brand_spoofed),
+    decision = _hybrid_hash_decision(
+        row,
+        registrar=registrar,
+        hosting_isp=hosting_isp,
+        dns_records=dns_records,
+        ocr_text_from_csv=ocr_text_from_csv,
+        tvc_brand_spoofed=tvc_brand_spoofed,
+        tvc_brand_spoof_strong=tvc_brand_spoof_strong,
+        brand_model_agrees=brand_model_agrees,
+        domain_model_agrees=domain_model_agrees,
+        brand_model_confidence=brand_model_confidence,
+        domain_model_confidence=domain_model_confidence,
     )
-    model_support = bool(brand_model_agrees or domain_model_agrees)
-    model_contradiction = bool(
-        (brand_model_confidence >= 0.75 and not brand_model_agrees)
-        or (domain_model_confidence >= 0.75 and not domain_model_agrees)
-    )
-    strong_corroborator = bool(hash_anchor or tvc_brand_spoofed or brand_aligned_clip)
-    suspicious_or_mismatched = bool(suspicious_infra or infra_unknown or model_contradiction or base_label == "Phishing")
-
-    if not fetched:
-        if (
-            suspicious_infra
-            or domain_hit
-            or keyword_hit
-            or bool(tvc_brand_spoofed)
-            or brand_aligned_clip
-            or hash_anchor
-            or clip_anchor
-            or model_support
-        ):
-            return "Suspected"
+    classification = str(decision.get("classification", "Legitimate"))
+    if classification in {"REVIEW_ONLY", "SKIPPED_PARKING_OR_PLACEHOLDER"}:
         return "Legitimate"
-
-    if strict_lexical_hit and strong_corroborator and suspicious_or_mismatched:
-        return "Phishing"
-
-    contradiction_strong = (
-        trusted_infra
-        and not suspicious_infra
-        and not infra_unknown
-        and not hash_anchor
-        and not domain_hit
-        and not keyword_hit
-        and not bool(tvc_brand_spoofed)
-        and not brand_aligned_clip
-        and not model_contradiction
-        and base_label == "Legitimate"
-    )
-    if contradiction_strong:
-        return "Legitimate"
-
-    if strict_lexical_hit and (
-        suspicious_infra
-        or infra_unknown
-        or domain_hit
-        or keyword_hit
-        or brand_aligned_clip
-        or bool(tvc_brand_spoofed)
-        or model_support
-        or base_label in {"Phishing", "Suspected"}
-    ):
-        return "Suspected"
-
-    if lexical_score_pass and (suspicious_infra or infra_unknown or domain_hit or keyword_hit or model_support):
-        return "Suspected"
-
-    return "Legitimate"
+    return classification
 
 
 async def _run_hash_only_pipeline(
@@ -1061,9 +1255,18 @@ async def _run_hash_only_pipeline(
     whois_rate_limiter: RateLimiter,
     high_confidence_threshold: float,
     medium_confidence_threshold: float,
+    failed_fetch_suspected_min: float | None = None,
+    failed_fetch_review_min: float | None = None,
 ):
     df_filtered = df_filtered.copy()
-    os.makedirs(os.path.dirname(HASH_REVIEW_QUEUE_PATH), exist_ok=True)
+    df_filtered = _normalize_replayed_columns(
+        df_filtered,
+        ["parking_provider", "parking_reason", "placeholder_or_parking_reason", "final_landing_url"],
+    )
+    filtered_output_path = FINAL_OUTPUT.replace(".csv", "_filtered.csv")
+    existing_review_df = _read_existing_review_queue(HASH_REVIEW_QUEUE_PATH)
+    eligible_fetch_statuses = {"fetched", "fetched_visual_missing"}
+    logger.info("Hash-only input after whitelist filtering: %d shortlisted rows", len(df_filtered))
     if "hash_score" not in df_filtered.columns:
         df_filtered["hash_score"] = 0.0
     df_filtered["hash_score"] = pd.to_numeric(df_filtered["hash_score"], errors="coerce").fillna(0.0)
@@ -1082,10 +1285,12 @@ async def _run_hash_only_pipeline(
     df_filtered["review_reason"] = [
         "fetch_failed_lexical_hit"
         if str(row.get("fetch_status", "")).strip().lower() in {"failed", "timeout"} and _as_bool_flag(row.get("strict_lexical_hit"))
-        else "low_confidence_strict_lexical"
-        if _as_bool_flag(row.get("strict_lexical_hit"))
         else "low_confidence_hash_bypass"
         if _as_bool_flag(row.get("hash_anchor"))
+        else "low_confidence_clip_anchor"
+        if _as_bool_flag(row.get("clip_anchor"))
+        else "low_confidence_strict_lexical"
+        if _as_bool_flag(row.get("strict_lexical_hit"))
         else "low_confidence_lexical_score_pass"
         if _as_bool_flag(row.get("lexical_score_pass"))
         else "low_confidence_admitted"
@@ -1093,18 +1298,28 @@ async def _run_hash_only_pipeline(
     ]
 
     low_conf_df = df_filtered[df_filtered["confidence_band"] == "Low"].copy()
-    low_conf_df.to_csv(HASH_REVIEW_QUEUE_PATH, index=False, encoding="utf-8")
-    logger.info("Hash review queue written to %s (%d rows)", HASH_REVIEW_QUEUE_PATH, len(low_conf_df))
 
     classified_df = df_filtered.copy()
+    non_fetched_count = int(
+        (~classified_df.get(
+            "fetch_status",
+            pd.Series(["fetched"] * len(classified_df), index=classified_df.index),
+        ).astype(str).str.strip().str.lower().isin(eligible_fetch_statuses)).sum()
+    )
     total_domains = len(classified_df)
-    logger.info("Hash-only mode will classify %d shortlisted rows", total_domains)
+    logger.info(
+        "Hash-only mode will classify %d shortlisted rows (%d non-fetched candidates included for possible rescue)",
+        total_domains,
+        non_fetched_count,
+    )
 
     if classified_df.empty:
         empty_df = pd.DataFrame(columns=_submission_record_columns())
         empty_df.to_csv(FINAL_OUTPUT, index=False, encoding="utf-8")
+        empty_df.to_csv(filtered_output_path, index=False, encoding="utf-8")
         _write_debug_csv([], STAGE2_MODEL_DEBUG_PATH)
         _write_debug_csv([], STAGE3_CLASSIFICATION_DEBUG_PATH)
+        _write_hash_review_queue(_merge_review_queue_frames(existing_review_df, low_conf_df))
         logger.info("No shortlisted rows to classify. Final output written as empty schema CSV.")
         return empty_df
 
@@ -1123,6 +1338,7 @@ async def _run_hash_only_pipeline(
         logger.warning("Supporting models unavailable for hash-only validation: %s", exc)
 
     records = []
+    review_queue_records = []
     stage2_model_debug_records = []
     stage3_classification_debug_records = []
     records_lock = asyncio.Lock()
@@ -1142,12 +1358,16 @@ async def _run_hash_only_pipeline(
         host = host.split(":")[0]
         screenshot_path = str(row.get("screenshot_path", "") or "").strip()
         fetch_status = str(row.get("fetch_status", "fetched") or "fetched").strip().lower()
+        source_workbook = str(row.get("source_workbook", "") or "")
+        confidence_band = row.get("confidence_band", "Low")
+        evidence_tier = _normalize_evidence_tier(row)
         stored_parking = _detect_stored_parked_page(row)
         if stored_parking["is_parked"]:
             async with records_lock:
                 stage2_model_debug_records.append(
                     {
                         "url": domain_url,
+                        "source_workbook": source_workbook,
                         "shortlisted_cse": row.get("Cooresponding CSE", ""),
                         "shortlisted_domain": row.get("Legitimate Domains", ""),
                         "fetch_status": fetch_status,
@@ -1162,18 +1382,22 @@ async def _run_hash_only_pipeline(
                         "model_domain_agrees_with_shortlist": False,
                         "model_feature_status": "skipped_parked_page",
                         "model_input_error": stored_parking.get("parking_reason", ""),
+                        "model_usable": False,
+                        **_stage1_debug_compat_payload(row),
                     }
                 )
                 stage3_classification_debug_records.append(
                     {
                         "url": domain_url,
+                        "source_workbook": source_workbook,
                         "shortlisted_cse": row.get("Cooresponding CSE", ""),
                         "shortlisted_domain": row.get("Legitimate Domains", ""),
                         "fetch_status": fetch_status,
                         "final_landing_url": stored_parking.get("final_landing_url", ""),
                         "parking_provider": stored_parking.get("parking_provider", ""),
                         "parking_reason": stored_parking.get("parking_reason", ""),
-                        "classification": "SKIPPED_PARKED_PAGE",
+                        "placeholder_or_parking_reason": stored_parking.get("parking_reason", ""),
+                        "classification": "SKIPPED_PARKING_OR_PLACEHOLDER",
                         "confidence_band": row.get("confidence_band", "Low"),
                         "evidence_tier": row.get("evidence_tier", ""),
                         "lexical_score": row.get("lexical_score", 0.0),
@@ -1186,9 +1410,16 @@ async def _run_hash_only_pipeline(
                         "typo_anchor": row.get("typo_anchor", False),
                         "hash_anchor": row.get("hash_anchor", False),
                         "clip_anchor": row.get("clip_anchor", False),
+                        "generic_token_only_match": row.get("generic_token_only_match", False),
+                        "direct_brand_evidence_count": row.get("direct_brand_evidence_count", 0),
+                        "clip_corroborated": row.get("clip_corroborated", False),
+                        "stage1_passthrough": row.get("stage1_passthrough", False),
                         "tvc_brand_detected": False,
                         "tvc_detected_brand": "none",
                         "tvc_brand_spoofed": False,
+                        "tvc_match_surface": "none",
+                        "tvc_matched_alias": "",
+                        "tvc_spoof_strong": False,
                         "ocr_text_len": 0,
                         "registrar": "NA",
                         "hosting_isp": "NA",
@@ -1202,6 +1433,159 @@ async def _run_hash_only_pipeline(
                         "model_domain_agrees_with_shortlist": False,
                         "model_feature_status": "skipped_parked_page",
                         "model_input_error": stored_parking.get("parking_reason", ""),
+                        "model_usable": False,
+                        "classification_gate_reason": "parked_replay_excluded",
+                        "review_only_reason": stored_parking.get("parking_reason", "parking_or_placeholder_excluded"),
+                        "survival_path": "",
+                        "drop_path": "parked_replay_excluded",
+                        "non_lexical_corroboration_count": 0,
+                        **_stage1_debug_compat_payload(row),
+                    }
+                )
+            return
+        if fetch_status not in eligible_fetch_statuses:
+            classification_decision = _hybrid_hash_decision(
+                row,
+                registrar="NA",
+                hosting_isp="NA",
+                dns_records="NA",
+                ocr_text_from_csv="",
+                tvc_brand_spoofed=False,
+                tvc_brand_spoof_strong=False,
+                brand_model_agrees=False,
+                domain_model_agrees=False,
+                brand_model_confidence=0.0,
+                domain_model_confidence=0.0,
+                failed_fetch_suspected_min=failed_fetch_suspected_min,
+                failed_fetch_review_min=failed_fetch_review_min,
+            )
+            classification = str(classification_decision.get("classification", "Legitimate"))
+            emit_output = bool(classification_decision.get("emit_output", False))
+            classification_gate_reason = str(classification_decision.get("classification_gate_reason", "") or "")
+            review_only_reason = str(classification_decision.get("review_only_reason", "") or "")
+            non_lexical_corroboration_count = int(classification_decision.get("non_lexical_corroboration_count", 0) or 0)
+            source_of_detection = adjust_source(
+                row.get("Cooresponding CSE", ""),
+                row.get("Legitimate Domains", ""),
+                "Unknown",
+            )
+            record = None
+            if emit_output:
+                record = {
+                    "Application_ID": APPLICATION_ID,
+                    "Source of detection": source_of_detection,
+                    "Identified Phishing/Suspected Domain Name": domain_url,
+                    "Corresponding CSE Domain Name": row.get("Legitimate Domains", ""),
+                    "Critical Sector Entity Name": row.get("Cooresponding CSE", ""),
+                    "Phishing/Suspected Domains (i.e. Class Label)": classification,
+                    "Domain Registration Date": "NA",
+                    "Registrar Name": "NA",
+                    "Registrant Name or Registrant Organisation": "NA",
+                    "Registrant Country": "NA",
+                    "Name Servers": "NA",
+                    "Hosting IP": "NA",
+                    "Hosting ISP": "NA",
+                    "Hosting Country": "NA",
+                    "DNS Records (if any)": "NA",
+                    "Evidence file name": "NA",
+                    "Date of detection (DD-MM-YYYY)": datetime.now().strftime("%d-%m-%Y"),
+                    "Time of detection (HH-MM-SS)": datetime.now().strftime("%H:%M:%S"),
+                    "Date of Post (If detection is from Source: social media)": "NA",
+                    "Remarks": "weak_or_single_signal_match; NA values are due to privacy issues.",
+                }
+            async with records_lock:
+                if emit_output and record is not None:
+                    records.append(record)
+                    await asyncio.to_thread(_append_record_to_checkpoint, record, CHECKPOINT_CSV)
+                elif classification == "REVIEW_ONLY":
+                    review_row = dict(row)
+                    review_row.update(
+                        {
+                            "review_reason": review_only_reason or "stage3_review_only",
+                            "classification_gate_reason": classification_gate_reason,
+                            "non_lexical_corroboration_count": non_lexical_corroboration_count,
+                            "tvc_match_surface": "none",
+                            "tvc_matched_alias": "",
+                            "tvc_spoof_strong": False,
+                        }
+                    )
+                    review_queue_records.append(review_row)
+                stage2_model_debug_records.append(
+                    {
+                        "url": domain_url,
+                        "source_workbook": source_workbook,
+                        "shortlisted_cse": row.get("Cooresponding CSE", ""),
+                        "shortlisted_domain": row.get("Legitimate Domains", ""),
+                        "fetch_status": fetch_status,
+                        "final_landing_url": row.get("final_landing_url", ""),
+                        "parking_provider": row.get("parking_provider", ""),
+                        "parking_reason": row.get("parking_reason", ""),
+                        "brand_model_top1": "NA",
+                        "brand_model_confidence": 0.0,
+                        "domain_model_top1": "Unknown",
+                        "domain_model_confidence": 0.0,
+                        "model_brand_agrees_with_shortlist": False,
+                        "model_domain_agrees_with_shortlist": False,
+                        "model_feature_status": "skipped_non_fetched_fetch_state",
+                        "model_input_error": classification_gate_reason or fetch_status,
+                        "model_usable": False,
+                        **_stage1_debug_compat_payload(row),
+                    }
+                )
+                stage3_classification_debug_records.append(
+                    {
+                        "url": domain_url,
+                        "source_workbook": source_workbook,
+                        "shortlisted_cse": row.get("Cooresponding CSE", ""),
+                        "shortlisted_domain": row.get("Legitimate Domains", ""),
+                        "fetch_status": fetch_status,
+                        "final_landing_url": row.get("final_landing_url", ""),
+                        "parking_provider": row.get("parking_provider", ""),
+                        "parking_reason": row.get("parking_reason", ""),
+                        "placeholder_or_parking_reason": row.get("placeholder_or_parking_reason", row.get("parking_reason", "")),
+                        "classification": classification,
+                        "confidence_band": confidence_band,
+                        "evidence_tier": evidence_tier,
+                        "lexical_score": row.get("lexical_score", 0.0),
+                        "hash_score": row.get("hash_score", 0.0),
+                        "old_fuzzy_hit": row.get("old_fuzzy_hit", False),
+                        "hybrid_lexical_hit": row.get("hybrid_lexical_hit", False),
+                        "strict_lexical_hit": row.get("strict_lexical_hit", False),
+                        "lexical_score_pass": row.get("lexical_score_pass", False),
+                        "fallback_rank_only": row.get("fallback_rank_only", False),
+                        "typo_anchor": row.get("typo_anchor", False),
+                        "hash_anchor": row.get("hash_anchor", False),
+                        "clip_anchor": row.get("clip_anchor", False),
+                        "generic_token_only_match": row.get("generic_token_only_match", False),
+                        "direct_brand_evidence_count": row.get("direct_brand_evidence_count", 0),
+                        "clip_corroborated": row.get("clip_corroborated", False),
+                        "stage1_passthrough": row.get("stage1_passthrough", False),
+                        "tvc_brand_detected": False,
+                        "tvc_detected_brand": "none",
+                        "tvc_brand_spoofed": False,
+                        "tvc_match_surface": "none",
+                        "tvc_matched_alias": "",
+                        "tvc_spoof_strong": False,
+                        "ocr_text_len": 0,
+                        "registrar": "NA",
+                        "hosting_isp": "NA",
+                        "hosting_country": "NA",
+                        "dns_records": "NA",
+                        "brand_model_top1": "NA",
+                        "brand_model_confidence": 0.0,
+                        "domain_model_top1": "Unknown",
+                        "domain_model_confidence": 0.0,
+                        "model_brand_agrees_with_shortlist": False,
+                        "model_domain_agrees_with_shortlist": False,
+                        "model_feature_status": "skipped_non_fetched_fetch_state",
+                        "model_input_error": classification_gate_reason or fetch_status,
+                        "model_usable": False,
+                        "classification_gate_reason": classification_gate_reason,
+                        "review_only_reason": review_only_reason,
+                        "survival_path": classification_gate_reason if (emit_output or classification == "REVIEW_ONLY") else "",
+                        "drop_path": "" if (emit_output or classification == "REVIEW_ONLY") else classification_gate_reason,
+                        "non_lexical_corroboration_count": non_lexical_corroboration_count,
+                        **_stage1_debug_compat_payload(row),
                     }
                 )
             return
@@ -1219,7 +1603,7 @@ async def _run_hash_only_pipeline(
             shortlisted_cse=str(row.get("Cooresponding CSE", "") or ""),
             shortlisted_domain=str(row.get("Legitimate Domains", "") or ""),
             html_text=html_brand_text,
-        ) if fetch_status == "fetched" else {
+        ) if fetch_status in eligible_fetch_statuses else {
             "ocr_text": "",
             "ocr_header_text": "",
             "ocr_footer_text": "",
@@ -1228,6 +1612,9 @@ async def _run_hash_only_pipeline(
             "tvc_domain_match": False,
             "tvc_fuzzy_score": 0.0,
             "tvc_brand_spoofed": False,
+            "tvc_match_surface": "none",
+            "tvc_matched_alias": "",
+            "tvc_spoof_strong": False,
         }
 
         try:
@@ -1244,6 +1631,7 @@ async def _run_hash_only_pipeline(
         model_domain_agrees_with_shortlist = False
         model_feature_status = "model_unavailable"
         model_input_error = ""
+        model_usable = False
 
         resolved_ip = None
         if net_feats.get("ip_address"):
@@ -1259,14 +1647,102 @@ async def _run_hash_only_pipeline(
                 pass
 
         reg_data = None
+        registration_lookup_status = "unknown"
         async with rdap_sem:
             try:
                 base_url = _get_rdap_url(host)
                 resp = await client.get(f"{base_url}{host}")
                 if resp.status_code == 200:
                     reg_data = _parse_rdap_to_fields(resp.json())
+                    registration_lookup_status = "registered"
+                elif resp.status_code == 404:
+                    registration_lookup_status = "not_registered"
+                else:
+                    registration_lookup_status = f"rdap_http_{resp.status_code}"
             except Exception:
                 pass
+
+        if registration_lookup_status == "not_registered":
+            async with records_lock:
+                stage2_model_debug_records.append(
+                    {
+                        "url": domain_url,
+                        "source_workbook": source_workbook,
+                        "shortlisted_cse": row.get("Cooresponding CSE", ""),
+                        "shortlisted_domain": row.get("Legitimate Domains", ""),
+                        "fetch_status": fetch_status,
+                        "final_landing_url": row.get("final_landing_url", ""),
+                        "parking_provider": row.get("parking_provider", ""),
+                        "parking_reason": "not_registered_domain",
+                        "brand_model_top1": "NA",
+                        "brand_model_confidence": 0.0,
+                        "domain_model_top1": "Unknown",
+                        "domain_model_confidence": 0.0,
+                        "model_brand_agrees_with_shortlist": False,
+                        "model_domain_agrees_with_shortlist": False,
+                        "model_feature_status": "skipped_not_registered_domain",
+                        "model_input_error": "rdap_not_found",
+                        "model_usable": False,
+                        **_stage1_debug_compat_payload(row),
+                    }
+                )
+                stage3_classification_debug_records.append(
+                    {
+                        "url": domain_url,
+                        "source_workbook": source_workbook,
+                        "shortlisted_cse": row.get("Cooresponding CSE", ""),
+                        "shortlisted_domain": row.get("Legitimate Domains", ""),
+                        "fetch_status": fetch_status,
+                        "final_landing_url": row.get("final_landing_url", ""),
+                        "parking_provider": row.get("parking_provider", ""),
+                        "parking_reason": "not_registered_domain",
+                        "placeholder_or_parking_reason": "not_registered_domain",
+                        "classification": "SKIPPED_PARKING_OR_PLACEHOLDER",
+                        "confidence_band": row.get("confidence_band", "Low"),
+                        "evidence_tier": row.get("evidence_tier", ""),
+                        "lexical_score": row.get("lexical_score", 0.0),
+                        "hash_score": row.get("hash_score", 0.0),
+                        "old_fuzzy_hit": row.get("old_fuzzy_hit", False),
+                        "hybrid_lexical_hit": row.get("hybrid_lexical_hit", False),
+                        "strict_lexical_hit": row.get("strict_lexical_hit", False),
+                        "lexical_score_pass": row.get("lexical_score_pass", False),
+                        "fallback_rank_only": row.get("fallback_rank_only", False),
+                        "typo_anchor": row.get("typo_anchor", False),
+                        "hash_anchor": row.get("hash_anchor", False),
+                        "clip_anchor": row.get("clip_anchor", False),
+                        "generic_token_only_match": row.get("generic_token_only_match", False),
+                        "direct_brand_evidence_count": row.get("direct_brand_evidence_count", 0),
+                        "clip_corroborated": row.get("clip_corroborated", False),
+                        "stage1_passthrough": row.get("stage1_passthrough", False),
+                        "tvc_brand_detected": False,
+                        "tvc_detected_brand": "none",
+                        "tvc_brand_spoofed": False,
+                        "tvc_match_surface": "none",
+                        "tvc_matched_alias": "",
+                        "tvc_spoof_strong": False,
+                        "ocr_text_len": 0,
+                        "registrar": "NA",
+                        "hosting_isp": "NA",
+                        "hosting_country": "NA",
+                        "dns_records": "NA",
+                        "brand_model_top1": "NA",
+                        "brand_model_confidence": 0.0,
+                        "domain_model_top1": "Unknown",
+                        "domain_model_confidence": 0.0,
+                        "model_brand_agrees_with_shortlist": False,
+                        "model_domain_agrees_with_shortlist": False,
+                        "model_feature_status": "skipped_not_registered_domain",
+                        "model_input_error": "rdap_not_found",
+                        "model_usable": False,
+                        "classification_gate_reason": "not_registered_domain_excluded",
+                        "review_only_reason": "not_registered_domain",
+                        "survival_path": "",
+                        "drop_path": "not_registered_domain_excluded",
+                        "non_lexical_corroboration_count": 0,
+                        **_stage1_debug_compat_payload(row),
+                    }
+                )
+            return
 
         if reg_data is None and resolved_ip is not None:
             async with whois_sem:
@@ -1344,31 +1820,41 @@ async def _run_hash_only_pipeline(
                     and str(domain_model_top1).strip().lower() == shortlisted_domain
                 )
                 model_feature_status = "ok"
+                model_usable = True
             except Exception as exc:
                 model_feature_status = "feature_error"
                 model_input_error = str(exc)
 
         confidence_band = row.get("confidence_band", "Low")
         evidence_tier = _normalize_evidence_tier(row)
-        classification = _hybrid_hash_classification(
+        classification_decision = _hybrid_hash_decision(
             row,
             registrar=registrar,
             hosting_isp=hosting_isp,
             dns_records=dns_records,
             ocr_text_from_csv=ocr_tvc.get("ocr_text", ""),
             tvc_brand_spoofed=bool(ocr_tvc.get("tvc_brand_spoofed", False)),
+            tvc_brand_spoof_strong=bool(ocr_tvc.get("tvc_spoof_strong", False)),
             brand_model_agrees=model_brand_agrees_with_shortlist,
             domain_model_agrees=model_domain_agrees_with_shortlist,
             brand_model_confidence=brand_model_confidence,
             domain_model_confidence=domain_model_confidence,
+            failed_fetch_suspected_min=failed_fetch_suspected_min,
+            failed_fetch_review_min=failed_fetch_review_min,
         )
+        classification = str(classification_decision.get("classification", "Legitimate"))
+        emit_output = bool(classification_decision.get("emit_output", False))
+        classification_gate_reason = str(classification_decision.get("classification_gate_reason", "") or "")
+        review_only_reason = str(classification_decision.get("review_only_reason", "") or "")
+        non_lexical_corroboration_count = int(classification_decision.get("non_lexical_corroboration_count", 0) or 0)
         source_of_detection = adjust_source(
             row.get("Cooresponding CSE", ""),
             row.get("Legitimate Domains", ""),
             domain_model_top1 if domain_model_top1 not in {"NA", ""} else "Unknown",
         )
 
-        if classification.lower() == "phishing":
+        evidence_name = "NA"
+        if emit_output and classification.lower() == "phishing":
             async with records_lock:
                 serial_counter[0] += 1
                 serial_no = serial_counter[0]
@@ -1379,8 +1865,6 @@ async def _run_hash_only_pipeline(
                 application_id=APPLICATION_ID,
             )
             await asyncio.to_thread(move_screenshot_to_evidence, domain_url, evidence_path)
-        else:
-            evidence_name = "NA"
 
         detection_date = datetime.now().strftime("%d-%m-%Y")
         detection_time_str = datetime.now().strftime("%H:%M:%S")
@@ -1413,10 +1897,26 @@ async def _run_hash_only_pipeline(
             ),
         }
         async with records_lock:
-            records.append(record)
+            if emit_output:
+                records.append(record)
+                await asyncio.to_thread(_append_record_to_checkpoint, record, CHECKPOINT_CSV)
+            elif classification == "REVIEW_ONLY":
+                review_row = dict(row)
+                review_row.update(
+                    {
+                        "review_reason": review_only_reason or "stage3_review_only",
+                        "classification_gate_reason": classification_gate_reason,
+                        "non_lexical_corroboration_count": non_lexical_corroboration_count,
+                        "tvc_match_surface": ocr_tvc.get("tvc_match_surface", "none"),
+                        "tvc_matched_alias": ocr_tvc.get("tvc_matched_alias", ""),
+                        "tvc_spoof_strong": ocr_tvc.get("tvc_spoof_strong", False),
+                    }
+                )
+                review_queue_records.append(review_row)
             stage2_model_debug_records.append(
                 {
                     "url": domain_url,
+                    "source_workbook": source_workbook,
                     "shortlisted_cse": row.get("Cooresponding CSE", ""),
                     "shortlisted_domain": row.get("Legitimate Domains", ""),
                     "fetch_status": fetch_status,
@@ -1431,17 +1931,21 @@ async def _run_hash_only_pipeline(
                     "model_domain_agrees_with_shortlist": model_domain_agrees_with_shortlist,
                     "model_feature_status": model_feature_status,
                     "model_input_error": model_input_error,
+                    "model_usable": model_usable,
+                    **_stage1_debug_compat_payload(row),
                 }
             )
             stage3_classification_debug_records.append(
                 {
                     "url": domain_url,
+                    "source_workbook": source_workbook,
                     "shortlisted_cse": row.get("Cooresponding CSE", ""),
                     "shortlisted_domain": row.get("Legitimate Domains", ""),
                     "fetch_status": fetch_status,
                     "final_landing_url": row.get("final_landing_url", ""),
                     "parking_provider": row.get("parking_provider", ""),
                     "parking_reason": row.get("parking_reason", ""),
+                    "placeholder_or_parking_reason": row.get("placeholder_or_parking_reason", row.get("parking_reason", "")),
                     "classification": classification,
                     "confidence_band": confidence_band,
                     "evidence_tier": evidence_tier,
@@ -1455,9 +1959,16 @@ async def _run_hash_only_pipeline(
                     "typo_anchor": row.get("typo_anchor", False),
                     "hash_anchor": row.get("hash_anchor", False),
                     "clip_anchor": row.get("clip_anchor", False),
+                    "generic_token_only_match": row.get("generic_token_only_match", False),
+                    "direct_brand_evidence_count": row.get("direct_brand_evidence_count", 0),
+                    "clip_corroborated": row.get("clip_corroborated", False),
+                    "stage1_passthrough": row.get("stage1_passthrough", False),
                     "tvc_brand_detected": ocr_tvc.get("tvc_brand_detected", False),
                     "tvc_detected_brand": ocr_tvc.get("tvc_detected_brand", "none"),
                     "tvc_brand_spoofed": ocr_tvc.get("tvc_brand_spoofed", False),
+                    "tvc_match_surface": ocr_tvc.get("tvc_match_surface", "none"),
+                    "tvc_matched_alias": ocr_tvc.get("tvc_matched_alias", ""),
+                    "tvc_spoof_strong": ocr_tvc.get("tvc_spoof_strong", False),
                     "ocr_text_len": len(str(ocr_tvc.get("ocr_text", "") or "")),
                     "registrar": registrar,
                     "hosting_isp": hosting_isp,
@@ -1471,9 +1982,15 @@ async def _run_hash_only_pipeline(
                     "model_domain_agrees_with_shortlist": model_domain_agrees_with_shortlist,
                     "model_feature_status": model_feature_status,
                     "model_input_error": model_input_error,
+                    "model_usable": model_usable,
+                    "classification_gate_reason": classification_gate_reason,
+                    "review_only_reason": review_only_reason,
+                    "survival_path": classification_gate_reason if (emit_output or classification == "REVIEW_ONLY") else "",
+                    "drop_path": "" if (emit_output or classification == "REVIEW_ONLY") else classification_gate_reason,
+                    "non_lexical_corroboration_count": non_lexical_corroboration_count,
+                    **_stage1_debug_compat_payload(row),
                 }
             )
-            await asyncio.to_thread(_append_record_to_checkpoint, record, CHECKPOINT_CSV)
 
     async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
         tasks = [
@@ -1485,13 +2002,40 @@ async def _run_hash_only_pipeline(
             if isinstance(task_result, Exception):
                 logger.error("Hash-only worker failed: %s", task_result)
 
+    parked_skip_count = sum(
+        1
+        for row in stage3_classification_debug_records
+        if str(row.get("classification", "")).strip() == "SKIPPED_PARKING_OR_PLACEHOLDER"
+    )
+    review_only_count = sum(
+        1
+        for row in stage3_classification_debug_records
+        if str(row.get("classification", "")).strip() == "REVIEW_ONLY"
+    )
+    stage3_review_df = pd.DataFrame(review_queue_records)
+    merged_review_df = _merge_review_queue_frames(existing_review_df, low_conf_df, stage3_review_df)
+    _write_hash_review_queue(merged_review_df)
+    logger.info(
+        "Hash-only stage summary | input_after_whitelist=%d | processed_for_stage3=%d | non_fetched_candidates=%d | skipped_parked_or_placeholder=%d | review_only=%d | final_output_records=%d",
+        len(df_filtered),
+        total_domains,
+        non_fetched_count,
+        parked_skip_count,
+        review_only_count,
+        len(records),
+    )
     df_out = pd.DataFrame(records, columns=_submission_record_columns())
     df_out.to_csv(FINAL_OUTPUT, index=False, encoding="utf-8")
+    flagged_df = df_out[
+        df_out["Phishing/Suspected Domains (i.e. Class Label)"].isin(["Phishing", "Suspected"])
+    ].copy()
+    flagged_df.to_csv(filtered_output_path, index=False, encoding="utf-8")
     _write_debug_csv(stage2_model_debug_records, STAGE2_MODEL_DEBUG_PATH)
     _write_debug_csv(stage3_classification_debug_records, STAGE3_CLASSIFICATION_DEBUG_PATH)
     logger.info("Stage2 model debug written to %s (%d rows)", STAGE2_MODEL_DEBUG_PATH, len(stage2_model_debug_records))
     logger.info("Stage3 classification debug written to %s (%d rows)", STAGE3_CLASSIFICATION_DEBUG_PATH, len(stage3_classification_debug_records))
     logger.info("Hash-only final output written to %s (%d records)", FINAL_OUTPUT, len(df_out))
+    logger.info("Flagged-only final output written to %s (%d records)", filtered_output_path, len(flagged_df))
     return df_out
 
 # ------------------------------------------------------------------
@@ -1506,16 +2050,26 @@ async def run_pipeline(
     pipeline_mode="hash_only",
     high_confidence_threshold=78.0,
     medium_confidence_threshold=68.0,
-    hashing_threshold=65.0,
+    hashing_threshold=58.0,
     domain_similarity_threshold=0.85,
     typo_top_k=10,
-    typo_min_score=0.45,
+    typo_min_score=0.75,
     lexical_pass_min_score=0.85,
-    clip_margin_min=0.12,
-    dns_timeout=3.0,
-    dns_retries=1,
+    clip_margin_min=0.20,
+    dns_timeout=5.0,
+    dns_retries=2,
     dns_max_workers=None,
     shortlist_debug_csv=None,
+    stage1_escalate_total_threshold=None,
+    stage1_brand_min=None,
+    stage1_credential_min=None,
+    stage1_low_band_min=None,
+    stage1_hard_trigger_brand_min=None,
+    keep_stage1_suspected=False,
+    keep_dns_rejected_strict_lexical=False,
+    keep_fetch_failed_strict_lexical=False,
+    failed_fetch_suspected_min=None,
+    failed_fetch_review_min=None,
 ):
     import time
     from tqdm import tqdm as tqdm_sync
@@ -1531,7 +2085,10 @@ async def run_pipeline(
         "Pipeline mode=%s | high_confidence_threshold=%.2f | medium_confidence_threshold=%.2f | "
         "hashing_threshold=%.2f | domain_similarity_threshold=%.3f | typo_top_k=%d | "
         "typo_min_score=%.3f | lexical_pass_min_score=%.3f | clip_margin_min=%.3f | "
-        "dns_timeout=%.2f | dns_retries=%d | dns_max_workers=%s",
+        "dns_timeout=%.2f | dns_retries=%d | dns_max_workers=%s | "
+        "stage1_overrides={escalate_total=%s,brand_min=%s,credential_min=%s,low_band_min=%s,hard_trigger_brand_min=%s} | "
+        "recall_passthroughs={stage1_suspected=%s,dns_rejected_strict_lexical=%s,fetch_failed_strict_lexical=%s} | "
+        "failed_fetch_rescue={suspected_min=%s,review_min=%s}",
         pipeline_mode,
         high_confidence_threshold,
         medium_confidence_threshold,
@@ -1544,6 +2101,16 @@ async def run_pipeline(
         dns_timeout,
         int(dns_retries),
         dns_max_workers if dns_max_workers is not None else "adaptive",
+        stage1_escalate_total_threshold if stage1_escalate_total_threshold is not None else "default",
+        stage1_brand_min if stage1_brand_min is not None else "default",
+        stage1_credential_min if stage1_credential_min is not None else "default",
+        stage1_low_band_min if stage1_low_band_min is not None else "default",
+        stage1_hard_trigger_brand_min if stage1_hard_trigger_brand_min is not None else "default",
+        keep_stage1_suspected,
+        keep_dns_rejected_strict_lexical,
+        keep_fetch_failed_strict_lexical,
+        failed_fetch_suspected_min if failed_fetch_suspected_min is not None else "off",
+        failed_fetch_review_min if failed_fetch_review_min is not None else "off",
     )
     
     # Initialize semaphores here to be shared with process_urls
@@ -1559,15 +2126,20 @@ async def run_pipeline(
 
     if not use_existing_holdout or not os.path.exists(holdout_csv_path):
         logger.info("Generating new holdout.csv via phishing_pipeline relocation...")
-        from .shortlisting import load_urls_from_excel_folder
+        from .shortlisting import load_url_records_from_excel_folder
         # Ensure parent module is in path
         sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
         try:
             from .comparison import run_hashing_shortlist_async
-            urls = load_urls_from_excel_folder(
+            url_records = load_url_records_from_excel_folder(
                 holdout_folder,
                 limit=limit_target_urls,
             )
+            urls = [record["url"] for record in url_records]
+            url_sources = {
+                record["url"]: record.get("source_workbooks", [])
+                for record in url_records
+            }
             holdout_df = await run_hashing_shortlist_async(
                 list(urls),
                 threshold=hashing_threshold,
@@ -1582,6 +2154,15 @@ async def run_pipeline(
                 dns_retries=dns_retries,
                 dns_max_workers=dns_max_workers,
                 shortlist_debug_csv=shortlist_debug_csv,
+                url_sources=url_sources,
+                keep_stage1_suspected=keep_stage1_suspected,
+                keep_dns_rejected_strict_lexical=keep_dns_rejected_strict_lexical,
+                keep_fetch_failed_strict_lexical=keep_fetch_failed_strict_lexical,
+                stage1_escalate_total_threshold=stage1_escalate_total_threshold,
+                stage1_brand_min=stage1_brand_min,
+                stage1_credential_min=stage1_credential_min,
+                stage1_low_band_min=stage1_low_band_min,
+                stage1_hard_trigger_brand_min=stage1_hard_trigger_brand_min,
             )
             
             os.makedirs(os.path.dirname(holdout_csv_path), exist_ok=True)
@@ -1606,6 +2187,10 @@ async def run_pipeline(
     ps02_df["Legitimate Domains"] = ps02_df["Legitimate Domains"].astype(str).str.strip().str.lower()
     
     df_holdout = pd.read_csv(holdout_csv_path)
+    df_holdout = _normalize_replayed_columns(
+        df_holdout,
+        ["parking_provider", "parking_reason", "placeholder_or_parking_reason", "final_landing_url"],
+    )
 
     # --- Use the new column name ---
     df_filtered = df_holdout[
@@ -1638,6 +2223,8 @@ async def run_pipeline(
             whois_rate_limiter=whois_rate_limiter,
             high_confidence_threshold=high_confidence_threshold,
             medium_confidence_threshold=medium_confidence_threshold,
+            failed_fetch_suspected_min=failed_fetch_suspected_min,
+            failed_fetch_review_min=failed_fetch_review_min,
         )
         if os.path.exists(CHECKPOINT_CSV):
             try:
@@ -2049,24 +2636,40 @@ def package_results(output_file=FINAL_OUTPUT, zip_path="PS-02_ISS_NLP_Submission
     # We'll save it in the same directory as this script (phishing_pipeline/)
     local_excel_path = os.path.join(BASE_DIR, excel_file_name)
     
-    # --- Find which CSV to use (filtered or main) ---
+    # Package from the main output by default so Legitimate rows are preserved.
     filtered_csv_file = output_file.replace(".csv", "_filtered.csv")
-    csv_to_use = None
-    
-    if os.path.exists(filtered_csv_file):
+    csv_to_use = output_file
+
+    if os.path.exists(output_file):
         try:
-            df_check = pd.read_csv(filtered_csv_file)
+            df_check = pd.read_csv(output_file)
             if len(df_check) > 0:
-                csv_to_use = filtered_csv_file
-                logger.info("Using filtered output file: %s", csv_to_use)
+                logger.info("Using main output file for packaging: %s", csv_to_use)
+            elif os.path.exists(filtered_csv_file):
+                filtered_df = pd.read_csv(filtered_csv_file)
+                if len(filtered_df) > 0:
+                    csv_to_use = filtered_csv_file
+                    logger.info(
+                        "Main output file is empty. Falling back to filtered output file: %s",
+                        csv_to_use,
+                    )
+                else:
+                    logger.info("Main and filtered output files are empty. Using main output file: %s", csv_to_use)
             else:
-                csv_to_use = output_file
-                logger.info("Filtered file is empty. Using main output file: %s", csv_to_use)
+                logger.info("Main output file is empty and no filtered file found. Using main output file: %s", csv_to_use)
         except Exception:
-            csv_to_use = output_file
-            logger.info("Error checking filtered file. Using main output file: %s", csv_to_use)
+            logger.info("Error checking main output file. Using main output file: %s", csv_to_use)
+    elif os.path.exists(filtered_csv_file):
+        try:
+            filtered_df = pd.read_csv(filtered_csv_file)
+            if len(filtered_df) > 0:
+                csv_to_use = filtered_csv_file
+                logger.info("Main output file missing. Falling back to filtered output file: %s", csv_to_use)
+            else:
+                logger.info("Filtered output file is empty. Main output file is still expected at: %s", csv_to_use)
+        except Exception:
+            logger.info("Error checking filtered output file. Main output file is still expected at: %s", csv_to_use)
     else:
-        csv_to_use = output_file
         logger.info("No filtered file found. Using main output file: %s", csv_to_use)
 
     if not os.path.exists(csv_to_use):

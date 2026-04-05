@@ -9,7 +9,11 @@ logger = logging.getLogger(__name__)
 # RDAP Bootstrap URL (redirects to the correct authoritative server)
 RDAP_BOOTSTRAP_URL = "https://rdap.org/domain/"
 
-async def lookup_rdap(domain: str, client: Optional[httpx.AsyncClient] = None) -> Dict[str, Any]:
+async def lookup_rdap(
+    domain: str,
+    client: Optional[httpx.AsyncClient] = None,
+    timeout: Optional[float] = None,
+) -> Dict[str, Any]:
     """
     Perform an RDAP lookup for a domain using httpx.
     
@@ -30,8 +34,9 @@ async def lookup_rdap(domain: str, client: Optional[httpx.AsyncClient] = None) -
         }
     """
     local_client = False
+    effective_timeout = float(timeout) if timeout is not None else 10.0
     if client is None:
-        client = httpx.AsyncClient(timeout=10.0, follow_redirects=True)
+        client = httpx.AsyncClient(timeout=effective_timeout, follow_redirects=True)
         local_client = True
         
     result = {
@@ -46,7 +51,7 @@ async def lookup_rdap(domain: str, client: Optional[httpx.AsyncClient] = None) -
     
     try:
         url = f"{RDAP_BOOTSTRAP_URL}{domain}"
-        response = await client.get(url)
+        response = await client.get(url, timeout=effective_timeout)
         
         if response.status_code == 200:
             data = response.json()

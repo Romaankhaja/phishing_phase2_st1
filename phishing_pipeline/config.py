@@ -46,3 +46,111 @@ EVIDENCE_DIR  = os.path.join(BASE_DIR, f"PS-02_{APPLICATION_ID}_Evidences")
 # Limits
 MAX_VARIANTS = 40
 MAX_WORKERS  = 20
+
+# Stage 1 cheap HTTP routing
+STAGE1_HTTP_CONFIG = {
+    "concurrency": 200,
+    "http_concurrency": 200,
+    "dns_concurrency": 200,
+    "rdap_concurrency": 10,
+    "tls_concurrency": 32,
+    "connect_timeout": 4.0,
+    "head_timeout": 4.0,
+    "get_timeout": 6.0,
+    "dns_timeout": 3.0,
+    "rdap_timeout": 5.0,
+    "tls_timeout": 3.0,
+    "max_html_bytes": 32768,
+    "max_redirects": 4,
+    "escalate_total_threshold": 60,
+    "brand_min": 18,
+    "credential_min": 18,
+    "low_band_min": 20,
+    "hard_trigger_brand_min": 10,
+}
+
+STAGE3_RECALL_RESCUE_CONFIG = {
+    "failed_fetch_suspected_min": None,
+    "failed_fetch_review_min": None,
+}
+
+
+def resolve_stage1_http_config(overrides: dict | None = None) -> dict:
+    config = dict(STAGE1_HTTP_CONFIG)
+    for key, value in (overrides or {}).items():
+        if value is None:
+            continue
+        config[key] = value
+    return config
+
+STAGE1_SCORE_WEIGHTS = {
+    "brand": {
+        "title": 24,
+        "meta": 8,
+        "body": 4,
+        "submit": 12,
+        "favicon": 4,
+        "final_domain": 4,
+        "redirect_alias": 4,
+    },
+    "credential": {
+        "password": 18,
+        "login_form": 8,
+        "auth_terms": 4,
+        "submit_auth": 4,
+        "action_mismatch": 16,
+        "multi_input": 2,
+    },
+    "infra": {
+        "age_le_30d": 10,
+        "age_le_90d": 5,
+        "suspicious_provider": 6,
+        "cert_suspect": 3,
+        "redirect_count_ge_2": 3,
+    },
+    "evasion": {
+        "meta_refresh": 6,
+        "js_redirect": 6,
+        "iframe": 4,
+        "image_heavy_low_text": 6,
+        "final_domain_changed": 4,
+    },
+}
+
+STAGE1_AUTH_TERMS = (
+    "login",
+    "log in",
+    "signin",
+    "sign in",
+    "auth",
+    "authenticate",
+    "verification",
+    "verify",
+    "account",
+    "reset",
+    "portal",
+    "secure",
+    "password",
+    "otp",
+)
+
+STAGE1_SUSPICIOUS_PROVIDER_TOKENS = {
+    "namecheap",
+    "contabo",
+    "digitalocean",
+    "ovh",
+    "vultr",
+    "hetzner",
+    "hostinger",
+    "reg.ru",
+    "shinjiru",
+    "pq hosting",
+}
+
+STAGE1_SUSPICIOUS_CERT_ISSUER_TOKENS = {
+    "self signed",
+    "local",
+    "temporary",
+    "default",
+    "localhost",
+}

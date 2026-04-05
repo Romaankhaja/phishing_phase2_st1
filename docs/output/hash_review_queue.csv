@@ -1,0 +1,15 @@
+Cooresponding CSE,Legitimate Domains,Identified Phishing/Suspected Domain Name,hash_score,confidence_band,score_margin,evidence_tier,lexical_score,jw_primary,token_set_primary,skeleton_similarity,lexical_rule_hit,brand_token_hit,candidate_generation_reason,dominant_signal_family,old_fuzzy_hit,old_fuzzy_cse,hybrid_lexical_hit,strict_lexical_hit,lexical_score_pass,fallback_rank_only,admission_reason,admission_path,fetch_status,best_score,domain_component,clip_component,hash_component,typo_similarity,typo_min_score_used,typo_decision_reason,clip_similarity,typo_anchor,hash_anchor,clip_anchor,signal_hit_screenshot,signal_hit_typo,signal_hit_domain,signal_hit_favicon,signal_hit_ssl_hash,signal_hit_html_hash,signal_hit_domain_hash,signal_hit_keywords,screenshot_path,html_title_text,visible_text_excerpt,review_reason
+"Unique Identification Authority of India (UIDAI)
+",uidai.gov.in,https://uidaiaadhardownload.com,56.4903,Low,56.4903,weak_evidence,0.8526,0.8526,0.4167,0.4167,True,False,jw_primary,lexical,True,"Unique Identification Authority of India (UIDAI)
+",True,True,True,False,strict_lexical_hit,strict_lexical_hit,fetched,56.4903,25.5789,10.5748,0.0,0.4167,0.45,below_min_score,0.5287,False,False,False,True,False,True,False,False,False,False,False,/home/user7/new_code/phishing_ml/phishing_pipeline/screens/uidaiaadhardownload.com.png,home - uidai aadhaar download,"home - uidai aadhaar download 
+            download your aadhaar cardin just 5 minutes
+         
+            complete step-by-step guide to downloading your e-aadhaar online via uidai portal,
+            digilocker, or maadhaar app — completely free, no paperwork needed.
+         
+            choose how to download aadhar card
+         
+            uidai provides three official ways to download your aadhaar. pick the one that's easiest for you.
+         uidai website download directly from myaad",low_confidence_strict_lexical
+Airtel,airtel.in,https://airtell.ai,0.0,Low,0.0,weak_evidence,0.9714,0.9714,0.9231,0.9231,True,False,jw_primary|token_set_primary|skeleton_similarity|host_similarity,lexical,True,Airtel,True,True,True,False,strict_lexical_hit,strict_lexical_hit,failed,0.0,29.1429,0.0,0.0,0.9231,0.45,anchor_typo,0.0,True,False,False,False,True,False,False,False,False,False,False,,,,fetch_failed_lexical_hit
+Axis Bank,axis.bank.in,https://axisupi.com,0.0,Low,0.0,weak_evidence,0.9143,0.9143,0.7273,0.7273,True,False,jw_primary,lexical,True,Axis Bank,True,True,True,False,strict_lexical_hit,strict_lexical_hit,failed,0.0,27.4286,0.0,0.0,0.7273,0.45,anchor_typo,0.0,True,False,False,False,True,False,False,False,False,False,False,,,,fetch_failed_lexical_hit

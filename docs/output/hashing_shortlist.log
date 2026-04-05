@@ -1,0 +1,14 @@
+2026-04-05 13:08:49,583 | INFO | Hashing shortlist (streaming) started | urls=7 | threshold=65.0 | domain_similarity_threshold=0.850 | high_confidence_threshold=78.00 | medium_confidence_threshold=68.00 | typo_top_k=10 | typo_min_score=0.450 | lexical_pass_min_score=0.850 | clip_margin_min=0.120 | dns_timeout=3.00 | dns_retries=1 | dns_max_workers=adaptive
+2026-04-05 13:08:49,583 | INFO | Scoring weights | domain=30, screenshot=20, favicon=14, ssl_hash=12, html_hash=6, domain_hash=8, keywords=10
+2026-04-05 13:08:49,583 | INFO | Stage1 hashing parallelism | dns_workers=7 | total_pages=120 | page_workers_per_shard=16 | shards=8 | http_limit=360 | nav_timeout_ms=8000 | screenshot_timeout_ms=3000 | fetch_timeout_s=10.0 | gpu_queue=512 | gpu_batch=16 | active_fetch_limit=120 | active_fetch_floor=120 | aux_net_limit=240 | adaptive_downshift_enabled=False
+2026-04-05 13:08:49,583 | INFO | Stage1 note | OCR/Screenshots/ImgProc/RDAP/WHOIS limits from phishing_pipeline.utils are not the active hashing-stage browser worker counts.
+2026-04-05 13:08:49,670 | INFO | DNS gate details | urls=7 | kept=3 | timeout=3.0s | retries=1 | workers=7 | resolved=3 timeout=0 resolver_error=0 no_records=1 dns_error=3 retry_success=0
+2026-04-05 13:08:49,671 | INFO | DNS gate kept 3/7 URLs at 3.0s timeout (retries=1, retry_success=0) | resolved=3 timeout=0 resolver_error=0 no_records=1 dns_error=3
+2026-04-05 13:08:49,672 | INFO | Hashing log file: /home/user7/new_code/phishing_ml/output/hashing_shortlist.log
+2026-04-05 13:08:52,174 | INFO | ðŸš€ Loading CLIP model (openai/clip-vit-base-patch32) on cpu...
+2026-04-05 13:08:58,877 | INFO | âœ… CLIP model ready (dtype=torch.float32)
+2026-04-05 13:08:59,119 | INFO | Hashing shortlist completed | passed_dns_gate=3 | processed=3 | hashed_success=1 | fetch_failed=2 | fetch_timed_out=0 | fetch_parked=0 | final_matches=3 | gpu_batches=1 | gpu_items=1 | avg_gpu_batch=1.0 | urls_per_sec=0.32 | threshold=65.0 | elapsed=9.4s
+2026-04-05 13:08:59,119 | INFO | Anchor summary (shortlisted) | typo_anchor=2 | hash_anchor=0 | clip_anchor=0 | shortlisted=3
+2026-04-05 13:08:59,121 | INFO | Typo similarity summary (shortlisted) | min=0.4167 | avg=0.6890 | p95=0.9035 | max=0.9231 | typo_min_score=0.4500
+2026-04-05 13:08:59,126 | INFO | Stage1 debug CSV written to output/stage1_lexical_debug.csv with 7 rows
+2026-04-05 13:08:59,138 | INFO | Excluded URL audit written to /home/user7/new_code/phishing_ml/output/hashing_shortlist_excluded_urls.csv with 4 rows

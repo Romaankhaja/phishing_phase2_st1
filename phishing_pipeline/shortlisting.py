@@ -95,30 +95,29 @@ def is_similar_advanced(cand_url_norm: str, legit_url_norm: str,
         pass
     return False
 
-def load_urls_from_excel_folder(folder_path, limit: int | None = None):
-    logger.info(f"Reading Excel files from: {folder_path}")
-    all_urls = set()
-    max_urls = None if limit is None else max(0, int(limit))
-    
+def _discover_excel_files(folder_path: str) -> list[str]:
     if os.path.isfile(folder_path) and folder_path.endswith((".xlsx", ".xls")):
         files = [folder_path]
     else:
         files = glob.glob(os.path.join(folder_path, "*.xlsx")) + glob.glob(os.path.join(folder_path, "*.xls"))
-        
+    return [f for f in files if not os.path.basename(f).startswith("~$")]
+
+
+def load_url_records_from_excel_folder(folder_path, limit: int | None = None):
+    logger.info(f"Reading Excel files from: {folder_path}")
+    url_records: dict[str, dict] = {}
+    max_urls = None if limit is None else max(0, int(limit))
+
+    files = _discover_excel_files(folder_path)
     if not files:
         logger.warning(f"No .xlsx or .xls files found in {folder_path}.")
-        return all_urls
+        return []
     logger.info(f"Found {len(files)} files.")
     if max_urls == 0:
         logger.info("Target URL limit set to 0; skipping Excel URL loading.")
-        return all_urls
-    
+        return []
+
     for f in files:
-        # Ignore temporary lock files created by Excel
-        if os.path.basename(f).startswith("~$"):
-            logger.info(f"Skipping temporary Excel file: {f}")
-            continue
-            
         try:
             header_df = pd.read_excel(f, nrows=0)
             possible_cols = ["Identified Phishing/Suspected Domain Name", "URL", "url", "Domain", "domain_name"]
@@ -137,10 +136,10 @@ def load_urls_from_excel_folder(folder_path, limit: int | None = None):
                 logger.warning(f"No known URL column in {f}. Using first column: {found_col}")
             remaining_limit = None
             if max_urls is not None:
-                remaining_limit = max_urls - len(all_urls)
+                remaining_limit = max_urls - len(url_records)
                 if remaining_limit <= 0:
                     logger.info("Reached target URL limit (%d total).", max_urls)
-                    return all_urls
+                    break
 
             df = pd.read_excel(
                 f,
@@ -149,24 +148,38 @@ def load_urls_from_excel_folder(folder_path, limit: int | None = None):
             )
             urls = df[found_col].dropna().astype(str)
             added_from_file = 0
+            workbook_name = os.path.basename(f)
             for url in urls:
                 normalized = url.strip().lower()
-                if not normalized or normalized in all_urls:
+                if not normalized:
                     continue
-                all_urls.add(normalized)
-                added_from_file += 1
-                if max_urls is not None and len(all_urls) >= max_urls:
+                record = url_records.get(normalized)
+                if record is None:
+                    record = {
+                        "url": normalized,
+                        "source_workbooks": [],
+                    }
+                    url_records[normalized] = record
+                    added_from_file += 1
+                if workbook_name not in record["source_workbooks"]:
+                    record["source_workbooks"].append(workbook_name)
+                if max_urls is not None and len(url_records) >= max_urls:
                     logger.info(
                         "Loaded %d new URLs from '%s' before reaching target limit (%d total).",
                         added_from_file,
                         f,
                         max_urls,
                     )
-                    return all_urls
+                    return list(url_records.values())
             logger.info(f"Loaded {len(urls)} URLs from '{f}'")
         except Exception as e:
             logger.error(f"Failed to read {f}: {e}")
-    return all_urls
+    return list(url_records.values())
+
+
+def load_urls_from_excel_folder(folder_path, limit: int | None = None):
+    url_records = load_url_records_from_excel_folder(folder_path, limit=limit)
+    return {record["url"] for record in url_records}
 
 def load_urls_from_txt(file_path):
     if not os.path.exists(file_path):
