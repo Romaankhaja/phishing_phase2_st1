@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from unittest import mock
 
@@ -28,6 +29,20 @@ class _FakeClient:
         if isinstance(item, Exception):
             raise item
         return item
+
+
+class _GateClient:
+    def __init__(self, response):
+        self._response = response
+        self.calls = 0
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def get(self, url, timeout=None):
+        self.calls += 1
+        self.entered.set()
+        await self.release.wait()
+        return self._response
 
 
 class _EmptyMessageRequestError(httpx.RequestError):
@@ -86,7 +101,34 @@ class RdapUtilsTests(unittest.IsolatedAsyncioTestCase):
         snapshot = rdap_utils.get_rdap_metrics_snapshot()
         self.assertEqual(snapshot["429"], 3)
         self.assertEqual(snapshot["retry_exhausted"], 1)
-        self.assertEqual(snapshot["cache_hit"], 1)
+        self.assertEqual(snapshot["cooldown_hit"], 1)
+
+    async def test_lookup_rdap_shares_inflight_request_for_concurrent_exact_domain_calls(self):
+        client = _GateClient(
+            _FakeResponse(
+                200,
+                {
+                    "events": [{"eventAction": "registration", "eventDate": "2024-03-03T00:00:00Z"}],
+                    "entities": [],
+                    "nameservers": [],
+                    "status": ["active"],
+                },
+            )
+        )
+
+        first_task = asyncio.create_task(rdap_utils.lookup_rdap("shared.example", client=client, timeout=1.0))
+        await asyncio.wait_for(client.entered.wait(), timeout=1.0)
+        second_task = asyncio.create_task(rdap_utils.lookup_rdap("shared.example", client=client, timeout=1.0))
+        await asyncio.sleep(0)
+        client.release.set()
+        first, second = await asyncio.gather(first_task, second_task)
+
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(first["creation_date"], "2024-03-03T00:00:00Z")
+        self.assertEqual(second["creation_date"], "2024-03-03T00:00:00Z")
+        snapshot = rdap_utils.get_rdap_metrics_snapshot()
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(snapshot["inflight_wait"], 1)
 
     async def test_lookup_rdap_retries_429_then_succeeds_with_same_schema(self):
         client = _FakeClient(
@@ -139,6 +181,30 @@ class RdapUtilsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(client.calls, 3)
         self.assertTrue(any("EmptyMessageRequestError" in line for line in logs.output))
+
+    async def test_lookup_rdap_applies_cooldown_after_read_timeout_exhaustion(self):
+        request = httpx.Request("GET", "https://rdap.org/domain/timeout.example")
+        client = _FakeClient(
+            [
+                httpx.ReadTimeout("slow", request=request),
+                httpx.ReadTimeout("slow", request=request),
+                httpx.ReadTimeout("slow", request=request),
+            ]
+        )
+
+        with mock.patch("phishing_pipeline.rdap_utils.random.uniform", return_value=0.0), mock.patch(
+            "phishing_pipeline.rdap_utils.asyncio.sleep",
+            new=mock.AsyncMock(),
+        ):
+            first = await rdap_utils.lookup_rdap("timeout.example", client=client, timeout=1.0)
+            second = await rdap_utils.lookup_rdap("timeout.example", client=client, timeout=1.0)
+
+        self.assertEqual(client.calls, 3)
+        self.assertEqual(first["raw_rdap"], {})
+        self.assertEqual(second["raw_rdap"], {})
+        snapshot = rdap_utils.get_rdap_metrics_snapshot()
+        self.assertEqual(snapshot["retry_exhausted"], 1)
+        self.assertEqual(snapshot["cooldown_hit"], 1)
 
     async def test_lookup_rdap_does_not_retry_non_transport_exception(self):
         client = _FakeClient([ValueError("boom")])

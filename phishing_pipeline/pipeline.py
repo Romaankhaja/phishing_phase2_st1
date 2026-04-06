@@ -47,6 +47,17 @@ from .visual_features import close_browser
 from .geoip_utils import enrich_with_geoip
 from .model_utils import load_models_and_preproc
 from .comparison import detect_parked_page_signals
+from .reliability import (
+    CheckpointStore,
+    ProgressTracker,
+    RunContext,
+    StageWatchdog,
+    async_with_timeout_and_retry,
+    make_record_key,
+    normalize_exception,
+    stage_result_patch,
+    utc_now_iso,
+)
 # from .shortlisting import generate_shortlisted_csv # REMOVED: Using hashing_ml instead
 from .rate_limiter import RateLimiter
 from .utils import (
@@ -1257,6 +1268,10 @@ async def _run_hash_only_pipeline(
     medium_confidence_threshold: float,
     failed_fetch_suspected_min: float | None = None,
     failed_fetch_review_min: float | None = None,
+    run_context: RunContext | None = None,
+    checkpoint_store: CheckpointStore | None = None,
+    resume: bool = False,
+    force_reprocess: bool = False,
 ):
     df_filtered = df_filtered.copy()
     df_filtered = _normalize_replayed_columns(
@@ -1300,6 +1315,30 @@ async def _run_hash_only_pipeline(
     low_conf_df = df_filtered[df_filtered["confidence_band"] == "Low"].copy()
 
     classified_df = df_filtered.copy()
+    completed_record_keys = (
+        checkpoint_store.get_completed_record_keys()
+        if checkpoint_store is not None and resume and not force_reprocess
+        else set()
+    )
+    if checkpoint_store is not None and run_context is not None:
+        pending_rows = []
+        skipped_existing = 0
+        for row in classified_df.to_dict("records"):
+            domain_url = str(row.get("Identified Phishing/Suspected Domain Name", "")).strip()
+            normalized_url = domain_url.strip().lower()
+            source_workbook = str(row.get("source_workbook", "") or "")
+            checkpoint_store.ensure_url_result(
+                raw_url=domain_url,
+                normalized_url=normalized_url,
+                source_workbook=source_workbook,
+            )
+            if make_record_key(normalized_url, source_workbook) in completed_record_keys:
+                skipped_existing += 1
+                continue
+            pending_rows.append(row)
+        if skipped_existing:
+            logger.info("Hash-only resume | skipped %d already-completed shortlisted rows", skipped_existing)
+        classified_df = pd.DataFrame(pending_rows)
     non_fetched_count = int(
         (~classified_df.get(
             "fetch_status",
@@ -1314,7 +1353,8 @@ async def _run_hash_only_pipeline(
     )
 
     if classified_df.empty:
-        empty_df = pd.DataFrame(columns=_submission_record_columns())
+        existing_records = checkpoint_store.get_terminal_submission_records() if checkpoint_store is not None else []
+        empty_df = pd.DataFrame(existing_records, columns=_submission_record_columns()) if existing_records else pd.DataFrame(columns=_submission_record_columns())
         empty_df.to_csv(FINAL_OUTPUT, index=False, encoding="utf-8")
         empty_df.to_csv(filtered_output_path, index=False, encoding="utf-8")
         _write_debug_csv([], STAGE2_MODEL_DEBUG_PATH)
@@ -1346,14 +1386,105 @@ async def _run_hash_only_pipeline(
     rdap_sem = _get_rdap_semaphore()
     whois_sem = _get_whois_semaphore()
     dns_sem = _get_dns_prefilter_semaphore()
+    classify_progress = ProgressTracker(total=len(classified_df))
+    classify_metrics = {
+        "outputs": 0,
+        "review": 0,
+        "failed": 0,
+        "parked": 0,
+        "legitimate": 0,
+        "suspected": 0,
+        "phishing": 0,
+    }
+    active_workers: dict[str, str] = {}
+
+    def _upsert_classify_checkpoint(
+        *,
+        row: dict,
+        stage_status: str,
+        final_pipeline_status: str | None = None,
+        final_decision: str | None = None,
+        failure_reason: str | None = None,
+        retry_count: int = 0,
+        timeout_hit: bool = False,
+        worker_id: str = "",
+        error_type: str = "",
+        error_message: str = "",
+        submission_record: dict | None = None,
+    ) -> None:
+        if checkpoint_store is None or run_context is None:
+            return
+        domain_url = str(row.get("Identified Phishing/Suspected Domain Name", "")).strip()
+        normalized_url = domain_url.strip().lower()
+        source_workbook = str(row.get("source_workbook", "") or "")
+        checkpoint_store.upsert_url_result(
+            stage_result_patch(
+                run_id=run_context.run_id,
+                raw_url=domain_url,
+                normalized_url=normalized_url,
+                source_workbook=source_workbook,
+                stage_name="classify",
+                stage_status=stage_status,
+                current_stage="classify",
+                retry_count=retry_count,
+                timeout_hit=timeout_hit,
+                worker_id=worker_id,
+                error_type=error_type,
+                error_message=error_message,
+                final_pipeline_status=final_pipeline_status,
+                final_decision=final_decision,
+                failure_reason=failure_reason,
+                submission_record=submission_record,
+            )
+        )
+
+    def _append_classify_stage_event(
+        *,
+        row: dict,
+        worker_id: str,
+        started_at: str,
+        started_monotonic: float,
+        status: str,
+        retry_count: int = 0,
+        timeout_flag: bool = False,
+        error_type: str = "",
+        error_message: str = "",
+    ) -> None:
+        if checkpoint_store is None or run_context is None:
+            return
+        domain_url = str(row.get("Identified Phishing/Suspected Domain Name", "")).strip()
+        normalized_url = domain_url.strip().lower()
+        source_workbook = str(row.get("source_workbook", "") or "")
+        checkpoint_store.append_stage_event(
+            {
+                "run_id": run_context.run_id,
+                "record_key": make_record_key(normalized_url, source_workbook),
+                "source_workbook": source_workbook,
+                "normalized_url": normalized_url,
+                "stage_name": "classify",
+                "attempt_index": max(1, int(retry_count) + 1),
+                "worker_id": worker_id,
+                "started_at": started_at,
+                "finished_at": utc_now_iso(),
+                "duration_ms": int(max(0.0, (time.perf_counter() - started_monotonic) * 1000.0)),
+                "status": status,
+                "error_type": error_type,
+                "error_message": error_message,
+                "retry_count": retry_count,
+                "timeout_flag": int(bool(timeout_flag)),
+                "fallback_taken": "",
+            }
+        )
 
     def _get_rdap_url(host):
         ext = tldextract.extract(host)
         tld = ext.suffix.split(".")[-1] if ext.suffix else ""
         return RDAP_DIRECT_URLS.get(tld, RDAP_FALLBACK_URL)
 
-    async def _process_hash_row(row: dict, client: httpx.AsyncClient):
+    async def _process_hash_row(row: dict, client: httpx.AsyncClient, worker_id: str = ""):
         domain_url = str(row.get("Identified Phishing/Suspected Domain Name", "")).strip()
+        stage_started_at = utc_now_iso()
+        stage_started_monotonic = time.perf_counter()
         host = urlparse(domain_url).hostname or domain_url
         host = host.split(":")[0]
         screenshot_path = str(row.get("screenshot_path", "") or "").strip()
@@ -1442,6 +1573,23 @@ async def _run_hash_only_pipeline(
                         **_stage1_debug_compat_payload(row),
                     }
                 )
+                _upsert_classify_checkpoint(
+                    row=row,
+                    stage_status="skipped_parked_page",
+                    final_pipeline_status="parked_or_placeholder",
+                    final_decision="UNCLASSIFIED",
+                    failure_reason=stored_parking.get("parking_reason", "parking_or_placeholder_excluded"),
+                    worker_id=worker_id,
+                )
+                _append_classify_stage_event(
+                    row=row,
+                    worker_id=worker_id,
+                    started_at=stage_started_at,
+                    started_monotonic=stage_started_monotonic,
+                    status="skipped_parked_page",
+                )
+                classify_metrics["parked"] += 1
+                classify_progress.mark_completed(final_status="parked_or_placeholder")
             return
         if fetch_status not in eligible_fetch_statuses:
             classification_decision = _hybrid_hash_decision(
@@ -1587,6 +1735,39 @@ async def _run_hash_only_pipeline(
                         "non_lexical_corroboration_count": non_lexical_corroboration_count,
                         **_stage1_debug_compat_payload(row),
                     }
+                )
+                _upsert_classify_checkpoint(
+                    row=row,
+                    stage_status=classification_gate_reason or "non_fetched",
+                    final_pipeline_status=(
+                        "completed" if emit_output else "review_only" if classification == "REVIEW_ONLY" else "classification_failed"
+                    ),
+                    final_decision=classification if emit_output else "UNCLASSIFIED" if classification == "REVIEW_ONLY" else "UNCLASSIFIED",
+                    failure_reason=review_only_reason or classification_gate_reason or fetch_status,
+                    worker_id=worker_id,
+                    submission_record=record if emit_output else None,
+                )
+                _append_classify_stage_event(
+                    row=row,
+                    worker_id=worker_id,
+                    started_at=stage_started_at,
+                    started_monotonic=stage_started_monotonic,
+                    status=classification_gate_reason or "non_fetched",
+                )
+                if emit_output:
+                    classify_metrics["outputs"] += 1
+                    if classification == "Legitimate":
+                        classify_metrics["legitimate"] += 1
+                    elif classification == "Suspected":
+                        classify_metrics["suspected"] += 1
+                    elif classification == "Phishing":
+                        classify_metrics["phishing"] += 1
+                elif classification == "REVIEW_ONLY":
+                    classify_metrics["review"] += 1
+                else:
+                    classify_metrics["failed"] += 1
+                classify_progress.mark_completed(
+                    final_status="completed" if emit_output else "review_only" if classification == "REVIEW_ONLY" else "classification_failed"
                 )
             return
         html_brand_text = " ".join(
@@ -1742,6 +1923,23 @@ async def _run_hash_only_pipeline(
                         **_stage1_debug_compat_payload(row),
                     }
                 )
+                _upsert_classify_checkpoint(
+                    row=row,
+                    stage_status="not_registered_domain",
+                    final_pipeline_status="not_registered_domain",
+                    final_decision="UNCLASSIFIED",
+                    failure_reason="rdap_not_found",
+                    worker_id=worker_id,
+                )
+                _append_classify_stage_event(
+                    row=row,
+                    worker_id=worker_id,
+                    started_at=stage_started_at,
+                    started_monotonic=stage_started_monotonic,
+                    status="not_registered_domain",
+                )
+                classify_metrics["failed"] += 1
+                classify_progress.mark_completed(final_status="not_registered_domain")
             return
 
         if reg_data is None and resolved_ip is not None:
@@ -1991,16 +2189,192 @@ async def _run_hash_only_pipeline(
                     **_stage1_debug_compat_payload(row),
                 }
             )
+        _upsert_classify_checkpoint(
+            row=row,
+            stage_status=classification_gate_reason or classification,
+            final_pipeline_status=(
+                "completed" if emit_output else "review_only" if classification == "REVIEW_ONLY" else "classification_failed"
+            ),
+            final_decision=classification if emit_output else "UNCLASSIFIED" if classification == "REVIEW_ONLY" else "UNCLASSIFIED",
+            failure_reason=review_only_reason or classification_gate_reason,
+            worker_id=worker_id,
+            submission_record=record if emit_output else None,
+        )
+        _append_classify_stage_event(
+            row=row,
+            worker_id=worker_id,
+            started_at=stage_started_at,
+            started_monotonic=stage_started_monotonic,
+            status=classification_gate_reason or classification,
+        )
+        if emit_output:
+            classify_metrics["outputs"] += 1
+            if classification == "Legitimate":
+                classify_metrics["legitimate"] += 1
+            elif classification == "Suspected":
+                classify_metrics["suspected"] += 1
+            elif classification == "Phishing":
+                classify_metrics["phishing"] += 1
+        elif classification == "REVIEW_ONLY":
+            classify_metrics["review"] += 1
+        else:
+            classify_metrics["failed"] += 1
+        classify_progress.mark_completed(
+            final_status="completed" if emit_output else "review_only" if classification == "REVIEW_ONLY" else "classification_failed"
+        )
+
+    classify_worker_count = max(1, min(32, NETWORK_SEMAPHORE_LIMIT, len(classified_df)))
+    classify_queue: asyncio.Queue[dict | None] = asyncio.Queue()
+    for row in classified_df.to_dict("records"):
+        await classify_queue.put(row)
+    for _ in range(classify_worker_count):
+        await classify_queue.put(None)
 
     async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
-        tasks = [
-            asyncio.create_task(_process_hash_row(row, client))
-            for row in classified_df.to_dict("records")
-        ]
-        task_results = await asyncio.gather(*tasks, return_exceptions=True)
-        for task_result in task_results:
-            if isinstance(task_result, Exception):
-                logger.error("Hash-only worker failed: %s", task_result)
+        try:
+            from tqdm import tqdm
+
+            progress_bar = tqdm(
+                total=len(classified_df),
+                desc="Stage3 classify",
+                unit="url",
+                leave=True,
+                dynamic_ncols=True,
+            )
+        except ImportError:
+            progress_bar = None
+
+        async def _progress_monitor() -> None:
+            if progress_bar is None:
+                return
+            last_completed = 0
+            while True:
+                await asyncio.sleep(0.5)
+                completed = classify_progress.completed
+                if completed > last_completed:
+                    progress_bar.update(completed - last_completed)
+                    last_completed = completed
+                progress_bar.set_postfix(
+                    {
+                        "act": len(active_workers),
+                        "q": classify_queue.qsize(),
+                        "out": classify_metrics["outputs"],
+                        "rev": classify_metrics["review"],
+                        "fail": classify_metrics["failed"],
+                    },
+                    refresh=False,
+                )
+                if completed >= len(classified_df):
+                    break
+
+        monitor_task = asyncio.create_task(_progress_monitor()) if progress_bar is not None else None
+
+        async def _classify_worker(worker_index: int) -> None:
+            worker_id = f"classify-{worker_index}"
+            while True:
+                row = await classify_queue.get()
+                if row is None:
+                    classify_queue.task_done()
+                    break
+                domain_url = str(row.get("Identified Phishing/Suspected Domain Name", "")).strip()
+                normalized_url = domain_url.strip().lower()
+                source_workbook = str(row.get("source_workbook", "") or "")
+                record_key = make_record_key(normalized_url, source_workbook)
+                active_workers[worker_id] = normalized_url
+                if checkpoint_store is not None:
+                    checkpoint_store.update_worker_heartbeat(
+                        stage_name="classify",
+                        worker_id=worker_id,
+                        record_key=record_key,
+                        state="running",
+                        details={"url": normalized_url},
+                    )
+                try:
+                    await async_with_timeout_and_retry(
+                        lambda: _process_hash_row(row, client, worker_id),
+                        timeout=30.0,
+                        max_retries=0,
+                    )
+                except Exception as exc:
+                    error = normalize_exception(exc)
+                    logger.error(
+                        "Hash-only worker failure | worker=%s | url=%s | %s: %s",
+                        worker_id,
+                        domain_url,
+                        error["error_type"],
+                        error["error_message"],
+                    )
+                    _upsert_classify_checkpoint(
+                        row=row,
+                        stage_status="failed",
+                        final_pipeline_status="classification_failed",
+                        final_decision="UNCLASSIFIED",
+                        failure_reason=error["error_message"],
+                        worker_id=worker_id,
+                        error_type=error["error_type"],
+                        error_message=error["error_message"],
+                    )
+                    _append_classify_stage_event(
+                        row=row,
+                        worker_id=worker_id,
+                        started_at=utc_now_iso(),
+                        started_monotonic=time.perf_counter(),
+                        status="failed",
+                        error_type=error["error_type"],
+                        error_message=error["error_message"],
+                    )
+                    classify_metrics["failed"] += 1
+                    classify_progress.mark_completed(final_status="classification_failed")
+                finally:
+                    active_workers.pop(worker_id, None)
+                    if checkpoint_store is not None:
+                        checkpoint_store.clear_worker_heartbeat(stage_name="classify", worker_id=worker_id)
+                    classify_queue.task_done()
+
+        classify_watchdog = StageWatchdog(
+            stage_name="classify",
+            progress_tracker=classify_progress,
+            checkpoint_store=checkpoint_store,
+            warn_after_seconds=run_context.watchdog_warning_seconds if run_context is not None else 60,
+            stall_after_seconds=run_context.stall_threshold_seconds if run_context is not None else 180,
+            queue_size_getter=classify_queue.qsize,
+            active_summary_getter=lambda: {"workers": classify_worker_count, "records": len(records), "reviews": len(review_queue_records)},
+            logger_instance=logger,
+        )
+        workers = [asyncio.create_task(_classify_worker(index)) for index in range(classify_worker_count)]
+        classify_watchdog.start()
+        try:
+            join_timeout = max(
+                run_context.stall_threshold_seconds if run_context is not None else 180,
+                30,
+            )
+            await asyncio.wait_for(classify_queue.join(), timeout=join_timeout)
+            await asyncio.gather(*workers)
+        except asyncio.TimeoutError as exc:
+            for worker in workers:
+                worker.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+            raise RuntimeError("Hash-only classification worker pool stalled before draining the queue") from exc
+        finally:
+            if monitor_task is not None:
+                monitor_task.cancel()
+                await asyncio.gather(monitor_task, return_exceptions=True)
+            if progress_bar is not None:
+                completed = classify_progress.completed
+                if completed > progress_bar.n:
+                    progress_bar.update(completed - progress_bar.n)
+                progress_bar.set_postfix(
+                    {
+                        "act": len(active_workers),
+                        "q": classify_queue.qsize(),
+                        "out": classify_metrics["outputs"],
+                        "rev": classify_metrics["review"],
+                        "fail": classify_metrics["failed"],
+                    },
+                    refresh=False,
+                )
+                progress_bar.close()
+            await classify_watchdog.stop()
 
     parked_skip_count = sum(
         1
@@ -2032,6 +2406,8 @@ async def _run_hash_only_pipeline(
     flagged_df.to_csv(filtered_output_path, index=False, encoding="utf-8")
     _write_debug_csv(stage2_model_debug_records, STAGE2_MODEL_DEBUG_PATH)
     _write_debug_csv(stage3_classification_debug_records, STAGE3_CLASSIFICATION_DEBUG_PATH)
+    if checkpoint_store is not None:
+        checkpoint_store.export_all()
     logger.info("Stage2 model debug written to %s (%d rows)", STAGE2_MODEL_DEBUG_PATH, len(stage2_model_debug_records))
     logger.info("Stage3 classification debug written to %s (%d rows)", STAGE3_CLASSIFICATION_DEBUG_PATH, len(stage3_classification_debug_records))
     logger.info("Hash-only final output written to %s (%d records)", FINAL_OUTPUT, len(df_out))
@@ -2070,6 +2446,10 @@ async def run_pipeline(
     keep_fetch_failed_strict_lexical=False,
     failed_fetch_suspected_min=None,
     failed_fetch_review_min=None,
+    run_context: RunContext | None = None,
+    checkpoint_store: CheckpointStore | None = None,
+    resume: bool = False,
+    force_reprocess: bool = False,
 ):
     import time
     from tqdm import tqdm as tqdm_sync
@@ -2163,6 +2543,10 @@ async def run_pipeline(
                 stage1_credential_min=stage1_credential_min,
                 stage1_low_band_min=stage1_low_band_min,
                 stage1_hard_trigger_brand_min=stage1_hard_trigger_brand_min,
+                run_context=run_context,
+                checkpoint_store=checkpoint_store,
+                resume=resume,
+                force_reprocess=force_reprocess,
             )
             
             os.makedirs(os.path.dirname(holdout_csv_path), exist_ok=True)
@@ -2199,23 +2583,23 @@ async def run_pipeline(
 
     # ── Resume from checkpoint if a previous run was interrupted ──────────
     done_domains = set()
-    if os.path.exists(CHECKPOINT_CSV):
+    if checkpoint_store is None and resume and not force_reprocess and os.path.exists(CHECKPOINT_CSV):
         try:
             df_ckpt = pd.read_csv(CHECKPOINT_CSV)
             done_domains = set(
                 df_ckpt["Identified Phishing/Suspected Domain Name"]
                 .astype(str).str.strip().str.lower()
             )
-            logger.info("♻️  Resuming: %d domains already in checkpoint", len(done_domains))
+            logger.info("Resuming from legacy checkpoint CSV: %d domains already completed", len(done_domains))
         except Exception as e:
-            logger.warning("⚠️ Could not read checkpoint, starting fresh: %s", e)
+            logger.warning("Could not read legacy checkpoint CSV, starting fresh: %s", e)
 
     if done_domains:
         df_filtered = df_filtered[
             ~df_filtered["Identified Phishing/Suspected Domain Name"]
              .astype(str).str.strip().str.lower().isin(done_domains)
         ]
-        logger.info("📋 %d domains remaining after checkpoint resume", len(df_filtered))
+        logger.info("%d domains remaining after legacy checkpoint resume", len(df_filtered))
 
     if pipeline_mode == "hash_only":
         df_out = await _run_hash_only_pipeline(
@@ -2225,8 +2609,12 @@ async def run_pipeline(
             medium_confidence_threshold=medium_confidence_threshold,
             failed_fetch_suspected_min=failed_fetch_suspected_min,
             failed_fetch_review_min=failed_fetch_review_min,
+            run_context=run_context,
+            checkpoint_store=checkpoint_store,
+            resume=resume,
+            force_reprocess=force_reprocess,
         )
-        if os.path.exists(CHECKPOINT_CSV):
+        if checkpoint_store is None and os.path.exists(CHECKPOINT_CSV):
             try:
                 os.remove(CHECKPOINT_CSV)
                 logger.info("🗑 Removed checkpoint file (hash-only pipeline completed successfully)")

@@ -8,6 +8,7 @@ import os
 import argparse
 import asyncio
 import logging
+import json
 from typing import Any
 
 # Event loop policy on Windows
@@ -58,6 +59,7 @@ if sys.platform.startswith("win"):
 
 
 def _non_negative_float(value: str) -> float:
+    fatal_stage = "controller_startup"
     try:
         parsed = float(value)
     except ValueError as exc:
@@ -112,6 +114,14 @@ def _runtime_profile(value: str) -> str:
     allowed = {"auto", "default", "cpu-safe", "cpu-recall", "cpu-fast"}
     if normalized not in allowed:
         raise argparse.ArgumentTypeError(f"runtime profile must be one of {sorted(allowed)}")
+    return normalized
+
+
+def _stage1_failure_policy(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    allowed = {"route_to_dns", "stop"}
+    if normalized not in allowed:
+        raise argparse.ArgumentTypeError(f"stage1 failure policy must be one of {sorted(allowed)}")
     return normalized
 
 
@@ -205,7 +215,7 @@ def _resolve_runtime_profile_settings(
                 "concurrency": 128,
                 "http_concurrency": 128,
                 "dns_concurrency": 128,
-                "rdap_concurrency": 6,
+                "rdap_concurrency": 4,
                 "tls_concurrency": 24,
             },
             "dns_max_workers": 256,
@@ -309,6 +319,27 @@ def _load_runtime_components() -> dict[str, Any]:
     return components
 
 
+def _load_existing_run_manifest(path: str) -> dict[str, Any] | None:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _manifest_matches_inputs(manifest: dict[str, Any] | None, metadata: dict[str, Any]) -> bool:
+    if not manifest:
+        return False
+    manifest_meta = manifest.get("metadata_json")
+    if not isinstance(manifest_meta, dict):
+        return False
+    for key in ("shortlisting", "whitelist", "pipeline_mode", "target_limit", "limit_whitelisted"):
+        if str(manifest_meta.get(key, "")) != str(metadata.get(key, "")):
+            return False
+    return True
+
+
 def clear_gpu_memory():
     """Clear GPU memory before pipeline run for better performance."""
     try:
@@ -401,7 +432,66 @@ async def main():
                         help="Optional partial-run mode: off, dns, fetch, lexical, score, classify, all (default=off)")
     parser.add_argument("--runtime-profile", type=_runtime_profile, default="auto",
                         help="Concurrency-only runtime preset. 'auto' is the default; 'default' is an alias for 'auto'.")
+    parser.add_argument("--run-id", type=str, default=None,
+                        help="Optional run identifier for reliability checkpoints and resumable outputs")
+    parser.add_argument("--resume", dest="resume", action=argparse.BooleanOptionalAction, default=True,
+                        help="Resume from the latest compatible incomplete run when possible (default=true)")
+    parser.add_argument("--force-reprocess", action="store_true",
+                        help="Ignore resume state and process all URL records again")
+    parser.add_argument("--stage1-failure-policy", type=_stage1_failure_policy, default="route_to_dns",
+                        help="Routing policy when cheap Stage1 HTTP analysis fails for lexical misses")
+    parser.add_argument("--stall-threshold-seconds", type=_positive_int, default=180,
+                        help="Watchdog threshold for no-progress detection in long-running stages (default=180)")
     args = parser.parse_args()
+
+    from phishing_pipeline.config import OUTPUT_DIR, RELIABILITY_CONFIG
+    from phishing_pipeline.reliability import CheckpointStore, build_run_context
+
+    reliability_metadata = {
+        "shortlisting": os.path.abspath(args.shortlisting),
+        "whitelist": os.path.abspath(args.whitelist),
+        "pipeline_mode": args.pipeline_mode,
+        "target_limit": args.target_limit,
+        "limit_whitelisted": args.limit,
+        "runtime_profile": args.runtime_profile,
+    }
+    existing_manifest = None
+    existing_run_id = None
+    if args.resume and not args.force_reprocess:
+        existing_manifest = _load_existing_run_manifest(os.path.join(OUTPUT_DIR, "run_manifest.json"))
+        if (
+            existing_manifest
+            and str(existing_manifest.get("status", "")).strip().lower() != "completed"
+            and _manifest_matches_inputs(existing_manifest, reliability_metadata)
+        ):
+            checkpoint_db_path = str(existing_manifest.get("checkpoint_db_path", "") or "")
+            if checkpoint_db_path and os.path.exists(checkpoint_db_path):
+                existing_run_id = str(existing_manifest.get("run_id", "") or "").strip() or None
+
+    resolved_run_id = args.run_id or existing_run_id
+    resuming_existing_run = bool(existing_run_id and resolved_run_id == existing_run_id and args.resume and not args.force_reprocess)
+    run_context = build_run_context(
+        output_dir=OUTPUT_DIR,
+        run_id=resolved_run_id,
+        stall_threshold_seconds=args.stall_threshold_seconds,
+        watchdog_warning_seconds=int(RELIABILITY_CONFIG.get("watchdog_warning_seconds", 60)),
+        export_flush_interval_seconds=int(RELIABILITY_CONFIG.get("export_flush_interval_seconds", 5)),
+        export_flush_row_interval=int(RELIABILITY_CONFIG.get("export_flush_row_interval", 50)),
+        stage1_failure_policy=args.stage1_failure_policy,
+        max_worker_restarts=int(RELIABILITY_CONFIG.get("max_worker_restarts", 2)),
+        metadata=reliability_metadata,
+    )
+    checkpoint_store = CheckpointStore(run_context)
+    checkpoint_store.update_manifest(status="running", metadata_json=reliability_metadata)
+    logger.info(
+        "Reliability run context | run_id=%s | resume=%s | force_reprocess=%s | checkpoint=%s | stage1_failure_policy=%s | stall_threshold_seconds=%d",
+        run_context.run_id,
+        resuming_existing_run,
+        args.force_reprocess,
+        run_context.checkpoint_db_path,
+        run_context.stage1_failure_policy,
+        run_context.stall_threshold_seconds,
+    )
 
     runtime_profile_settings = _resolve_runtime_profile_settings(args.runtime_profile)
     _apply_runtime_profile_env(runtime_profile_settings)
@@ -448,6 +538,21 @@ async def main():
         runtime_profile_settings.get("stage1_http", {}),
         effective_dns_max_workers if effective_dns_max_workers is not None else "adaptive",
     )
+    logger.info(
+        "Effective runtime concurrency | hash={pages=%s,page_concurrency=%s,http_limit=%s,aux_net_limit=%s,active_fetch_floor=%s,dns_gate_min=%s,dns_gate_max=%s} | stage1_http={url=%s,http=%s,dns=%s,rdap=%s,tls=%s}",
+        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_PAGES", "NA"),
+        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_PAGE_CONCURRENCY", "NA"),
+        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_HTTP_LIMIT", "NA"),
+        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_AUX_NET_LIMIT", "NA"),
+        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_ACTIVE_PAGES_FLOOR", "NA"),
+        runtime_profile_settings.get("env", {}).get("PHISHING_DNS_GATE_MIN_WORKERS", "NA"),
+        runtime_profile_settings.get("env", {}).get("PHISHING_DNS_GATE_MAX_WORKERS", "NA"),
+        stage1_http_config.get("concurrency", "NA"),
+        stage1_http_config.get("http_concurrency", "NA"),
+        stage1_http_config.get("dns_concurrency", "NA"),
+        stage1_http_config.get("rdap_concurrency", "NA"),
+        stage1_http_config.get("tls_concurrency", "NA"),
+    )
 
     # ✅ Ensure whitelist file exists
     if not os.path.exists(args.whitelist):
@@ -463,43 +568,44 @@ async def main():
         # 🧹 Clear GPU memory at the start of every run
         clear_gpu_memory()
 
-        # 🧹 Clear stale outputs from previous runs
-        import shutil
-        import glob
+        if resuming_existing_run:
+            logger.info("Resuming existing compatible run. Output cleanup is skipped for run_id=%s", run_context.run_id)
+        else:
+            # Preserve resumable artifacts unless this is a fresh run.
+            import shutil
+            import glob
 
-        evidence_dir = os.path.join("phishing_pipeline", "PS-02_ISS_NLP_Evidences")
-        packaged_submission_dir = os.path.join("output", "PS-02_ISS_NLP_Submission")
-        if os.path.isdir(evidence_dir):
-            shutil.rmtree(evidence_dir, ignore_errors=True)
-            logger.info("🧹 Cleared previous evidence directory: %s", evidence_dir)
-        if os.path.isdir(packaged_submission_dir):
-            shutil.rmtree(packaged_submission_dir, ignore_errors=True)
-            logger.info("🧹 Cleared stale packaged submission directory: %s", packaged_submission_dir)
-        # Remove old submission xlsx (temp file in phishing_pipeline/)
-        for xlsx in glob.glob(os.path.join("phishing_pipeline", "PS-02_*_Submission_Set.xlsx")):
-            os.remove(xlsx)
-            logger.info("🧹 Removed old submission xlsx: %s", xlsx)
+            evidence_dir = os.path.join("phishing_pipeline", "PS-02_ISS_NLP_Evidences")
+            packaged_submission_dir = os.path.join("output", "PS-02_ISS_NLP_Submission")
+            if os.path.isdir(evidence_dir):
+                shutil.rmtree(evidence_dir, ignore_errors=True)
+                logger.info("🧹 Cleared previous evidence directory: %s", evidence_dir)
+            if os.path.isdir(packaged_submission_dir):
+                shutil.rmtree(packaged_submission_dir, ignore_errors=True)
+                logger.info("🧹 Cleared stale packaged submission directory: %s", packaged_submission_dir)
+            for xlsx in glob.glob(os.path.join("phishing_pipeline", "PS-02_*_Submission_Set.xlsx")):
+                os.remove(xlsx)
+                logger.info("🧹 Removed old submission xlsx: %s", xlsx)
 
-        # Remove old submission zip and output CSVs
-        cleanup_patterns = [
-            os.path.join("output", "*.zip"),
-            os.path.join("output", "output_file.csv"),
-            os.path.join("output", "output_file_filtered.csv"),
-            os.path.join("output", "hash_review_queue.csv"),
-            os.path.join("output", "checkpoint_records.csv"),
-            os.path.join("output", "stage1_lexical_debug.csv"),
-            os.path.join("output", "stage1_methods_debug.csv"),
-            os.path.join("output", "stage1_deep_analysis_candidates.csv"),
-            os.path.join("output", "stage2_model_debug.csv"),
-            os.path.join("output", "stage3_classification_debug.csv"),
-            os.path.join("output", "parked_page_exclusions.csv"),
-        ]
-        if args.stage_smoke_test != "classify":
-            cleanup_patterns.append(os.path.join("output", "holdout.csv"))
-        for pattern in cleanup_patterns:
-            for f in glob.glob(pattern):
-                os.remove(f)
-                logger.info("🧹 Removed old output: %s", f)
+            cleanup_patterns = [
+                os.path.join("output", "*.zip"),
+                os.path.join("output", "output_file.csv"),
+                os.path.join("output", "output_file_filtered.csv"),
+                os.path.join("output", "hash_review_queue.csv"),
+                os.path.join("output", "checkpoint_records.csv"),
+                os.path.join("output", "stage1_lexical_debug.csv"),
+                os.path.join("output", "stage1_methods_debug.csv"),
+                os.path.join("output", "stage1_deep_analysis_candidates.csv"),
+                os.path.join("output", "stage2_model_debug.csv"),
+                os.path.join("output", "stage3_classification_debug.csv"),
+                os.path.join("output", "parked_page_exclusions.csv"),
+            ]
+            if args.stage_smoke_test != "classify":
+                cleanup_patterns.append(os.path.join("output", "holdout.csv"))
+            for pattern in cleanup_patterns:
+                for f in glob.glob(pattern):
+                    os.remove(f)
+                    logger.info("🧹 Removed old output: %s", f)
         
         logger.info("Using whitelist file: %s", args.whitelist)
         logger.info("Using shortlisting folder: %s", args.shortlisting)
@@ -589,6 +695,7 @@ async def main():
         # Try the new-style orchestration (controller -> comparison -> pipeline)
         if run_hashing_shortlist_async and shortlisting:
             if args.stage_smoke_test == "classify":
+                fatal_stage = "classify"
                 existing_holdout = os.path.join("output", "holdout.csv")
                 if not os.path.exists(existing_holdout):
                     raise FileNotFoundError("stage-smoke-test=classify requires an existing output/holdout.csv")
@@ -622,10 +729,15 @@ async def main():
                     keep_fetch_failed_strict_lexical=args.keep_fetch_failed_strict_lexical,
                     failed_fetch_suspected_min=args.failed_fetch_suspected_min,
                     failed_fetch_review_min=args.failed_fetch_review_min,
+                    run_context=run_context,
+                    checkpoint_store=checkpoint_store,
+                    resume=args.resume,
+                    force_reprocess=args.force_reprocess,
                 )
                 logger.info("--- Finished Stage Smoke Test classify ---")
             else:
             # 1. Run Shortlisting using phishing_pipeline.comparison
+                fatal_stage = "shortlist"
                 logger.info("--- Starting Step 1: Running Hashing-based Shortlisting ---")
                 url_records = shortlisting.load_url_records_from_excel_folder(
                     args.shortlisting,
@@ -670,6 +782,10 @@ async def main():
                     stage1_credential_min=args.stage1_credential_min,
                     stage1_low_band_min=args.stage1_low_band_min,
                     stage1_hard_trigger_brand_min=args.stage1_hard_trigger_brand_min,
+                    run_context=run_context,
+                    checkpoint_store=checkpoint_store,
+                    resume=args.resume,
+                    force_reprocess=args.force_reprocess,
                 )
                 
                 # Save output to holdout.csv
@@ -681,9 +797,12 @@ async def main():
                 if args.stage_smoke_test in {"dns", "fetch", "lexical", "score"}:
                     logger.info("Stage smoke test '%s' requested. Stopping after Step 1.", args.stage_smoke_test)
                     df_out = holdout_df
+                    checkpoint_store.mark_completed()
+                    checkpoint_store.export_all()
                     return
                 
                 # 2. Run Pipeline
+                fatal_stage = "classify"
                 logger.info("--- Starting Step 2: Running Main Pipeline ---")
                 
                 df_out = await run_pipeline(
@@ -715,12 +834,17 @@ async def main():
                     keep_fetch_failed_strict_lexical=args.keep_fetch_failed_strict_lexical,
                     failed_fetch_suspected_min=args.failed_fetch_suspected_min,
                     failed_fetch_review_min=args.failed_fetch_review_min,
+                    run_context=run_context,
+                    checkpoint_store=checkpoint_store,
+                    resume=args.resume,
+                    force_reprocess=args.force_reprocess,
                 )
                 
                 logger.info("--- Finished Step 2: Main Pipeline Complete ---")
 
         # Fallback to old style (pipeline does everything)
         elif run_pipeline is not None:
+            fatal_stage = "pipeline"
             logger.warning("Could not find shortlisting.run_shortlisting_process. Falling back to old pipeline-only mode.")
             try:
                 df_out = await run_pipeline(
@@ -751,6 +875,10 @@ async def main():
                     keep_fetch_failed_strict_lexical=args.keep_fetch_failed_strict_lexical,
                     failed_fetch_suspected_min=args.failed_fetch_suspected_min,
                     failed_fetch_review_min=args.failed_fetch_review_min,
+                    run_context=run_context,
+                    checkpoint_store=checkpoint_store,
+                    resume=args.resume,
+                    force_reprocess=args.force_reprocess,
                 )
             except TypeError:
                 df_out = await run_pipeline(args.shortlisting, args.whitelist, args.limit)
@@ -761,6 +889,7 @@ async def main():
         zip_path = None
         if package_results is not None:
             try:
+                fatal_stage = "package"
                 input_name = os.path.basename(os.path.normpath(args.shortlisting))
                 zip_path = package_results(zip_path=f"Submission-{input_name}.zip")
                 logger.info("Packaged results into: %s", zip_path)
@@ -776,6 +905,13 @@ async def main():
                 print(df_out.head(10))
             except Exception:
                 logger.info("Output is not a pandas DataFrame or cannot be printed.")
+        checkpoint_store.mark_completed()
+        checkpoint_store.export_all()
+
+    except Exception as exc:
+        checkpoint_store.mark_failed(stage=fatal_stage, exc=exc)
+        checkpoint_store.export_all()
+        raise
 
     finally:
         # Always attempt to close the visual browser (if available)
@@ -793,6 +929,10 @@ async def main():
             logger.info("Cleaned up orphaned Chrome processes.")
         except Exception:
             pass  # Expected to fail on Windows
+        try:
+            checkpoint_store.close()
+        except Exception as exc:
+            logger.warning("Checkpoint store close failed: %s", exc)
 
 
 if __name__ == "__main__":

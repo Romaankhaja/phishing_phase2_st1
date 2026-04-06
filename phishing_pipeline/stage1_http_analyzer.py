@@ -897,6 +897,12 @@ def _default_stage1_result(url: str) -> dict[str, Any]:
         "csc_mention_count": 0,
         "escalate_to_hashing": False,
         "escalate_reason": "stage1_fetch_failed",
+        "stage1_error_type": "",
+        "stage1_error_message": "",
+        "stage1_retry_count": 0,
+        "stage1_timeout_hit": False,
+        "html_truncated": False,
+        "fallback_taken": "",
     }
 
 
@@ -918,6 +924,8 @@ async def analyze_stage1_url(
     if not normalized_url:
         result["fetch_error_type"] = "invalid_url"
         result["fetch_error_detail"] = "empty url"
+        result["stage1_error_type"] = "invalid_url"
+        result["stage1_error_message"] = "empty url"
         return result
 
     redirect_chain: list[str] = []
@@ -938,6 +946,8 @@ async def analyze_stage1_url(
         except Exception as exc:
             result["fetch_error_type"] = "head_error"
             result["fetch_error_detail"] = str(exc)
+            result["stage1_error_type"] = exc.__class__.__name__
+            result["stage1_error_message"] = str(exc) or exc.__class__.__name__
 
         try:
             async with client.stream(
@@ -980,6 +990,7 @@ async def analyze_stage1_url(
                         chunks.append(piece)
                         total += len(piece)
                         if total >= int(config["max_html_bytes"]):
+                            result["html_truncated"] = True
                             break
                     html_bytes = b"".join(chunks)
         except Exception as exc:
@@ -989,6 +1000,8 @@ async def analyze_stage1_url(
                 result["fetch_status"] = "head_only"
             result["fetch_error_type"] = "get_error"
             result["fetch_error_detail"] = str(exc)
+            result["stage1_error_type"] = exc.__class__.__name__
+            result["stage1_error_message"] = str(exc) or exc.__class__.__name__
 
     await _run_with_optional_semaphore(
         concurrency_controls.http_semaphore,
@@ -1080,4 +1093,8 @@ async def analyze_stage1_url(
     if not result["stage1_reasons"] and result["fetch_status"] == "failed":
         result["stage1_reasons"] = "stage1_fetch_failed"
         result["escalate_reason"] = "stage1_fetch_failed"
+        if not result["stage1_error_type"]:
+            result["stage1_error_type"] = str(result.get("fetch_error_type") or "stage1_fetch_failed")
+        if not result["stage1_error_message"]:
+            result["stage1_error_message"] = str(result.get("fetch_error_detail") or "fetch attempts exhausted")
     return result

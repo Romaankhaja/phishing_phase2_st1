@@ -1,0 +1,19 @@
+{
+  "checkpoint_db_path": "c:\\Users\\SATWIK\\Documents\\Phishing\\output\\checkpoints\\run_20260406T114645Z\\pipeline_state.sqlite3",
+  "completed_at": "2026-04-06T12:00:32+00:00",
+  "fatal_error_message": "DNS gate worker pool stalled before draining the queue",
+  "fatal_error_type": "RuntimeError",
+  "fatal_stage": "shortlist",
+  "metadata_json": {
+    "limit_whitelisted": null,
+    "pipeline_mode": "hash_only",
+    "runtime_profile": "auto",
+    "shortlisting": "C:\\Users\\SATWIK\\Documents\\Phishing\\data\\holdout_sets",
+    "target_limit": null,
+    "whitelist": "C:\\Users\\SATWIK\\Documents\\Phishing\\data\\whitelists\\Stage_2_Legitimate_Domains_80.xlsx"
+  },
+  "run_id": "run_20260406T114645Z",
+  "started_at": "2026-04-06T11:46:45+00:00",
+  "status": "completed",
+  "updated_at": "2026-04-06T12:00:32+00:00"
+}

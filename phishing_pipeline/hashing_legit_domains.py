@@ -1,6 +1,5 @@
 ﻿import pandas as pd
 import json
-import hashlib
 import asyncio
 import ssl
 import os
@@ -14,6 +13,11 @@ from playwright.async_api import async_playwright
 from PIL import Image
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
+from .similarity_hashing import (
+    compute_domain_simhash,
+    compute_image_phash,
+    compute_ssl_simhash,
+)
 
 try:
     import aiohttp
@@ -70,18 +74,6 @@ def _runtime_parallelism() -> tuple[int, int]:
 
 MAX_CONCURRENT_PAGES, CLIP_BATCH_SIZE = _runtime_parallelism()
 
-###############################################
-# HELPERS
-###############################################
-
-def sha256_text(text):
-    return hashlib.sha256(text.encode()).hexdigest()
-
-
-def sha256_bytes(data):
-    return hashlib.sha256(data).hexdigest()
-
-
 # â”€â”€ Async favicon fetching â”€â”€
 async def favicon_hash_async(domain, session=None):
     """Fetch favicon hash using aiohttp (non-blocking) or requests fallback."""
@@ -94,7 +86,7 @@ async def favicon_hash_async(domain, session=None):
             ) as resp:
                 if resp.status == 200:
                     data = await resp.read()
-                    return sha256_bytes(data)
+                    return compute_image_phash(data)
         except Exception:
             pass
         return None
@@ -109,7 +101,7 @@ def _favicon_hash_sync(domain):
         import requests
         r = requests.get(f"https://{domain}/favicon.ico", timeout=5)
         if r.status_code == 200:
-            return sha256_bytes(r.content)
+            return compute_image_phash(r.content)
     except Exception:
         pass
     return None
@@ -131,14 +123,14 @@ async def get_ssl_hash_async(domain):
         )
         ssl_obj = writer.get_extra_info("ssl_object")
         if ssl_obj:
-            cert_der = ssl_obj.getpeercert(binary_form=True)
+            cert_info = ssl_obj.getpeercert()
             writer.close()
             try:
                 await writer.wait_closed()
             except Exception:
                 pass
-            if cert_der:
-                return sha256_bytes(cert_der)
+            if cert_info:
+                return compute_ssl_simhash(cert_info)
         writer.close()
     except Exception:
         pass
@@ -152,7 +144,7 @@ def get_ssl_hash(domain):
         import socket
         with socket.create_connection((domain, 443), timeout=5) as sock:
             with ctx.wrap_socket(sock, server_hostname=domain) as ssock:
-                return sha256_bytes(ssock.getpeercert(binary_form=True))
+                return compute_ssl_simhash(ssock.getpeercert())
     except Exception:
         return None
 
@@ -229,10 +221,10 @@ async def _scan_domain(domain, entity, context, semaphore, aio_session, lock,
 
             async with lock:
                 entity_db[entity]["domains"].append(domain)
-                entity_db[entity]["domain_hashes"].append(sha256_text(domain))
-                entity_db[entity]["html_hashes"].append(sha256_text(html))
-                entity_db[entity]["favicon_hashes"].append(fav_result)
-                entity_db[entity]["ssl_hashes"].append(ssl_result)
+                entity_db[entity]["domain_simhashes"].append(compute_domain_simhash(domain))
+                entity_db[entity]["page_phashes"].append(compute_image_phash(screenshot))
+                entity_db[entity]["favicon_phashes"].append(fav_result)
+                entity_db[entity]["ssl_simhashes"].append(ssl_result)
                 pending_clips[entity].append(img)
 
         except Exception as e:
@@ -273,11 +265,11 @@ async def generate_hashes():
 
             entity_db[entity] = {
                 "domains": [],
-                "domain_hashes": [],
-                "html_hashes": [],
+                "domain_simhashes": [],
+                "page_phashes": [],
                 "screenshot_clip": [],   # will be filled in Phase 2
-                "favicon_hashes": [],
-                "ssl_hashes": [],
+                "favicon_phashes": [],
+                "ssl_simhashes": [],
                 "keywords": []
             }
 
@@ -338,9 +330,16 @@ asyncio.run(generate_hashes())
 # SAVE
 ###############################################
 
-with open(os.path.join(os.path.dirname(BASE_DIR), "data", "entity_hash_db.json"), "w") as f:
-    json.dump(entity_db, f, indent=4)
+output_payload = {
+    "_meta": {
+        "hash_schema_version": 2,
+    },
+    **entity_db,
+}
+
+with open(os.path.join(os.path.dirname(BASE_DIR), "data", "entity_hash_db.json"), "w", encoding="utf-8") as f:
+    json.dump(output_payload, f, indent=4)
 
 
-print("âœ… DB GENERATED WITH CLIP")
+print("âœ… DB GENERATED WITH SIMILARITY HASHES (schema v2) + CLIP")
 

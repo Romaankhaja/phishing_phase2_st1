@@ -35,6 +35,10 @@ CITY_DB_PATH = os.path.join(GEOLITE_DIR, "GeoLite2-City.mmdb")
 WHITELISTS_DIR  = os.path.join(ROOT_DIR, "data", "whitelists")
 HOLDOUT_SETS_DIR = os.path.join(ROOT_DIR, "data", "holdout_sets")
 OUTPUT_DIR      = os.path.join(ROOT_DIR, "output")
+CHECKPOINTS_DIR = os.path.join(OUTPUT_DIR, "checkpoints")
+PIPELINE_RUN_RESULTS_CSV = os.path.join(OUTPUT_DIR, "pipeline_run_results.csv")
+PIPELINE_STAGE_EVENTS_CSV = os.path.join(OUTPUT_DIR, "pipeline_stage_events.csv")
+RUN_MANIFEST_JSON = os.path.join(OUTPUT_DIR, "run_manifest.json")
 
 # Screenshots & Evidence
 SCREENS_DIR  = os.path.join(BASE_DIR, "screens")
@@ -72,6 +76,15 @@ STAGE1_HTTP_CONFIG = {
 STAGE3_RECALL_RESCUE_CONFIG = {
     "failed_fetch_suspected_min": None,
     "failed_fetch_review_min": None,
+}
+
+RELIABILITY_CONFIG = {
+    "stall_threshold_seconds": 180,
+    "watchdog_warning_seconds": 60,
+    "export_flush_interval_seconds": 5,
+    "export_flush_row_interval": 50,
+    "stage1_failure_policy": "route_to_dns",
+    "max_worker_restarts": 2,
 }
 
 

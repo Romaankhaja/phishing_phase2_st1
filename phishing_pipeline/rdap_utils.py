@@ -2,6 +2,7 @@ import asyncio
 import copy
 import logging
 import random
+import time
 from typing import Dict, Any, Optional
 
 import httpx
@@ -13,8 +14,10 @@ RDAP_BOOTSTRAP_URL = "https://rdap.org/domain/"
 RDAP_RETRY_ATTEMPTS = 3
 RDAP_RETRY_BASE_DELAY_S = 0.25
 RDAP_RETRY_MAX_DELAY_S = 1.5
+RDAP_FAILURE_COOLDOWN_S = 90.0
 
 _RDAP_CACHE: dict[str, Dict[str, Any]] = {}
+_RDAP_FAILURE_CACHE: dict[str, tuple[float, Dict[str, Any]]] = {}
 _RDAP_IN_FLIGHT: dict[str, asyncio.Task] = {}
 _RDAP_METRICS = {
     "success": 0,
@@ -23,6 +26,8 @@ _RDAP_METRICS = {
     "retry_exhausted": 0,
     "exception": 0,
     "cache_hit": 0,
+    "inflight_wait": 0,
+    "cooldown_hit": 0,
 }
 _rdap_lock: asyncio.Lock | None = None
 
@@ -52,6 +57,7 @@ def _record_metric(name: str, increment: int = 1) -> None:
 
 def reset_rdap_state() -> None:
     _RDAP_CACHE.clear()
+    _RDAP_FAILURE_CACHE.clear()
     _RDAP_IN_FLIGHT.clear()
     for key in list(_RDAP_METRICS.keys()):
         _RDAP_METRICS[key] = 0
@@ -73,12 +79,23 @@ def _retry_delay_seconds(attempt_index: int) -> float:
     return float(base_delay + random.uniform(0.0, 0.1))
 
 
+def _failure_cache_entry(result: Dict[str, Any]) -> tuple[float, Dict[str, Any]]:
+    return (time.monotonic() + RDAP_FAILURE_COOLDOWN_S, copy.deepcopy(result))
+
+
+def _is_failure_cache_active(entry: tuple[float, Dict[str, Any]] | None) -> bool:
+    if not entry:
+        return False
+    expires_at, _ = entry
+    return float(expires_at) > time.monotonic()
+
+
 async def _lookup_rdap_uncached(
     domain: str,
     *,
     client: Optional[httpx.AsyncClient] = None,
     timeout: Optional[float] = None,
-) -> Dict[str, Any]:
+) -> tuple[Dict[str, Any], str]:
     local_client = False
     effective_timeout = float(timeout) if timeout is not None else 10.0
     if client is None:
@@ -108,11 +125,11 @@ async def _lookup_rdap_uncached(
                     continue
                 _record_metric("retry_exhausted")
                 logger.error("RDAP lookup exception for %s: %s", domain, message)
-                return result
+                return result, "failure_cooldown"
             except Exception as exc:
                 _record_metric("exception")
                 logger.error("RDAP lookup exception for %s: %s", domain, _format_exception_message(exc))
-                return result
+                return result, "none"
 
             if response.status_code == 200:
                 try:
@@ -120,21 +137,20 @@ async def _lookup_rdap_uncached(
                 except Exception as exc:
                     _record_metric("exception")
                     logger.error("RDAP lookup exception for %s: %s", domain, _format_exception_message(exc))
-                    return result
+                    return result, "none"
                 result["raw_rdap"] = data
                 result.update(_parse_rdap_response(data))
                 _record_metric("success")
                 if attempt > 1:
                     _record_metric("retry_success")
-                return result
+                return result, "cache"
 
             if response.status_code == 404:
                 logger.debug("RDAP 404 for %s: Domain not found or no RDAP entry.", domain)
-                return result
+                return result, "cache"
 
             if response.status_code == 429:
                 _record_metric("429")
-                logger.warning("RDAP 429 Rate Limit for %s.", domain)
                 if attempt < RDAP_RETRY_ATTEMPTS:
                     delay_s = _retry_delay_seconds(attempt)
                     logger.debug(
@@ -147,15 +163,21 @@ async def _lookup_rdap_uncached(
                     await asyncio.sleep(delay_s)
                     continue
                 _record_metric("retry_exhausted")
-                return result
+                logger.warning(
+                    "RDAP 429 Rate Limit for %s after %d attempts; entering %.0fs cooldown.",
+                    domain,
+                    RDAP_RETRY_ATTEMPTS,
+                    RDAP_FAILURE_COOLDOWN_S,
+                )
+                return result, "failure_cooldown"
 
             logger.debug("RDAP lookup failed for %s with status %s", domain, response.status_code)
-            return result
+            return result, "none"
     finally:
         if local_client:
             await client.aclose()
 
-    return result
+    return result, "none"
 
 async def lookup_rdap(
     domain: str,
@@ -192,6 +214,12 @@ async def lookup_rdap(
         if cached is not None:
             _record_metric("cache_hit")
             return copy.deepcopy(cached)
+        failure_cached = _RDAP_FAILURE_CACHE.get(normalized_domain)
+        if _is_failure_cache_active(failure_cached):
+            _record_metric("cooldown_hit")
+            return copy.deepcopy(failure_cached[1])
+        if failure_cached is not None:
+            _RDAP_FAILURE_CACHE.pop(normalized_domain, None)
         task = _RDAP_IN_FLIGHT.get(normalized_domain)
         if task is None:
             creator = True
@@ -204,17 +232,25 @@ async def lookup_rdap(
             )
             _RDAP_IN_FLIGHT[normalized_domain] = task
         else:
-            _record_metric("cache_hit")
+            _record_metric("inflight_wait")
 
-    result = await task
+    result, cache_policy = await task
 
     async with lock:
         existing_task = _RDAP_IN_FLIGHT.get(normalized_domain)
         if existing_task is task:
             _RDAP_IN_FLIGHT.pop(normalized_domain, None)
-            _RDAP_CACHE[normalized_domain] = copy.deepcopy(result)
-        elif creator and normalized_domain not in _RDAP_CACHE:
-            _RDAP_CACHE[normalized_domain] = copy.deepcopy(result)
+            if cache_policy == "cache":
+                _RDAP_CACHE[normalized_domain] = copy.deepcopy(result)
+                _RDAP_FAILURE_CACHE.pop(normalized_domain, None)
+            elif cache_policy == "failure_cooldown":
+                _RDAP_FAILURE_CACHE[normalized_domain] = _failure_cache_entry(result)
+        elif creator:
+            if cache_policy == "cache" and normalized_domain not in _RDAP_CACHE:
+                _RDAP_CACHE[normalized_domain] = copy.deepcopy(result)
+                _RDAP_FAILURE_CACHE.pop(normalized_domain, None)
+            elif cache_policy == "failure_cooldown" and normalized_domain not in _RDAP_FAILURE_CACHE:
+                _RDAP_FAILURE_CACHE[normalized_domain] = _failure_cache_entry(result)
 
     return copy.deepcopy(result)
 

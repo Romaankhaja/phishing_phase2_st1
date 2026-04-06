@@ -76,7 +76,7 @@ class RuntimeProfileTests(unittest.TestCase):
 
         self.assertEqual(settings["dns_max_workers"], 256)
         self.assertEqual(settings["stage1_http"]["concurrency"], 128)
-        self.assertEqual(settings["stage1_http"]["rdap_concurrency"], 6)
+        self.assertEqual(settings["stage1_http"]["rdap_concurrency"], 4)
         self.assertEqual(settings["env"]["PHISHING_HASH_PAGES"], 20)
 
     def test_apply_runtime_profile_env_sets_overrides(self):

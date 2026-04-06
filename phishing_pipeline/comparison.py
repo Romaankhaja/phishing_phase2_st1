@@ -30,10 +30,28 @@ import unicodedata
 import psutil
 from contextlib import suppress
 from .config import STAGE1_HTTP_CONFIG, resolve_stage1_http_config
+from .similarity_hashing import (
+    SIMHASH_BITS,
+    best_similarity_against_set,
+    compute_domain_simhash,
+    compute_image_phash,
+    compute_ssl_simhash,
+)
 from .stage1_http_analyzer import (
     analyze_stage1_url,
     build_stage1_concurrency_controls,
     get_stage1_entity_context,
+)
+from .reliability import (
+    CheckpointStore,
+    ProgressTracker,
+    RunContext,
+    StageWatchdog,
+    async_with_timeout_and_retry,
+    make_record_key,
+    normalize_exception,
+    stage_result_patch,
+    utc_now_iso,
 )
 from .shortlisting import (
     normalize_url as _legacy_normalize_url,
@@ -469,8 +487,22 @@ def phash_distance(hash1, hash2):
 # LOAD DATA
 ###############################################
 
-with open(os.path.join(os.path.dirname(BASE_DIR), "data", "entity_hash_db.json")) as f:
-    entity_db = json.load(f)
+def _load_entity_db():
+    with open(os.path.join(os.path.dirname(BASE_DIR), "data", "entity_hash_db.json"), encoding="utf-8") as fh:
+        raw_data = json.load(fh)
+    if not isinstance(raw_data, dict):
+        raise ValueError("entity_hash_db.json must contain a top-level object")
+    metadata = raw_data.get("_meta") if isinstance(raw_data.get("_meta"), dict) else {}
+    entities = {
+        key: value
+        for key, value in raw_data.items()
+        if key != "_meta" and isinstance(value, dict)
+    }
+    return entities, metadata
+
+
+entity_db, _entity_db_meta = _load_entity_db()
+_USE_SIMILARITY_HASHING = int(_entity_db_meta.get("hash_schema_version", 1) or 1) >= 2
 
 
 # âœ… CSV LOADER (NEW)
@@ -529,6 +561,14 @@ DEFAULT_SCORING_WEIGHTS = {
     "keywords": 10.0,
 }
 _SCORING_WEIGHT_KEYS = tuple(DEFAULT_SCORING_WEIGHTS.keys())
+_HASH_SIMILARITY_BITS = SIMHASH_BITS
+_FAVICON_HASH_HIT_DISTANCE = 8
+_FAVICON_HASH_ANCHOR_DISTANCE = 4
+_PAGE_HASH_HIT_DISTANCE = 10
+_PAGE_HASH_ANCHOR_DISTANCE = 5
+_SSL_HASH_HIT_DISTANCE = 8
+_SSL_HASH_ANCHOR_DISTANCE = 3
+_DOMAIN_HASH_HIT_DISTANCE = 6
 
 
 def _format_weights_for_logging(weights: dict) -> str:
@@ -559,6 +599,90 @@ def _resolve_source_workbook_map(url_sources: dict | None) -> dict[str, str]:
             continue
         resolved[normalized_url] = _normalize_source_workbook_value(raw_value)
     return resolved
+
+
+def _upsert_shortlist_checkpoint(
+    *,
+    run_context: RunContext | None,
+    checkpoint_store: CheckpointStore | None,
+    raw_url: str,
+    normalized_url: str,
+    source_workbook: str,
+    stage_name: str,
+    stage_status: str,
+    current_stage: str | None = None,
+    retry_count: int = 0,
+    timeout_hit: bool = False,
+    fallback_taken: str = "",
+    worker_id: str = "",
+    error_type: str = "",
+    error_message: str = "",
+    final_pipeline_status: str | None = None,
+    failure_reason: str | None = None,
+) -> None:
+    if checkpoint_store is None or run_context is None:
+        return
+    checkpoint_store.upsert_url_result(
+        stage_result_patch(
+            run_id=run_context.run_id,
+            raw_url=raw_url,
+            normalized_url=normalized_url,
+            source_workbook=source_workbook,
+            stage_name=stage_name,
+            stage_status=stage_status,
+            current_stage=current_stage or stage_name,
+            retry_count=retry_count,
+            timeout_hit=timeout_hit,
+            fallback_taken=fallback_taken,
+            worker_id=worker_id,
+            error_type=error_type,
+            error_message=error_message,
+            final_pipeline_status=final_pipeline_status,
+            failure_reason=failure_reason,
+        )
+    )
+
+
+def _append_shortlist_stage_event(
+    *,
+    run_context: RunContext | None,
+    checkpoint_store: CheckpointStore | None,
+    raw_url: str,
+    normalized_url: str,
+    source_workbook: str,
+    stage_name: str,
+    worker_id: str,
+    started_at: str,
+    started_monotonic: float,
+    status: str,
+    retry_count: int = 0,
+    timeout_flag: bool = False,
+    error_type: str = "",
+    error_message: str = "",
+    fallback_taken: str = "",
+) -> None:
+    if checkpoint_store is None or run_context is None:
+        return
+    checkpoint_store.append_stage_event(
+        {
+            "run_id": run_context.run_id,
+            "record_key": make_record_key(normalized_url, source_workbook),
+            "source_workbook": source_workbook,
+            "normalized_url": normalized_url,
+            "stage_name": stage_name,
+            "attempt_index": max(1, int(retry_count) + 1),
+            "worker_id": worker_id,
+            "started_at": started_at,
+            "finished_at": utc_now_iso(),
+            "duration_ms": int(max(0.0, (time.perf_counter() - started_monotonic) * 1000.0)),
+            "status": status,
+            "error_type": error_type,
+            "error_message": error_message,
+            "retry_count": int(retry_count),
+            "timeout_flag": int(bool(timeout_flag)),
+            "fallback_taken": fallback_taken,
+        }
+    )
 
 
 def _coerce_optional_stage1_threshold(
@@ -1255,6 +1379,14 @@ def _build_prefetch_decision_row(
         "lexical_score": round(float(prefetch_metrics.get("best_lexical_score", 0.0)), 4),
         **_stage1_signal_defaults(),
         "clip_similarity": 0.0,
+        "favicon_hash_similarity": 0.0,
+        "favicon_hash_distance": -1,
+        "page_hash_similarity": 0.0,
+        "page_hash_distance": -1,
+        "domain_hash_similarity": 0.0,
+        "domain_hash_distance": -1,
+        "ssl_hash_similarity": 0.0,
+        "ssl_hash_distance": -1,
         "typo_similarity": round(float(prefetch_metrics.get("best_typo_similarity", 0.0)), 4),
         "generic_token_only_match": bool(prefetch_metrics.get("generic_token_only_match", False)),
         "direct_brand_evidence_count": 0,
@@ -1396,6 +1528,14 @@ def _empty_shortlist_df():
             "typo_min_score_used",
             "typo_decision_reason",
             "clip_similarity",
+            "favicon_hash_similarity",
+            "favicon_hash_distance",
+            "page_hash_similarity",
+            "page_hash_distance",
+            "domain_hash_similarity",
+            "domain_hash_distance",
+            "ssl_hash_similarity",
+            "ssl_hash_distance",
             "typo_anchor",
             "hash_anchor",
             "clip_anchor",
@@ -1698,6 +1838,14 @@ def _build_stage1_passthrough_holdout_row(stage1_row: dict, scoring_config: dict
             else "below_min_score"
         ),
         "clip_similarity": 0.0,
+        "favicon_hash_similarity": 0.0,
+        "favicon_hash_distance": -1,
+        "page_hash_similarity": 0.0,
+        "page_hash_distance": -1,
+        "domain_hash_similarity": 0.0,
+        "domain_hash_distance": -1,
+        "ssl_hash_similarity": 0.0,
+        "ssl_hash_distance": -1,
         "typo_anchor": bool(stage1_row.get("strict_lexical_hit", False)) and typo_similarity >= scoring_config["typo_min_score"],
         "hash_anchor": False,
         "clip_anchor": False,
@@ -1774,6 +1922,14 @@ _STAGE1_DEBUG_FIELDNAMES = [
     "escalate_to_hashing",
     "escalate_reason",
     "clip_similarity",
+    "favicon_hash_similarity",
+    "favicon_hash_distance",
+    "page_hash_similarity",
+    "page_hash_distance",
+    "domain_hash_similarity",
+    "domain_hash_distance",
+    "ssl_hash_similarity",
+    "ssl_hash_distance",
     "typo_similarity",
     "generic_token_only_match",
     "direct_brand_evidence_count",
@@ -2424,7 +2580,7 @@ async def _route_nonessential_requests(route):
 
 # â”€â”€ Async favicon fetching (non-blocking) â”€â”€
 async def favicon_hash_async(domain, session=None):
-    """Fetch favicon hash using aiohttp (non-blocking) or requests fallback."""
+    """Fetch favicon perceptual hash using aiohttp (non-blocking) or requests fallback."""
     async with _get_aux_net_semaphore():
         if _has_aiohttp and session is not None:
             try:
@@ -2435,6 +2591,8 @@ async def favicon_hash_async(domain, session=None):
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.read()
+                        if _USE_SIMILARITY_HASHING:
+                            return compute_image_phash(data)
                         return hashlib.sha256(data).hexdigest()
             except Exception:
                 pass
@@ -2451,6 +2609,8 @@ def _favicon_hash_sync(domain):
     try:
         r = requests.get(f"https://{domain}/favicon.ico", timeout=5)
         if r.status_code == 200:
+            if _USE_SIMILARITY_HASHING:
+                return compute_image_phash(r.content)
             return hashlib.sha256(r.content).hexdigest()
     except Exception:
         pass
@@ -2463,7 +2623,7 @@ def favicon_hash(domain):
 
 
 async def get_ssl_hash_async(domain):
-    """Non-blocking SSL certificate hash fetch."""
+    """Non-blocking SSL identity similarity-hash fetch."""
     async with _get_aux_net_semaphore():
         try:
             ctx = ssl.create_default_context()
@@ -2475,12 +2635,15 @@ async def get_ssl_hash_async(domain):
             _ = reader
             ssl_obj = writer.get_extra_info("ssl_object")
             if ssl_obj:
+                cert_info = ssl_obj.getpeercert()
                 cert_der = ssl_obj.getpeercert(binary_form=True)
                 writer.close()
                 try:
                     await writer.wait_closed()
                 except Exception:
                     pass
+                if _USE_SIMILARITY_HASHING and cert_info:
+                    return compute_ssl_simhash(cert_info)
                 if cert_der:
                     return hashlib.sha256(cert_der).hexdigest()
             writer.close()
@@ -2490,14 +2653,17 @@ async def get_ssl_hash_async(domain):
 
 
 def get_ssl_hash(domain):
-    """Sync SSL certificate hash fetch (backward-compatible helper)."""
+    """Sync SSL identity similarity-hash fetch (backward-compatible helper)."""
     import socket
 
     try:
         ctx = ssl.create_default_context()
         with socket.create_connection((domain, 443), timeout=5) as sock:
             with ctx.wrap_socket(sock, server_hostname=domain) as ssock:
+                cert_info = ssock.getpeercert()
                 cert_der = ssock.getpeercert(binary_form=True)
+                if _USE_SIMILARITY_HASHING and cert_info:
+                    return compute_ssl_simhash(cert_info)
                 if cert_der:
                     return hashlib.sha256(cert_der).hexdigest()
     except Exception:
@@ -2797,6 +2963,14 @@ def _build_entity_index(entity_db):
     Pre-compute numpy arrays from entity_db for vectorised scoring.
     Called once at module load â€” avoids repeated dict traversal.
     """
+    hash_schema_version = int(_entity_db_meta.get("hash_schema_version", 1) or 1)
+    use_similarity_hashing = hash_schema_version >= 2
+    if not use_similarity_hashing:
+        _clip_logger.warning(
+            "entity_hash_db.json is using legacy hash schema v%d; shortlist will use exact-match hashing until the DB is regenerated.",
+            hash_schema_version,
+        )
+
     entity_names = list(entity_db.keys())
 
     entity_domains = []            # list of domain-lists, aligned with entity_names
@@ -2804,6 +2978,10 @@ def _build_entity_index(entity_db):
     entity_ssl_hash_sets = []      # list of SSL cert hash sets
     entity_html_hash_sets = []     # list of HTML hash sets
     entity_domain_hash_sets = []   # list of domain hash sets
+    entity_fav_similarity_refs = []
+    entity_ssl_similarity_refs = []
+    entity_page_similarity_refs = []
+    entity_domain_similarity_refs = []
     entity_kw_sets = []            # list of keyword-sets
     entity_brand_tokens = []       # list of lexical brand-token sets
 
@@ -2816,6 +2994,10 @@ def _build_entity_index(entity_db):
         entity_ssl_hash_sets.append(set(data.get("ssl_hashes", [])) - {None})
         entity_html_hash_sets.append(set(data.get("html_hashes", [])) - {None})
         entity_domain_hash_sets.append(set(data.get("domain_hashes", [])) - {None})
+        entity_fav_similarity_refs.append(tuple(str(item).strip().lower() for item in data.get("favicon_phashes", []) if item))
+        entity_ssl_similarity_refs.append(tuple(str(item).strip().lower() for item in data.get("ssl_simhashes", []) if item))
+        entity_page_similarity_refs.append(tuple(str(item).strip().lower() for item in data.get("page_phashes", []) if item))
+        entity_domain_similarity_refs.append(tuple(str(item).strip().lower() for item in data.get("domain_simhashes", []) if item))
         keyword_set = set(data.get("keywords", []))
         entity_kw_sets.append(keyword_set)
         brand_tokens = set()
@@ -2826,6 +3008,8 @@ def _build_entity_index(entity_db):
         entity_brand_tokens.append(brand_tokens)
 
     return {
+        "hash_schema_version": hash_schema_version,
+        "use_similarity_hashing": use_similarity_hashing,
         "names": entity_names,
         "clip_matrix": np.empty((0, _CLIP_DIM), dtype="float32"),
         "clip_entity_idx": np.empty((0,), dtype="int32"),
@@ -2834,6 +3018,10 @@ def _build_entity_index(entity_db):
         "ssl_hash_sets": entity_ssl_hash_sets,
         "html_hash_sets": entity_html_hash_sets,
         "domain_hash_sets": entity_domain_hash_sets,
+        "fav_similarity_refs": entity_fav_similarity_refs,
+        "ssl_similarity_refs": entity_ssl_similarity_refs,
+        "page_similarity_refs": entity_page_similarity_refs,
+        "domain_similarity_refs": entity_domain_similarity_refs,
         "kw_sets": entity_kw_sets,
         "brand_tokens": entity_brand_tokens,
     }
@@ -2854,6 +3042,40 @@ def _domain_sim_for_entity(args):
     if not entity_domains:
         return 0.0
     return max(domain_similarity(target_domain, d) for d in entity_domains)
+
+
+def _distance_to_similarity(max_distance: int) -> float:
+    return max(0.0, 1.0 - (float(max_distance) / float(_HASH_SIMILARITY_BITS)))
+
+
+def _similarity_arrays_from_reference_sets(
+    candidate_hash: str | None,
+    reference_sets,
+    *,
+    hit_distance: int,
+    anchor_distance: int | None = None,
+):
+    n_entities = len(reference_sets)
+    similarity = np.zeros(n_entities, dtype="float64")
+    distance = np.full(n_entities, -1, dtype="int32")
+    hit = np.zeros(n_entities, dtype=bool)
+    anchor = np.zeros(n_entities, dtype=bool)
+    if not candidate_hash:
+        return similarity, distance, hit, anchor
+
+    hit_similarity_floor = _distance_to_similarity(hit_distance)
+    anchor_similarity_floor = _distance_to_similarity(anchor_distance) if anchor_distance is not None else None
+
+    for idx, reference_hashes in enumerate(reference_sets):
+        best_similarity, best_distance = best_similarity_against_set(candidate_hash, reference_hashes, hash_bits=_HASH_SIMILARITY_BITS)
+        similarity[idx] = float(best_similarity)
+        if best_distance is not None:
+            distance[idx] = int(best_distance)
+        if best_similarity >= hit_similarity_floor:
+            hit[idx] = True
+        if anchor_similarity_floor is not None and best_similarity >= anchor_similarity_floor:
+            anchor[idx] = True
+    return similarity, distance, hit, anchor
 
 
 ###############################################
@@ -3082,8 +3304,9 @@ async def _fetch_url_payload(
                         except Exception:
                             screenshot_path = ""
 
-                    domain_hash = sha256_text(domain)
-                    html_hash = sha256_text(html_content)
+                    domain_hash = compute_domain_simhash(domain) if _USE_SIMILARITY_HASHING else sha256_text(domain)
+                    html_hash = None if _USE_SIMILARITY_HASHING else sha256_text(html_content)
+                    page_hash = compute_image_phash(screenshot_bytes) if (_USE_SIMILARITY_HASHING and screenshot_bytes) else None
                     fav_task = favicon_hash_async(domain, session=aio_session)
                     ssl_task = get_ssl_hash_async(domain)
                     fav_hash, ssl_hash = await asyncio.gather(fav_task, ssl_task)
@@ -3114,27 +3337,115 @@ async def _fetch_url_payload(
                         if seeded_mask.any():
                             candidate_mask = seeded_mask
 
-                    hash_bypass_mask = np.zeros(n_entities, dtype=bool)
-                    if fav_hash:
-                        hash_bypass_mask |= np.array(
-                            [fav_hash in _entity_index["fav_sets"][i] for i in range(n_entities)],
+                    use_similarity_hashing = bool(_entity_index.get("use_similarity_hashing", False))
+                    if use_similarity_hashing:
+                        (
+                            favicon_similarity,
+                            favicon_distance,
+                            favicon_hit,
+                            favicon_anchor,
+                        ) = _similarity_arrays_from_reference_sets(
+                            fav_hash,
+                            _entity_index["fav_similarity_refs"],
+                            hit_distance=_FAVICON_HASH_HIT_DISTANCE,
+                            anchor_distance=_FAVICON_HASH_ANCHOR_DISTANCE,
+                        )
+                        (
+                            ssl_hash_similarity,
+                            ssl_hash_distance,
+                            ssl_hash_hit,
+                            ssl_hash_anchor,
+                        ) = _similarity_arrays_from_reference_sets(
+                            ssl_hash,
+                            _entity_index["ssl_similarity_refs"],
+                            hit_distance=_SSL_HASH_HIT_DISTANCE,
+                            anchor_distance=_SSL_HASH_ANCHOR_DISTANCE,
+                        )
+                        (
+                            page_hash_similarity,
+                            page_hash_distance,
+                            html_hash_hit,
+                            html_hash_anchor,
+                        ) = _similarity_arrays_from_reference_sets(
+                            page_hash,
+                            _entity_index["page_similarity_refs"],
+                            hit_distance=_PAGE_HASH_HIT_DISTANCE,
+                            anchor_distance=_PAGE_HASH_ANCHOR_DISTANCE,
+                        )
+                        (
+                            domain_hash_similarity,
+                            domain_hash_distance,
+                            domain_hash_hit,
+                            domain_hash_anchor,
+                        ) = _similarity_arrays_from_reference_sets(
+                            domain_hash,
+                            _entity_index["domain_similarity_refs"],
+                            hit_distance=_DOMAIN_HASH_HIT_DISTANCE,
+                            anchor_distance=None,
+                        )
+                        hash_hit_count = (
+                            favicon_hit.astype(int)
+                            + ssl_hash_hit.astype(int)
+                            + html_hash_hit.astype(int)
+                            + domain_hash_hit.astype(int)
+                        )
+                        hash_bypass_mask = np.array(
+                            favicon_anchor | ssl_hash_anchor | html_hash_anchor | (hash_hit_count >= 2),
                             dtype=bool,
                         )
-                    if ssl_hash:
-                        hash_bypass_mask |= np.array(
-                            [ssl_hash in _entity_index["ssl_hash_sets"][i] for i in range(n_entities)],
-                            dtype=bool,
-                        )
-                    if html_hash:
-                        hash_bypass_mask |= np.array(
-                            [html_hash in _entity_index["html_hash_sets"][i] for i in range(n_entities)],
-                            dtype=bool,
-                        )
-                    if domain_hash:
-                        hash_bypass_mask |= np.array(
-                            [domain_hash in _entity_index["domain_hash_sets"][i] for i in range(n_entities)],
-                            dtype=bool,
-                        )
+                    else:
+                        hash_bypass_mask = np.zeros(n_entities, dtype=bool)
+                        favicon_similarity = np.zeros(n_entities, dtype="float64")
+                        favicon_distance = np.full(n_entities, -1, dtype="int32")
+                        favicon_hit = np.zeros(n_entities, dtype=bool)
+                        favicon_anchor = np.zeros(n_entities, dtype=bool)
+                        ssl_hash_similarity = np.zeros(n_entities, dtype="float64")
+                        ssl_hash_distance = np.full(n_entities, -1, dtype="int32")
+                        ssl_hash_hit = np.zeros(n_entities, dtype=bool)
+                        ssl_hash_anchor = np.zeros(n_entities, dtype=bool)
+                        page_hash_similarity = np.zeros(n_entities, dtype="float64")
+                        page_hash_distance = np.full(n_entities, -1, dtype="int32")
+                        html_hash_hit = np.zeros(n_entities, dtype=bool)
+                        html_hash_anchor = np.zeros(n_entities, dtype=bool)
+                        domain_hash_similarity = np.zeros(n_entities, dtype="float64")
+                        domain_hash_distance = np.full(n_entities, -1, dtype="int32")
+                        domain_hash_hit = np.zeros(n_entities, dtype=bool)
+                        domain_hash_anchor = np.zeros(n_entities, dtype=bool)
+                        if fav_hash:
+                            favicon_hit = np.array(
+                                [fav_hash in _entity_index["fav_sets"][i] for i in range(n_entities)],
+                                dtype=bool,
+                            )
+                            hash_bypass_mask |= favicon_hit
+                            favicon_similarity = favicon_hit.astype("float64")
+                            favicon_distance = np.where(favicon_hit, 0, -1).astype("int32")
+                            favicon_anchor = favicon_hit.copy()
+                        if ssl_hash:
+                            ssl_hash_hit = np.array(
+                                [ssl_hash in _entity_index["ssl_hash_sets"][i] for i in range(n_entities)],
+                                dtype=bool,
+                            )
+                            hash_bypass_mask |= ssl_hash_hit
+                            ssl_hash_similarity = ssl_hash_hit.astype("float64")
+                            ssl_hash_distance = np.where(ssl_hash_hit, 0, -1).astype("int32")
+                            ssl_hash_anchor = ssl_hash_hit.copy()
+                        if html_hash:
+                            html_hash_hit = np.array(
+                                [html_hash in _entity_index["html_hash_sets"][i] for i in range(n_entities)],
+                                dtype=bool,
+                            )
+                            hash_bypass_mask |= html_hash_hit
+                            page_hash_similarity = html_hash_hit.astype("float64")
+                            page_hash_distance = np.where(html_hash_hit, 0, -1).astype("int32")
+                            html_hash_anchor = html_hash_hit.copy()
+                        if domain_hash:
+                            domain_hash_hit = np.array(
+                                [domain_hash in _entity_index["domain_hash_sets"][i] for i in range(n_entities)],
+                                dtype=bool,
+                            )
+                            hash_bypass_mask |= domain_hash_hit
+                            domain_hash_similarity = domain_hash_hit.astype("float64")
+                            domain_hash_distance = np.where(domain_hash_hit, 0, -1).astype("int32")
                     candidate_mask |= hash_bypass_mask
                     for idx in np.where(hash_bypass_mask)[0]:
                         candidate_reasons[idx] = f"{candidate_reasons[idx]}|hash_bypass".strip("|")
@@ -3142,10 +3453,6 @@ async def _fetch_url_payload(
                     cpu_scores = np.zeros(n_entities, dtype="float64")
                     cpu_denominators = np.zeros(n_entities, dtype="float64")
                     domain_hit = np.zeros(n_entities, dtype=bool)
-                    favicon_hit = np.zeros(n_entities, dtype=bool)
-                    ssl_hash_hit = np.zeros(n_entities, dtype=bool)
-                    html_hash_hit = np.zeros(n_entities, dtype=bool)
-                    domain_hash_hit = np.zeros(n_entities, dtype=bool)
                     keyword_hit = np.zeros(n_entities, dtype=bool)
                     for i in range(n_entities):
                         if not candidate_mask[i]:
@@ -3166,27 +3473,24 @@ async def _fetch_url_payload(
                         fav_set = _entity_index["fav_sets"][i]
                         if fav_hash and fav_set:
                             cpu_denominators[i] += resolved_weights["favicon"]
-                            if fav_hash in fav_set:
-                                cpu_scores[i] += resolved_weights["favicon"]
-                                favicon_hit[i] = True
+                            if favicon_hit[i]:
+                                cpu_scores[i] += resolved_weights["favicon"] * float(favicon_similarity[i])
                         ssl_set = _entity_index["ssl_hash_sets"][i]
                         if ssl_hash and ssl_set:
                             cpu_denominators[i] += resolved_weights["ssl_hash"]
-                            if ssl_hash in ssl_set:
-                                cpu_scores[i] += resolved_weights["ssl_hash"]
-                                ssl_hash_hit[i] = True
-                        html_set = _entity_index["html_hash_sets"][i]
-                        if html_hash and html_set:
+                            if ssl_hash_hit[i]:
+                                cpu_scores[i] += resolved_weights["ssl_hash"] * float(ssl_hash_similarity[i])
+                        html_candidate_hash = page_hash if use_similarity_hashing else html_hash
+                        html_set = _entity_index["page_similarity_refs"][i] if use_similarity_hashing else _entity_index["html_hash_sets"][i]
+                        if html_candidate_hash and html_set:
                             cpu_denominators[i] += resolved_weights["html_hash"]
-                            if html_hash in html_set:
-                                cpu_scores[i] += resolved_weights["html_hash"]
-                                html_hash_hit[i] = True
-                        domain_hash_set = _entity_index["domain_hash_sets"][i]
+                            if html_hash_hit[i]:
+                                cpu_scores[i] += resolved_weights["html_hash"] * float(page_hash_similarity[i])
+                        domain_hash_set = _entity_index["domain_similarity_refs"][i] if use_similarity_hashing else _entity_index["domain_hash_sets"][i]
                         if domain_hash and domain_hash_set:
                             cpu_denominators[i] += resolved_weights["domain_hash"]
-                            if domain_hash in domain_hash_set:
-                                cpu_scores[i] += resolved_weights["domain_hash"]
-                                domain_hash_hit[i] = True
+                            if domain_hash_hit[i]:
+                                cpu_scores[i] += resolved_weights["domain_hash"] * float(domain_hash_similarity[i])
                         if _entity_index["kw_sets"][i] and words:
                             cpu_denominators[i] += resolved_weights["keywords"]
                             overlap = len(words & _entity_index["kw_sets"][i])
@@ -3221,9 +3525,21 @@ async def _fetch_url_payload(
                         "brand_token_hit": brand_token_hit,
                         "generic_token_only_hit": np.array(prefetch_metrics.get("generic_token_only_hits", np.zeros(n_entities, dtype=bool)), dtype=bool),
                         "favicon_hit": favicon_hit,
+                        "favicon_anchor": favicon_anchor,
+                        "favicon_hash_similarity": favicon_similarity,
+                        "favicon_hash_distance": favicon_distance,
                         "ssl_hash_hit": ssl_hash_hit,
+                        "ssl_hash_anchor": ssl_hash_anchor,
+                        "ssl_hash_similarity": ssl_hash_similarity,
+                        "ssl_hash_distance": ssl_hash_distance,
                         "html_hash_hit": html_hash_hit,
+                        "html_hash_anchor": html_hash_anchor,
+                        "page_hash_similarity": page_hash_similarity,
+                        "page_hash_distance": page_hash_distance,
                         "domain_hash_hit": domain_hash_hit,
+                        "domain_hash_anchor": domain_hash_anchor,
+                        "domain_hash_similarity": domain_hash_similarity,
+                        "domain_hash_distance": domain_hash_distance,
                         "keyword_hit": keyword_hit,
                         "typo_scores": typo_scores,
                         "candidate_mask": candidate_mask,
@@ -3344,7 +3660,7 @@ async def _run_browser_shard(
                     prefetch_admitted_failures.append(admitted_prefetch_match)
                 queue_payload = payload_outcome["queue_payload"]
                 if queue_payload is not None:
-                    await gpu_queue.put(queue_payload)
+                    await asyncio.wait_for(gpu_queue.put(queue_payload), timeout=5.0)
                 metrics[payload_outcome["metric_key"]] += 1
                 metrics["processed"] += 1
             except Exception as exc:
@@ -3521,6 +3837,14 @@ def _build_shortlist_output_row(match: dict, scoring_config: dict) -> dict:
             "anchor_typo" if bool(match.get("typo_anchor", False)) else "below_min_score"
         ),
         "clip_similarity": round(float(match.get("clip_similarity", 0.0)), 4),
+        "favicon_hash_similarity": round(float(match.get("favicon_hash_similarity", 0.0) or 0.0), 4),
+        "favicon_hash_distance": int(match.get("favicon_hash_distance", -1) or -1),
+        "page_hash_similarity": round(float(match.get("page_hash_similarity", 0.0) or 0.0), 4),
+        "page_hash_distance": int(match.get("page_hash_distance", -1) or -1),
+        "domain_hash_similarity": round(float(match.get("domain_hash_similarity", 0.0) or 0.0), 4),
+        "domain_hash_distance": int(match.get("domain_hash_distance", -1) or -1),
+        "ssl_hash_similarity": round(float(match.get("ssl_hash_similarity", 0.0) or 0.0), 4),
+        "ssl_hash_distance": int(match.get("ssl_hash_distance", -1) or -1),
         "typo_anchor": bool(match.get("typo_anchor", False)),
         "hash_anchor": bool(match.get("hash_anchor", False)),
         "clip_anchor": bool(match.get("clip_anchor", False)),
@@ -3614,14 +3938,31 @@ def _finalize_scored_hash_payload(
     brand_token_hit = bool(payload["brand_token_hit"][best_idx])
     generic_token_only_match = bool(payload.get("generic_token_only_hit", np.zeros(n_entities, dtype=bool))[best_idx])
     typo_anchor = lexical_rule_hit and best_typo_similarity >= scoring_config["typo_min_score"]
-    hash_anchor = any(
-        (
-            bool(payload["favicon_hit"][best_idx]),
-            bool(payload["ssl_hash_hit"][best_idx]),
-            bool(payload["html_hash_hit"][best_idx]),
-            bool(payload["domain_hash_hit"][best_idx]),
-        )
+    favicon_hit = bool(payload["favicon_hit"][best_idx])
+    ssl_hash_hit = bool(payload["ssl_hash_hit"][best_idx])
+    html_hash_hit = bool(payload["html_hash_hit"][best_idx])
+    domain_hash_hit = bool(payload["domain_hash_hit"][best_idx])
+    favicon_anchor = bool(payload.get("favicon_anchor", np.zeros(n_entities, dtype=bool))[best_idx])
+    ssl_hash_anchor = bool(payload.get("ssl_hash_anchor", np.zeros(n_entities, dtype=bool))[best_idx])
+    html_hash_anchor = bool(payload.get("html_hash_anchor", np.zeros(n_entities, dtype=bool))[best_idx])
+    hash_hit_count = sum(
+        int(flag)
+        for flag in (favicon_hit, ssl_hash_hit, html_hash_hit, domain_hash_hit)
     )
+    hash_anchor = bool(
+        favicon_anchor
+        or ssl_hash_anchor
+        or html_hash_anchor
+        or hash_hit_count >= 2
+    )
+    favicon_hash_similarity = float(payload.get("favicon_hash_similarity", np.zeros(n_entities, dtype="float64"))[best_idx])
+    favicon_hash_distance = int(payload.get("favicon_hash_distance", np.full(n_entities, -1, dtype="int32"))[best_idx])
+    ssl_hash_similarity = float(payload.get("ssl_hash_similarity", np.zeros(n_entities, dtype="float64"))[best_idx])
+    ssl_hash_distance = int(payload.get("ssl_hash_distance", np.full(n_entities, -1, dtype="int32"))[best_idx])
+    page_hash_similarity = float(payload.get("page_hash_similarity", np.zeros(n_entities, dtype="float64"))[best_idx])
+    page_hash_distance = int(payload.get("page_hash_distance", np.full(n_entities, -1, dtype="int32"))[best_idx])
+    domain_hash_similarity = float(payload.get("domain_hash_similarity", np.zeros(n_entities, dtype="float64"))[best_idx])
+    domain_hash_distance = int(payload.get("domain_hash_distance", np.full(n_entities, -1, dtype="int32"))[best_idx])
     best_clip_similarity = 0.0
     direct_brand_evidence_count = _count_shortlist_aligned_page_brand_evidence(best_idx, payload)
     clip_corroborated = False
@@ -3648,10 +3989,10 @@ def _finalize_scored_hash_payload(
         else "weak_evidence"
     )
     hash_contribution = float(
-        bool(payload["favicon_hit"][best_idx]) * resolved_weights["favicon"]
-        + bool(payload["ssl_hash_hit"][best_idx]) * resolved_weights["ssl_hash"]
-        + bool(payload["html_hash_hit"][best_idx]) * resolved_weights["html_hash"]
-        + bool(payload["domain_hash_hit"][best_idx]) * resolved_weights["domain_hash"]
+        (favicon_hash_similarity * resolved_weights["favicon"] if favicon_hit else 0.0)
+        + (ssl_hash_similarity * resolved_weights["ssl_hash"] if ssl_hash_hit else 0.0)
+        + (page_hash_similarity * resolved_weights["html_hash"] if html_hash_hit else 0.0)
+        + (domain_hash_similarity * resolved_weights["domain_hash"] if domain_hash_hit else 0.0)
     )
     lexical_contribution = best_lexical_score * resolved_weights["domain"]
     dominant_signal_family = max(
@@ -3713,6 +4054,14 @@ def _finalize_scored_hash_payload(
             "typo_similarity": round(best_typo_similarity, 4),
             "generic_token_only_match": generic_token_only_match,
             "direct_brand_evidence_count": direct_brand_evidence_count,
+            "favicon_hash_similarity": round(favicon_hash_similarity, 4),
+            "favicon_hash_distance": favicon_hash_distance,
+            "page_hash_similarity": round(page_hash_similarity, 4),
+            "page_hash_distance": page_hash_distance,
+            "domain_hash_similarity": round(domain_hash_similarity, 4),
+            "domain_hash_distance": domain_hash_distance,
+            "ssl_hash_similarity": round(ssl_hash_similarity, 4),
+            "ssl_hash_distance": ssl_hash_distance,
             "clip_corroborated": clip_corroborated,
             "stage1_passthrough": False,
             "survival_path": "|".join(dict.fromkeys(admission_paths)) if admitted_to_holdout else (review_only_reason if kept_for_review_only else ""),
@@ -3780,6 +4129,14 @@ def _finalize_scored_hash_payload(
         "signal_hit_keywords": bool(payload["keyword_hit"][best_idx]),
         "generic_token_only_match": generic_token_only_match,
         "direct_brand_evidence_count": direct_brand_evidence_count,
+        "favicon_hash_similarity": favicon_hash_similarity,
+        "favicon_hash_distance": favicon_hash_distance,
+        "page_hash_similarity": page_hash_similarity,
+        "page_hash_distance": page_hash_distance,
+        "domain_hash_similarity": domain_hash_similarity,
+        "domain_hash_distance": domain_hash_distance,
+        "ssl_hash_similarity": ssl_hash_similarity,
+        "ssl_hash_distance": ssl_hash_distance,
         "clip_corroborated": clip_corroborated,
         "screenshot_path": payload.get("screenshot_path", ""),
         "html_title_text": payload.get("html_title_text", ""),
@@ -3968,11 +4325,15 @@ def _log_hashing_metrics_summary(
 async def _analyze_stage1_http_candidates(
     urls: list[str],
     stage1_http_config: dict | None = None,
+    run_context: RunContext | None = None,
+    checkpoint_store: CheckpointStore | None = None,
+    source_workbook_map: dict[str, str] | None = None,
 ) -> dict[str, dict]:
     if not urls:
         return {}
 
     stage1_http_config = dict(stage1_http_config or STAGE1_HTTP_CONFIG)
+    source_workbook_map = dict(source_workbook_map or {})
     entity_context, ordered_entities = get_stage1_entity_context()
     concurrency_controls = build_stage1_concurrency_controls(stage1_http_config)
     url_concurrency = max(1, int(stage1_http_config.get("concurrency", 24)))
@@ -3986,6 +4347,20 @@ async def _analyze_stage1_http_candidates(
         connect=stage1_http_config["connect_timeout"],
     )
     results = {}
+    progress = ProgressTracker(total=len(urls))
+    progress_metrics = {
+        "escalated": 0,
+        "failed": 0,
+        "head_only": 0,
+        "fetched": 0,
+        "fallback_dns": 0,
+    }
+    active_workers: dict[str, str] = {}
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+    for raw_url in urls:
+        await queue.put(raw_url)
+    for _ in range(url_concurrency):
+        await queue.put(None)
 
     async with httpx.AsyncClient(
         timeout=timeout,
@@ -3994,32 +4369,233 @@ async def _analyze_stage1_http_candidates(
         verify=False,
         headers={"User-Agent": "Mozilla/5.0 (compatible; stage1-router/1.0)"},
     ) as client:
-        async def _worker(raw_url: str):
-            normalized_url = normalize_url(raw_url)
-            async with concurrency_controls.url_semaphore:
-                try:
-                    analysis = await analyze_stage1_url(
-                        raw_url,
-                        client,
-                        entity_context=entity_context,
-                        ordered_entities=ordered_entities,
-                        config=stage1_http_config,
-                        concurrency_controls=concurrency_controls,
-                    )
-                except Exception as exc:
-                    analysis = {
-                        **_stage1_signal_defaults(),
-                        "url": normalized_url,
-                        "normalized_url": normalized_url,
-                        "fetch_status": "failed",
-                        "fetch_error_type": "stage1_http_error",
-                        "fetch_error_detail": _compact_exception_message(exc),
-                        "stage1_reasons": "stage1_fetch_failed",
-                        "escalate_reason": "stage1_fetch_failed",
-                    }
-            results[normalized_url] = analysis
+        try:
+            from tqdm import tqdm
 
-        await asyncio.gather(*[_worker(raw_url) for raw_url in urls])
+            progress_bar = tqdm(
+                total=len(urls),
+                desc="Stage1 cheap HTTP",
+                unit="url",
+                leave=True,
+                dynamic_ncols=True,
+            )
+        except ImportError:
+            progress_bar = None
+
+        async def _progress_monitor():
+            if progress_bar is None:
+                return
+            last_completed = 0
+            while True:
+                await asyncio.sleep(0.5)
+                completed = progress.completed
+                if completed > last_completed:
+                    progress_bar.update(completed - last_completed)
+                    last_completed = completed
+                progress_bar.set_postfix(
+                    {
+                        "act": len(active_workers),
+                        "q": queue.qsize(),
+                        "esc": progress_metrics["escalated"],
+                        "fail": progress_metrics["failed"],
+                        "dnsfb": progress_metrics["fallback_dns"],
+                    },
+                    refresh=False,
+                )
+                if completed >= len(urls):
+                    break
+
+        monitor_task = asyncio.create_task(_progress_monitor()) if progress_bar is not None else None
+
+        async def _worker(worker_index: int):
+            worker_id = f"stage1-{worker_index}"
+            while True:
+                raw_url = await queue.get()
+                if raw_url is None:
+                    queue.task_done()
+                    break
+                normalized_url = normalize_url(raw_url)
+                source_workbook = source_workbook_map.get(normalized_url, "")
+                stage_started_at = utc_now_iso()
+                started_monotonic = time.perf_counter()
+                record_key = make_record_key(normalized_url, source_workbook)
+                active_workers[worker_id] = normalized_url
+                if checkpoint_store is not None and run_context is not None:
+                    checkpoint_store.ensure_url_result(
+                        raw_url=raw_url,
+                        normalized_url=normalized_url,
+                        source_workbook=source_workbook,
+                    )
+                    checkpoint_store.update_worker_heartbeat(
+                        stage_name="stage1",
+                        worker_id=worker_id,
+                        record_key=record_key,
+                        state="running",
+                        details={"url": normalized_url},
+                    )
+                try:
+                    try:
+                        async with concurrency_controls.url_semaphore:
+                            analysis, retry_count, timeout_hit = await async_with_timeout_and_retry(
+                                lambda: analyze_stage1_url(
+                                    raw_url,
+                                    client,
+                                    entity_context=entity_context,
+                                    ordered_entities=ordered_entities,
+                                    config=stage1_http_config,
+                                    concurrency_controls=concurrency_controls,
+                                ),
+                                timeout=max(
+                                    float(stage1_http_config.get("head_timeout", 4.0))
+                                    + float(stage1_http_config.get("get_timeout", 6.0))
+                                    + float(stage1_http_config.get("dns_timeout", 3.0))
+                                    + float(stage1_http_config.get("rdap_timeout", 5.0))
+                                    + float(stage1_http_config.get("tls_timeout", 3.0))
+                                    + 5.0,
+                                    10.0,
+                                ),
+                                max_retries=1,
+                            )
+                    except Exception as exc:
+                        error = normalize_exception(exc)
+                        timeout_hit = "timeout" in error["error_message"].lower()
+                        retry_count = 1 if timeout_hit else 0
+                        analysis = {
+                            **_stage1_signal_defaults(),
+                            "url": normalized_url,
+                            "normalized_url": normalized_url,
+                            "fetch_status": "failed",
+                            "fetch_error_type": "stage1_http_error",
+                            "fetch_error_detail": _compact_exception_message(exc),
+                            "stage1_reasons": "stage1_fetch_failed",
+                            "escalate_reason": "stage1_fetch_failed",
+                            "stage1_error_type": error["error_type"],
+                            "stage1_error_message": error["error_message"],
+                            "stage1_retry_count": retry_count,
+                            "stage1_timeout_hit": timeout_hit,
+                        }
+                    fallback_taken = ""
+                    if (
+                        str(analysis.get("fetch_status", "")).strip().lower() == "failed"
+                        and run_context is not None
+                        and run_context.stage1_failure_policy == "route_to_dns"
+                    ):
+                        fallback_taken = "route_to_dns_after_stage1_failure"
+                        analysis["fallback_taken"] = fallback_taken
+                        analysis["escalate_to_hashing"] = True
+                        analysis["escalate_reason"] = fallback_taken
+                    fetch_status = str(analysis.get("fetch_status", "")).strip().lower()
+                    if bool(analysis.get("escalate_to_hashing")):
+                        progress_metrics["escalated"] += 1
+                    if fetch_status == "failed":
+                        progress_metrics["failed"] += 1
+                    elif fetch_status == "head_only":
+                        progress_metrics["head_only"] += 1
+                    elif fetch_status in {"fetched", "fetched_visual_missing"}:
+                        progress_metrics["fetched"] += 1
+                    if fallback_taken:
+                        progress_metrics["fallback_dns"] += 1
+                    results[normalized_url] = analysis
+                    _upsert_shortlist_checkpoint(
+                        run_context=run_context,
+                        checkpoint_store=checkpoint_store,
+                        raw_url=raw_url,
+                        normalized_url=normalized_url,
+                        source_workbook=source_workbook,
+                        stage_name="stage1",
+                        stage_status=(
+                            "escalated"
+                            if bool(analysis.get("escalate_to_hashing"))
+                            else str(analysis.get("fetch_status", "failed") or "failed")
+                        ),
+                        current_stage="stage1",
+                        retry_count=int(analysis.get("stage1_retry_count", 0) or 0),
+                        timeout_hit=bool(analysis.get("stage1_timeout_hit", False)),
+                        fallback_taken=fallback_taken,
+                        worker_id=worker_id,
+                        error_type=str(analysis.get("stage1_error_type", "") or analysis.get("fetch_error_type", "")),
+                        error_message=str(analysis.get("stage1_error_message", "") or analysis.get("fetch_error_detail", "")),
+                        final_pipeline_status=(
+                            None
+                            if bool(analysis.get("escalate_to_hashing")) or fallback_taken
+                            else "filtered_lexical_miss"
+                        ),
+                        failure_reason=str(analysis.get("stage1_reasons", "") or analysis.get("fetch_error_detail", "")),
+                    )
+                    _append_shortlist_stage_event(
+                        run_context=run_context,
+                        checkpoint_store=checkpoint_store,
+                        raw_url=raw_url,
+                        normalized_url=normalized_url,
+                        source_workbook=source_workbook,
+                        stage_name="stage1",
+                        worker_id=worker_id,
+                        started_at=stage_started_at,
+                        started_monotonic=started_monotonic,
+                        status=(
+                            "escalated"
+                            if bool(analysis.get("escalate_to_hashing"))
+                            else str(analysis.get("fetch_status", "failed") or "failed")
+                        ),
+                        retry_count=int(analysis.get("stage1_retry_count", 0) or 0),
+                        timeout_flag=bool(analysis.get("stage1_timeout_hit", False)),
+                        error_type=str(analysis.get("stage1_error_type", "") or analysis.get("fetch_error_type", "")),
+                        error_message=str(analysis.get("stage1_error_message", "") or analysis.get("fetch_error_detail", "")),
+                        fallback_taken=fallback_taken,
+                    )
+                    progress.mark_completed(
+                        final_status="stage1_failed" if str(analysis.get("fetch_status", "")).strip().lower() == "failed" else "stage1_completed"
+                    )
+                finally:
+                    active_workers.pop(worker_id, None)
+                    if checkpoint_store is not None:
+                        checkpoint_store.clear_worker_heartbeat(stage_name="stage1", worker_id=worker_id)
+                    queue.task_done()
+
+        watchdog = StageWatchdog(
+            stage_name="stage1",
+            progress_tracker=progress,
+            checkpoint_store=checkpoint_store,
+            warn_after_seconds=run_context.watchdog_warning_seconds if run_context is not None else 60,
+            stall_after_seconds=run_context.stall_threshold_seconds if run_context is not None else 180,
+            queue_size_getter=queue.qsize,
+            active_summary_getter=lambda: {"workers": url_concurrency, "results": len(results)},
+            logger_instance=_clip_logger,
+        )
+        workers = [asyncio.create_task(_worker(index)) for index in range(url_concurrency)]
+        watchdog.start()
+        try:
+            join_timeout = max(
+                run_context.stall_threshold_seconds if run_context is not None else 180,
+                30,
+            )
+            await asyncio.wait_for(queue.join(), timeout=join_timeout)
+            await asyncio.gather(*workers)
+        except asyncio.TimeoutError as exc:
+            for worker in workers:
+                worker.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+            raise RuntimeError("Stage1 cheap HTTP worker pool stalled before draining the queue") from exc
+        finally:
+            if monitor_task is not None:
+                monitor_task.cancel()
+                await asyncio.gather(monitor_task, return_exceptions=True)
+            if progress_bar is not None:
+                completed = progress.completed
+                if completed > progress_bar.n:
+                    progress_bar.update(completed - progress_bar.n)
+                progress_bar.set_postfix(
+                    {
+                        "act": len(active_workers),
+                        "q": queue.qsize(),
+                        "esc": progress_metrics["escalated"],
+                        "fail": progress_metrics["failed"],
+                        "dnsfb": progress_metrics["fallback_dns"],
+                    },
+                    refresh=False,
+                )
+                progress_bar.close()
+            await watchdog.stop()
 
     return results
 
@@ -4052,6 +4628,10 @@ async def run_hashing_shortlist_streaming(
     stage1_credential_min=None,
     stage1_low_band_min=None,
     stage1_hard_trigger_brand_min=None,
+    run_context: RunContext | None = None,
+    checkpoint_store: CheckpointStore | None = None,
+    resume: bool = False,
+    force_reprocess: bool = False,
 ):
     """
     Streaming hashing shortlist engine. Uses long-lived browser shards
@@ -4089,6 +4669,11 @@ async def run_hashing_shortlist_streaming(
     from .rdap_utils import get_rdap_metrics_snapshot, reset_rdap_state
 
     input_urls = list(url_list)
+    completed_record_keys = (
+        checkpoint_store.get_completed_record_keys()
+        if checkpoint_store is not None and resume and not force_reprocess
+        else set()
+    )
     log_path = _configure_hashing_log()
     reset_rdap_state()
     original_count = len(input_urls)
@@ -4115,21 +4700,61 @@ async def run_hashing_shortlist_streaming(
     lexical_reject_urls = set()
     for raw_url in input_urls:
         normalized_url = normalize_url(raw_url)
+        source_workbook = source_workbook_map.get(normalized_url, "")
+        if checkpoint_store is not None and run_context is not None and normalized_url:
+            checkpoint_store.ensure_url_result(
+                raw_url=raw_url,
+                normalized_url=normalized_url,
+                source_workbook=source_workbook,
+            )
+            if make_record_key(normalized_url, source_workbook) in completed_record_keys:
+                continue
         if normalized_url and normalized_url not in prefetch_metrics_map:
             prefetch_metrics_map[normalized_url] = _compute_prefetch_lexical_state(raw_url, scoring_config)
-            prefetch_metrics_map[normalized_url]["source_workbook"] = source_workbook_map.get(normalized_url, "")
+            prefetch_metrics_map[normalized_url]["source_workbook"] = source_workbook
         prefetch_metrics = prefetch_metrics_map.get(normalized_url, {})
         prefetch_metrics["source_workbook"] = source_workbook_map.get(normalized_url, prefetch_metrics.get("source_workbook", ""))
         if _passes_lexical_gate(prefetch_metrics):
             lexical_candidate_urls.append(raw_url)
             stage1_analysis_map[normalized_url] = _build_lexical_stage1_state(prefetch_metrics)
+            _upsert_shortlist_checkpoint(
+                run_context=run_context,
+                checkpoint_store=checkpoint_store,
+                raw_url=raw_url,
+                normalized_url=normalized_url,
+                source_workbook=source_workbook,
+                stage_name="stage0",
+                stage_status="lexical_hit",
+                current_stage="stage0",
+            )
         else:
             lexical_miss_urls.append(raw_url)
+            _upsert_shortlist_checkpoint(
+                run_context=run_context,
+                checkpoint_store=checkpoint_store,
+                raw_url=raw_url,
+                normalized_url=normalized_url,
+                source_workbook=source_workbook,
+                stage_name="stage0",
+                stage_status="filtered_lexical_miss",
+                current_stage="stage0",
+            )
+
+    if completed_record_keys:
+        skipped_count = max(0, original_count - len(lexical_candidate_urls) - len(lexical_miss_urls))
+        if skipped_count:
+            _clip_logger.info(
+                "Hash shortlist resume | skipped %d URL records already terminal in checkpoint store",
+                skipped_count,
+            )
 
     if lexical_miss_urls:
         analyzed_lexical_misses = await _analyze_stage1_http_candidates(
             lexical_miss_urls,
             stage1_http_config=stage1_http_config,
+            run_context=run_context,
+            checkpoint_store=checkpoint_store,
+            source_workbook_map=source_workbook_map,
         )
         for raw_url in lexical_miss_urls:
             normalized_url = normalize_url(raw_url)
@@ -4140,11 +4765,18 @@ async def run_hashing_shortlist_streaming(
             }
             if bool(stage1_analysis_map[normalized_url].get("escalate_to_hashing")):
                 lexical_candidate_urls.append(raw_url)
+            elif (
+                run_context is not None
+                and run_context.stage1_failure_policy == "route_to_dns"
+                and str(stage1_analysis_map[normalized_url].get("fetch_status", "")).strip().lower() == "failed"
+            ):
+                lexical_candidate_urls.append(raw_url)
 
     rdap_metrics = get_rdap_metrics_snapshot()
 
     try:
         from .dns_gate import (
+            DEFAULT_AUDIT_PATH as DEFAULT_DNS_AUDIT_PATH,
             DEFAULT_DNS_TIMEOUT,
             DEFAULT_DNS_RETRIES,
             _resolve_dns_worker_count,
@@ -4249,13 +4881,15 @@ async def run_hashing_shortlist_streaming(
             ),
         )
         _clip_logger.info(
-            "Stage1 RDAP summary | success=%d | 429=%d | retry_success=%d | retry_exhausted=%d | exception=%d | cache_hit=%d",
+            "Stage1 RDAP summary | success=%d | 429=%d | retry_success=%d | retry_exhausted=%d | exception=%d | cache_hit=%d | inflight_wait=%d | cooldown_hit=%d",
             int(rdap_metrics.get("success", 0) or 0),
             int(rdap_metrics.get("429", 0) or 0),
             int(rdap_metrics.get("retry_success", 0) or 0),
             int(rdap_metrics.get("retry_exhausted", 0) or 0),
             int(rdap_metrics.get("exception", 0) or 0),
             int(rdap_metrics.get("cache_hit", 0) or 0),
+            int(rdap_metrics.get("inflight_wait", 0) or 0),
+            int(rdap_metrics.get("cooldown_hit", 0) or 0),
         )
         print(
             f"Stage1 routing kept {len(lexical_candidate_urls)}/{original_count} URLs"
@@ -4327,6 +4961,10 @@ async def run_hashing_shortlist_streaming(
             timeout=dns_timeout_effective,
             max_workers=dns_max_workers_effective,
             retries=dns_retries_effective,
+            source_workbook_map=source_workbook_map,
+            run_context=run_context,
+            checkpoint_store=checkpoint_store,
+            audit_output_path=DEFAULT_DNS_AUDIT_PATH,
         )
         for audit_row in audit_rows:
             normalized_target = normalize_url(str(audit_row.get("target_url", "")).strip())
@@ -4436,6 +5074,7 @@ async def run_hashing_shortlist_streaming(
         results = []
         review_results = []
         prefetch_admitted_failures = []
+        hash_progress = ProgressTracker(total=len(shortlisted_urls))
         last_progress_log = t0
         last_window_processed = 0
         last_window_failed = 0
@@ -4500,6 +5139,23 @@ async def run_hashing_shortlist_streaming(
                     scoring_config,
                 )
             )
+            hash_watchdog = StageWatchdog(
+                stage_name="hash",
+                progress_tracker=hash_progress,
+                checkpoint_store=checkpoint_store,
+                warn_after_seconds=run_context.watchdog_warning_seconds if run_context is not None else 60,
+                stall_after_seconds=run_context.stall_threshold_seconds if run_context is not None else 180,
+                queue_size_getter=url_queue.qsize,
+                active_summary_getter=lambda: {
+                    "processed": metrics.get("processed", 0),
+                    "gpu_queue_depth": gpu_queue.qsize(),
+                    "active_fetch_limit": active_fetch_limiter.limit,
+                    "shards_done": sum(1 for task in shard_tasks if task.done()),
+                    "shards_total": len(shard_tasks),
+                },
+                logger_instance=_clip_logger,
+            )
+            hash_watchdog.start()
 
             # Monitor progress while shards are running
             last_processed = 0
@@ -4516,6 +5172,20 @@ async def run_hashing_shortlist_streaming(
                         _build_progress_postfix(metrics), refresh=False
                     )
                     last_processed = current
+                    for _ in range(current - hash_progress.completed):
+                        hash_progress.mark_completed(final_status="hash_processed")
+                if (
+                    run_context is not None
+                    and hash_progress.seconds_since_progress() >= run_context.stall_threshold_seconds
+                ):
+                    for task in shard_tasks:
+                        task.cancel()
+                    scorer_task.cancel()
+                    await asyncio.gather(*shard_tasks, return_exceptions=True)
+                    await asyncio.gather(scorer_task, return_exceptions=True)
+                    raise RuntimeError(
+                        f"Hashing browser shard pool stalled for >= {run_context.stall_threshold_seconds}s without progress"
+                    )
                 if now - last_progress_log >= 15.0:
                     window_processed = current - last_window_processed
                     window_failed = metrics["fetch_failed"] - last_window_failed
@@ -4564,6 +5234,8 @@ async def run_hashing_shortlist_streaming(
                     progress_bar.set_postfix(
                         _build_progress_postfix(metrics), refresh=False
                     )
+                    for _ in range(current - hash_progress.completed):
+                        hash_progress.mark_completed(final_status="hash_processed")
 
             # Signal scorer to flush remaining batch and exit
             await gpu_queue.put(None)
@@ -4572,6 +5244,10 @@ async def run_hashing_shortlist_streaming(
                 results.extend(prefetch_admitted_failures)
 
         finally:
+            try:
+                await hash_watchdog.stop()
+            except Exception:
+                pass
             if progress_bar:
                 progress_bar.close()
             if aio_session:
@@ -4682,6 +5358,49 @@ async def run_hashing_shortlist_streaming(
             excluded_path,
             len(excluded_rows),
         )
+        if checkpoint_store is not None and run_context is not None:
+            for stage1_row in stage1_rows:
+                raw_url = str(stage1_row.get("input_url", "") or "")
+                normalized_url = str(stage1_row.get("normalized_url", "") or "")
+                source_workbook = str(stage1_row.get("source_workbook", "") or "")
+                final_status = None
+                failure_reason = ""
+                hash_status = "pending"
+                if bool(stage1_row.get("admitted")) or str(stage1_row.get("survival_path", "") or "").strip():
+                    final_status = "holdout_ready"
+                    hash_status = "admitted"
+                elif str(stage1_row.get("reason", "") or "").strip() == "dns_rejected":
+                    final_status = "dns_rejected"
+                    hash_status = "dns_rejected"
+                    failure_reason = "dns_rejected"
+                elif str(stage1_row.get("reason", "") or "").strip() == "parking_or_placeholder_excluded":
+                    final_status = "parked_or_placeholder"
+                    hash_status = "parked_or_placeholder"
+                    failure_reason = "parking_or_placeholder_excluded"
+                elif bool(stage1_row.get("kept_for_review_only")):
+                    final_status = "review_only"
+                    hash_status = "review_only"
+                    failure_reason = str(stage1_row.get("review_only_reason", "") or "stage1_review_only")
+                elif str(stage1_row.get("fetch_status", "")).strip().lower() in {"failed", "timeout"}:
+                    final_status = "hash_failed"
+                    hash_status = "fetch_failed"
+                    failure_reason = str(stage1_row.get("reason", "") or "fetch_timeout_or_fetch_failed")
+                elif str(stage1_row.get("exclusion_stage", "")).strip() in {"stage1_http", "lexical_gate"}:
+                    final_status = "filtered_lexical_miss"
+                    hash_status = "filtered"
+                    failure_reason = str(stage1_row.get("reason", "") or "filtered_lexical_miss")
+                _upsert_shortlist_checkpoint(
+                    run_context=run_context,
+                    checkpoint_store=checkpoint_store,
+                    raw_url=raw_url,
+                    normalized_url=normalized_url,
+                    source_workbook=source_workbook,
+                    stage_name="hash",
+                    stage_status=hash_status,
+                    current_stage="hash",
+                    final_pipeline_status=final_status,
+                    failure_reason=failure_reason,
+                )
         print(f"Excluded URLs: {excluded_path} ({len(excluded_rows)} rows)")
         print(f"Stage1 methods: {methods_path}")
         print(f"Stage1 deep-analysis candidates: {deep_analysis_path}")
@@ -4792,6 +5511,10 @@ async def run_hashing_shortlist_async(
     stage1_credential_min=None,
     stage1_low_band_min=None,
     stage1_hard_trigger_brand_min=None,
+    run_context: RunContext | None = None,
+    checkpoint_store: CheckpointStore | None = None,
+    resume: bool = False,
+    force_reprocess: bool = False,
 ):
     """Async entry point for hashing shortlist."""
     return await run_hashing_shortlist_streaming(
@@ -4818,6 +5541,10 @@ async def run_hashing_shortlist_async(
         stage1_credential_min=stage1_credential_min,
         stage1_low_band_min=stage1_low_band_min,
         stage1_hard_trigger_brand_min=stage1_hard_trigger_brand_min,
+        run_context=run_context,
+        checkpoint_store=checkpoint_store,
+        resume=resume,
+        force_reprocess=force_reprocess,
     )
 
 
