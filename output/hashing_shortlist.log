@@ -1,0 +1,37 @@
+2026-04-06 13:08:23,429 | INFO | Hashing shortlist (streaming) started | urls=5234 | threshold=58.0 | domain_similarity_threshold=0.800 | high_confidence_threshold=78.00 | medium_confidence_threshold=68.00 | typo_top_k=10 | typo_min_score=0.750 | lexical_pass_min_score=0.850 | clip_margin_min=0.200 | dns_timeout=5.00 | dns_retries=2 | dns_max_workers=192
+2026-04-06 13:08:23,429 | INFO | Scoring weights | domain=30, screenshot=20, favicon=14, ssl_hash=12, html_hash=6, domain_hash=8, keywords=10
+2026-04-06 13:08:23,429 | INFO | Stage1 hashing parallelism | dns_workers=192 | total_pages=16 | page_workers_per_shard=4 | shards=4 | http_limit=64 | nav_timeout_ms=15000 | screenshot_timeout_ms=6000 | fetch_timeout_s=20.0 | gpu_queue=32 | gpu_batch=16 | active_fetch_limit=16 | active_fetch_floor=6 | aux_net_limit=24 | adaptive_downshift_enabled=True
+2026-04-06 13:08:23,429 | INFO | Stage1 note | OCR/Screenshots/ImgProc/RDAP/WHOIS limits from phishing_pipeline.utils are not the active hashing-stage browser worker counts.
+2026-04-06 13:08:23,429 | INFO | Stage1 runtime thresholds | escalate_total=60 | brand_min=18 | credential_min=18 | low_band_min=20 | hard_trigger_brand_min=10 | passthroughs={stage1_suspected=False,dns_rejected_strict_lexical=False,fetch_failed_strict_lexical=False}
+2026-04-06 13:08:23,432 | INFO | Stage1 routing kept 32/5234 URLs before DNS | lexical_hits=29 | lexical_misses=5205 | non_escalated=5202
+2026-04-06 13:08:23,433 | INFO | Stage1 RDAP summary | success=0 | 429=6550 | retry_success=0 | retry_exhausted=2091 | exception=0 | cache_hit=29
+2026-04-06 13:08:33,220 | INFO | DNS gate details | urls=32 | kept=13 | timeout=5.0s | retries=2 | workers=192 | resolved=13 timeout=0 resolver_error=2 no_records=2 dns_error=15 retry_success=0
+2026-04-06 13:08:33,222 | INFO | DNS gate kept 13/32 Stage1 escalations at 5.0s timeout (retries=2, retry_success=0) | resolved=13 timeout=0 resolver_error=2 no_records=2 dns_error=15
+2026-04-06 13:08:33,222 | INFO | Hashing log file: c:\Users\SATWIK\Documents\Phishing\output\hashing_shortlist.log
+2026-04-06 13:08:48,404 | INFO | Hashing progress | processed=8/13 | ok=8 | fail=0 | tout=0 | park=0 | match=4 | gpu_batches=6 | gpu_items=8 | gpu_queue=0 | active_fetch_limit=16 | avg_gpu_batch=1.33 | urls_per_sec=0.53 | success_ratio=1.000 | timeout_ratio=0.000
+2026-04-06 13:08:51,620 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000002DF68F50880>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-06 13:08:55,349 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000002DF68D789A0>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-06 13:08:57,492 | DEBUG | Retrying fetch for https://airtell.ai after navigation_timeout
+2026-04-06 13:08:57,497 | DEBUG | Retrying fetch for https://axisupi.com after navigation_timeout
+2026-04-06 13:08:57,501 | DEBUG | Retrying fetch for https://icicibank.net/login after navigation_timeout
+2026-04-06 13:08:57,503 | DEBUG | Retrying fetch for https://onlinedentist24.com after navigation_timeout
+2026-04-06 13:08:58,470 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000002DF68D78760>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-06 13:08:59,495 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000002DF68D71C00>
+  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+
+2026-04-06 13:09:03,628 | INFO | Hashing progress | processed=9/13 | ok=9 | fail=0 | tout=0 | park=0 | match=4 | gpu_batches=7 | gpu_items=9 | gpu_queue=0 | active_fetch_limit=16 | avg_gpu_batch=1.29 | urls_per_sec=0.30 | success_ratio=1.000 | timeout_ratio=0.000
+2026-04-06 13:09:12,811 | INFO | Hashing shortlist completed | passed_dns_gate=13 | processed=13 | hashed_success=9 | fetch_failed=2 | fetch_timed_out=2 | fetch_parked=0 | final_matches=4 | gpu_batches=7 | gpu_items=9 | avg_gpu_batch=1.3 | urls_per_sec=0.33 | threshold=58.0 | elapsed=39.6s
+2026-04-06 13:09:12,811 | INFO | Anchor summary (shortlisted) | typo_anchor=3 | hash_anchor=0 | clip_anchor=0 | shortlisted=4
+2026-04-06 13:09:12,817 | INFO | Typo similarity summary (shortlisted) | min=0.4167 | avg=0.6867 | p95=0.8180 | max=0.8300 | typo_min_score=0.7500
+2026-04-06 13:09:13,051 | INFO | Stage1 methods summary | rows=5234 | lexical_hits=29 | hard_triggers=3 | password_pages=11 | login_forms=24 | action_mismatches=17 | deep_candidates=32 | dns_accepted=13 | deep_attempted=13 | top_escalate_reasons=stage1_low_suspicion:2719, stage1_fetch_failed:2400, stage1_suspected_non_escalated:83, lexical_hit:29, hard_trigger_hit|stage1_score_threshold|brand_credential_combo:2
+2026-04-06 13:09:13,051 | INFO | Stage1 methods CSV written to c:\Users\SATWIK\Documents\Phishing\output\stage1_methods_debug.csv
+2026-04-06 13:09:13,051 | INFO | Stage1 deep-analysis candidates CSV written to c:\Users\SATWIK\Documents\Phishing\output\stage1_deep_analysis_candidates.csv
+2026-04-06 13:09:13,123 | INFO | Stage1 review queue written to c:\Users\SATWIK\Documents\Phishing\output\hash_review_queue.csv with 85 rows
+2026-04-06 13:09:13,210 | INFO | Stage1 debug CSV written to output\stage1_lexical_debug.csv with 5234 rows
+2026-04-06 13:09:13,304 | INFO | Excluded URL audit written to c:\Users\SATWIK\Documents\Phishing\output\hashing_shortlist_excluded_urls.csv with 5228 rows

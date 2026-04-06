@@ -107,6 +107,152 @@ def _stage_smoke_mode(value: str) -> str:
     return normalized
 
 
+def _runtime_profile(value: str) -> str:
+    normalized = str(value).strip().lower()
+    allowed = {"auto", "default", "cpu-safe", "cpu-recall", "cpu-fast"}
+    if normalized not in allowed:
+        raise argparse.ArgumentTypeError(f"runtime profile must be one of {sorted(allowed)}")
+    return normalized
+
+
+def _probe_runtime_resources() -> dict[str, Any]:
+    cpu_cores = os.cpu_count() or 4
+    ram_gb = 0.0
+    vram_gb = 0.0
+
+    try:
+        import psutil  # type: ignore
+
+        ram_gb = float(psutil.virtual_memory().total / (1024 ** 3))
+    except Exception:
+        ram_gb = 0.0
+
+    try:
+        import torch  # type: ignore
+
+        if torch.cuda.is_available():
+            vram_gb = float(torch.cuda.get_device_properties(0).total_memory / (1024 ** 3))
+    except Exception:
+        vram_gb = 0.0
+
+    return {
+        "cpu_cores": int(cpu_cores),
+        "ram_gb": float(ram_gb),
+        "vram_gb": float(vram_gb),
+        "platform": sys.platform,
+    }
+
+
+def _resolve_auto_runtime_profile(resource_info: dict[str, Any] | None = None) -> str:
+    resource_info = dict(resource_info or _probe_runtime_resources())
+    cpu_cores = int(resource_info.get("cpu_cores", 0) or 0)
+    ram_gb = float(resource_info.get("ram_gb", 0.0) or 0.0)
+    vram_gb = float(resource_info.get("vram_gb", 0.0) or 0.0)
+
+    if cpu_cores >= 32 and ram_gb >= 96.0:
+        return "cpu-recall"
+    if cpu_cores <= 16 or ram_gb < 16.0 or (0.0 < vram_gb <= 6.0):
+        return "cpu-safe"
+    return "cpu-fast"
+
+
+def _resolve_runtime_profile_settings(
+    profile: str,
+    *,
+    resource_info: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    requested_profile = _runtime_profile(profile)
+    resource_info = dict(resource_info or _probe_runtime_resources())
+    resolved_profile = (
+        _resolve_auto_runtime_profile(resource_info)
+        if requested_profile in {"auto", "default"}
+        else requested_profile
+    )
+
+    profiles: dict[str, dict[str, Any]] = {
+        "cpu-safe": {
+            "env": {
+                "PHISHING_HASH_PAGES": 16,
+                "PHISHING_HASH_PAGE_CONCURRENCY": 4,
+                "PHISHING_HASH_HTTP_LIMIT": 64,
+                "PHISHING_HASH_AUX_NET_LIMIT": 24,
+                "PHISHING_HASH_ACTIVE_PAGES_FLOOR": 6,
+                "PHISHING_HASH_ADAPTIVE_DOWNSHIFT": "true",
+                "PHISHING_DNS_GATE_MIN_WORKERS": 96,
+                "PHISHING_DNS_GATE_MAX_WORKERS": 192,
+            },
+            "stage1_http": {
+                "concurrency": 96,
+                "http_concurrency": 96,
+                "dns_concurrency": 96,
+                "rdap_concurrency": 4,
+                "tls_concurrency": 16,
+            },
+            "dns_max_workers": 192,
+        },
+        "cpu-recall": {
+            "env": {
+                "PHISHING_HASH_PAGES": 20,
+                "PHISHING_HASH_PAGE_CONCURRENCY": 4,
+                "PHISHING_HASH_HTTP_LIMIT": 80,
+                "PHISHING_HASH_AUX_NET_LIMIT": 32,
+                "PHISHING_HASH_ACTIVE_PAGES_FLOOR": 8,
+                "PHISHING_HASH_ADAPTIVE_DOWNSHIFT": "true",
+                "PHISHING_DNS_GATE_MIN_WORKERS": 128,
+                "PHISHING_DNS_GATE_MAX_WORKERS": 256,
+            },
+            "stage1_http": {
+                "concurrency": 128,
+                "http_concurrency": 128,
+                "dns_concurrency": 128,
+                "rdap_concurrency": 6,
+                "tls_concurrency": 24,
+            },
+            "dns_max_workers": 256,
+        },
+        "cpu-fast": {
+            "env": {
+                "PHISHING_HASH_PAGES": 24,
+                "PHISHING_HASH_PAGE_CONCURRENCY": 4,
+                "PHISHING_HASH_HTTP_LIMIT": 96,
+                "PHISHING_HASH_AUX_NET_LIMIT": 40,
+                "PHISHING_HASH_ACTIVE_PAGES_FLOOR": 8,
+                "PHISHING_HASH_ADAPTIVE_DOWNSHIFT": "true",
+                "PHISHING_DNS_GATE_MIN_WORKERS": 128,
+                "PHISHING_DNS_GATE_MAX_WORKERS": 256,
+            },
+            "stage1_http": {
+                "concurrency": 144,
+                "http_concurrency": 144,
+                "dns_concurrency": 144,
+                "rdap_concurrency": 8,
+                "tls_concurrency": 24,
+            },
+            "dns_max_workers": 256,
+        },
+    }
+    selected = profiles[resolved_profile]
+    return {
+        "name": resolved_profile,
+        "requested_profile": requested_profile,
+        "resolved_profile": resolved_profile,
+        "resource_info": resource_info,
+        "env": dict(selected["env"]),
+        "stage1_http": dict(selected["stage1_http"]),
+        "dns_max_workers": selected["dns_max_workers"],
+    }
+
+
+def _apply_runtime_profile_env(settings: dict[str, Any]) -> None:
+    for key, value in (settings.get("env") or {}).items():
+        os.environ[str(key)] = str(value)
+
+
+def _apply_stage1_http_runtime_profile(stage1_http_config: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
+    stage1_http_config.update(settings.get("stage1_http") or {})
+    return stage1_http_config
+
+
 def _load_runtime_components() -> dict[str, Any]:
     """
     Import pipeline modules lazily.
@@ -181,15 +327,6 @@ def clear_gpu_memory():
 
 
 async def main():
-    components = _load_runtime_components()
-    final_output = components["FINAL_OUTPUT"]
-    close_browser = components["close_browser"]
-    run_pipeline = components["run_pipeline"]
-    package_results = components["package_results"]
-    shortlisting = components["shortlisting"]
-    run_hashing_shortlist_async = components["run_hashing_shortlist_async"]
-    stage1_http_config = components["STAGE1_HTTP_CONFIG"] or {}
-
     parser = argparse.ArgumentParser(description="Phishing Detection CLI Controller")
     
     parser.add_argument("--whitelist", type=str, default=os.path.join("data", "whitelists", "Stage_2_Legitimate_Domains_80.xlsx"),
@@ -262,7 +399,28 @@ async def main():
                         help="Path for Stage 1 lexical/debug CSV (default=output/stage1_lexical_debug.csv)")
     parser.add_argument("--stage-smoke-test", type=_stage_smoke_mode, default="off",
                         help="Optional partial-run mode: off, dns, fetch, lexical, score, classify, all (default=off)")
+    parser.add_argument("--runtime-profile", type=_runtime_profile, default="auto",
+                        help="Concurrency-only runtime preset. 'auto' is the default; 'default' is an alias for 'auto'.")
     args = parser.parse_args()
+
+    runtime_profile_settings = _resolve_runtime_profile_settings(args.runtime_profile)
+    _apply_runtime_profile_env(runtime_profile_settings)
+
+    components = _load_runtime_components()
+    final_output = components["FINAL_OUTPUT"]
+    close_browser = components["close_browser"]
+    run_pipeline = components["run_pipeline"]
+    package_results = components["package_results"]
+    shortlisting = components["shortlisting"]
+    run_hashing_shortlist_async = components["run_hashing_shortlist_async"]
+    stage1_http_config = components["STAGE1_HTTP_CONFIG"] or {}
+    _apply_stage1_http_runtime_profile(stage1_http_config, runtime_profile_settings)
+    effective_dns_max_workers = (
+        args.dns_max_workers
+        if args.dns_max_workers is not None
+        else runtime_profile_settings.get("dns_max_workers")
+    )
+
     if args.high_confidence_threshold < args.medium_confidence_threshold:
         raise ValueError("high-confidence-threshold must be >= medium-confidence-threshold")
     if args.dns_timeout <= 0:
@@ -277,6 +435,18 @@ async def main():
         "Deprecated CLI compatibility | clip_margin_min=%.3f ignored | weight_screenshot=%.3f ignored",
         args.clip_margin_min,
         args.weight_screenshot,
+    )
+    logger.info(
+        "Runtime profile requested=%s resolved=%s | host={cpu=%s,ram_gb=%.1f,vram_gb=%.1f,platform=%s} | hash_env=%s | stage1_http_overrides=%s | dns_max_workers=%s",
+        runtime_profile_settings["requested_profile"],
+        runtime_profile_settings["resolved_profile"],
+        runtime_profile_settings["resource_info"].get("cpu_cores", "NA"),
+        float(runtime_profile_settings["resource_info"].get("ram_gb", 0.0) or 0.0),
+        float(runtime_profile_settings["resource_info"].get("vram_gb", 0.0) or 0.0),
+        runtime_profile_settings["resource_info"].get("platform", "unknown"),
+        runtime_profile_settings.get("env", {}),
+        runtime_profile_settings.get("stage1_http", {}),
+        effective_dns_max_workers if effective_dns_max_workers is not None else "adaptive",
     )
 
     # ✅ Ensure whitelist file exists
@@ -386,7 +556,7 @@ async def main():
             args.lexical_pass_min_score,
             args.dns_timeout,
             args.dns_retries,
-            args.dns_max_workers if args.dns_max_workers is not None else "adaptive",
+            effective_dns_max_workers if effective_dns_max_workers is not None else "adaptive",
             stage1_http_config.get("concurrency", "NA"),
             stage1_http_config.get("http_concurrency", "NA"),
             stage1_http_config.get("dns_concurrency", "NA"),
@@ -440,7 +610,7 @@ async def main():
                     clip_margin_min=args.clip_margin_min,
                     dns_timeout=args.dns_timeout,
                     dns_retries=args.dns_retries,
-                    dns_max_workers=args.dns_max_workers,
+                    dns_max_workers=effective_dns_max_workers,
                     shortlist_debug_csv=args.shortlist_debug_csv,
                     stage1_escalate_total_threshold=args.stage1_escalate_total_threshold,
                     stage1_brand_min=args.stage1_brand_min,
@@ -488,7 +658,7 @@ async def main():
                     clip_margin_min=args.clip_margin_min,
                     dns_timeout=args.dns_timeout,
                     dns_retries=args.dns_retries,
-                    dns_max_workers=args.dns_max_workers,
+                    dns_max_workers=effective_dns_max_workers,
                     weights=shortlist_weights,
                     shortlist_debug_csv=args.shortlist_debug_csv,
                     url_sources=url_sources,
@@ -533,7 +703,7 @@ async def main():
                     clip_margin_min=args.clip_margin_min,
                     dns_timeout=args.dns_timeout,
                     dns_retries=args.dns_retries,
-                    dns_max_workers=args.dns_max_workers,
+                    dns_max_workers=effective_dns_max_workers,
                     shortlist_debug_csv=args.shortlist_debug_csv,
                     stage1_escalate_total_threshold=args.stage1_escalate_total_threshold,
                     stage1_brand_min=args.stage1_brand_min,
@@ -569,7 +739,7 @@ async def main():
                     clip_margin_min=args.clip_margin_min,
                     dns_timeout=args.dns_timeout,
                     dns_retries=args.dns_retries,
-                    dns_max_workers=args.dns_max_workers,
+                    dns_max_workers=effective_dns_max_workers,
                     shortlist_debug_csv=args.shortlist_debug_csv,
                     stage1_escalate_total_threshold=args.stage1_escalate_total_threshold,
                     stage1_brand_min=args.stage1_brand_min,

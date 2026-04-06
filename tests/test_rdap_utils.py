@@ -1,0 +1,158 @@
+import unittest
+from unittest import mock
+
+import httpx
+
+from phishing_pipeline import rdap_utils
+
+
+class _FakeResponse:
+    def __init__(self, status_code: int, payload=None):
+        self.status_code = status_code
+        self._payload = payload if payload is not None else {}
+
+    def json(self):
+        return self._payload
+
+
+class _FakeClient:
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = 0
+
+    async def get(self, url, timeout=None):
+        self.calls += 1
+        if not self._responses:
+            raise AssertionError("No fake responses left")
+        item = self._responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+class _EmptyMessageRequestError(httpx.RequestError):
+    def __str__(self):
+        return ""
+
+
+class RdapUtilsTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        rdap_utils.reset_rdap_state()
+
+    async def test_lookup_rdap_caches_successful_result_for_exact_domain(self):
+        client = _FakeClient(
+            [
+                _FakeResponse(
+                    200,
+                    {
+                        "events": [{"eventAction": "registration", "eventDate": "2024-01-01T00:00:00Z"}],
+                        "entities": [],
+                        "nameservers": [{"ldhName": "ns1.example.com"}],
+                        "status": ["active"],
+                    },
+                )
+            ]
+        )
+
+        first = await rdap_utils.lookup_rdap("example.com", client=client, timeout=1.0)
+        second = await rdap_utils.lookup_rdap("example.com", client=client, timeout=1.0)
+
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(first["creation_date"], "2024-01-01T00:00:00Z")
+        self.assertEqual(second["name_servers"], "ns1.example.com")
+        snapshot = rdap_utils.get_rdap_metrics_snapshot()
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(snapshot["cache_hit"], 1)
+
+    async def test_lookup_rdap_caches_empty_result_after_exhausted_429s(self):
+        client = _FakeClient(
+            [
+                _FakeResponse(429),
+                _FakeResponse(429),
+                _FakeResponse(429),
+            ]
+        )
+
+        with mock.patch("phishing_pipeline.rdap_utils.random.uniform", return_value=0.0), mock.patch(
+            "phishing_pipeline.rdap_utils.asyncio.sleep",
+            new=mock.AsyncMock(),
+        ):
+            first = await rdap_utils.lookup_rdap("limited.example", client=client, timeout=1.0)
+            second = await rdap_utils.lookup_rdap("limited.example", client=client, timeout=1.0)
+
+        self.assertEqual(client.calls, 3)
+        self.assertEqual(first["creation_date"], None)
+        self.assertEqual(second["raw_rdap"], {})
+        snapshot = rdap_utils.get_rdap_metrics_snapshot()
+        self.assertEqual(snapshot["429"], 3)
+        self.assertEqual(snapshot["retry_exhausted"], 1)
+        self.assertEqual(snapshot["cache_hit"], 1)
+
+    async def test_lookup_rdap_retries_429_then_succeeds_with_same_schema(self):
+        client = _FakeClient(
+            [
+                _FakeResponse(429),
+                _FakeResponse(
+                    200,
+                    {
+                        "events": [{"eventAction": "registration", "eventDate": "2024-02-02T00:00:00Z"}],
+                        "entities": [],
+                        "nameservers": [],
+                        "status": ["active"],
+                    },
+                ),
+            ]
+        )
+
+        with mock.patch("phishing_pipeline.rdap_utils.random.uniform", return_value=0.0), mock.patch(
+            "phishing_pipeline.rdap_utils.asyncio.sleep",
+            new=mock.AsyncMock(),
+        ):
+            result = await rdap_utils.lookup_rdap("retry.example", client=client, timeout=1.0)
+
+        self.assertEqual(client.calls, 2)
+        self.assertEqual(
+            set(result.keys()),
+            {"creation_date", "registrar", "registrant_name", "registrant_country", "name_servers", "status", "raw_rdap"},
+        )
+        self.assertEqual(result["creation_date"], "2024-02-02T00:00:00Z")
+        snapshot = rdap_utils.get_rdap_metrics_snapshot()
+        self.assertEqual(snapshot["429"], 1)
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(snapshot["retry_success"], 1)
+
+    async def test_lookup_rdap_logs_exception_type_when_message_is_empty(self):
+        request = httpx.Request("GET", "https://rdap.org/domain/silent.example")
+        client = _FakeClient(
+            [
+                _EmptyMessageRequestError("ignored", request=request),
+                _EmptyMessageRequestError("ignored", request=request),
+                _EmptyMessageRequestError("ignored", request=request),
+            ]
+        )
+
+        with mock.patch("phishing_pipeline.rdap_utils.random.uniform", return_value=0.0), mock.patch(
+            "phishing_pipeline.rdap_utils.asyncio.sleep",
+            new=mock.AsyncMock(),
+        ), self.assertLogs("phishing_pipeline.rdap_utils", level="ERROR") as logs:
+            await rdap_utils.lookup_rdap("silent.example", client=client, timeout=1.0)
+
+        self.assertEqual(client.calls, 3)
+        self.assertTrue(any("EmptyMessageRequestError" in line for line in logs.output))
+
+    async def test_lookup_rdap_does_not_retry_non_transport_exception(self):
+        client = _FakeClient([ValueError("boom")])
+
+        with self.assertLogs("phishing_pipeline.rdap_utils", level="ERROR") as logs:
+            result = await rdap_utils.lookup_rdap("boom.example", client=client, timeout=1.0)
+
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(result["raw_rdap"], {})
+        self.assertTrue(any("boom" in line for line in logs.output))
+        snapshot = rdap_utils.get_rdap_metrics_snapshot()
+        self.assertEqual(snapshot["exception"], 1)
+        self.assertEqual(snapshot["retry_exhausted"], 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

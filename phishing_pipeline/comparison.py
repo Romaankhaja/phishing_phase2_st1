@@ -4086,9 +4086,11 @@ async def run_hashing_shortlist_streaming(
     resolved_weights = scoring_config["weights"]
     stage1_http_config = dict(scoring_config["stage1_http_config"])
     source_workbook_map = _resolve_source_workbook_map(url_sources)
+    from .rdap_utils import get_rdap_metrics_snapshot, reset_rdap_state
 
     input_urls = list(url_list)
     log_path = _configure_hashing_log()
+    reset_rdap_state()
     original_count = len(input_urls)
     metrics = {
         "passed_dns_gate": 0,
@@ -4138,6 +4140,8 @@ async def run_hashing_shortlist_streaming(
             }
             if bool(stage1_analysis_map[normalized_url].get("escalate_to_hashing")):
                 lexical_candidate_urls.append(raw_url)
+
+    rdap_metrics = get_rdap_metrics_snapshot()
 
     try:
         from .dns_gate import (
@@ -4243,6 +4247,15 @@ async def run_hashing_shortlist_streaming(
                 for row in stage1_analysis_map.values()
                 if not bool(row.get("escalate_to_hashing", False))
             ),
+        )
+        _clip_logger.info(
+            "Stage1 RDAP summary | success=%d | 429=%d | retry_success=%d | retry_exhausted=%d | exception=%d | cache_hit=%d",
+            int(rdap_metrics.get("success", 0) or 0),
+            int(rdap_metrics.get("429", 0) or 0),
+            int(rdap_metrics.get("retry_success", 0) or 0),
+            int(rdap_metrics.get("retry_exhausted", 0) or 0),
+            int(rdap_metrics.get("exception", 0) or 0),
+            int(rdap_metrics.get("cache_hit", 0) or 0),
         )
         print(
             f"Stage1 routing kept {len(lexical_candidate_urls)}/{original_count} URLs"
