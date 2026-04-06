@@ -79,7 +79,7 @@ class RdapUtilsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["success"], 1)
         self.assertEqual(snapshot["cache_hit"], 1)
 
-    async def test_lookup_rdap_caches_empty_result_after_exhausted_429s(self):
+    async def test_lookup_rdap_caches_empty_result_after_single_429(self):
         client = _FakeClient(
             [
                 _FakeResponse(429),
@@ -95,11 +95,11 @@ class RdapUtilsTests(unittest.IsolatedAsyncioTestCase):
             first = await rdap_utils.lookup_rdap("limited.example", client=client, timeout=1.0)
             second = await rdap_utils.lookup_rdap("limited.example", client=client, timeout=1.0)
 
-        self.assertEqual(client.calls, 3)
+        self.assertEqual(client.calls, 1)
         self.assertEqual(first["creation_date"], None)
         self.assertEqual(second["raw_rdap"], {})
         snapshot = rdap_utils.get_rdap_metrics_snapshot()
-        self.assertEqual(snapshot["429"], 3)
+        self.assertEqual(snapshot["429"], 1)
         self.assertEqual(snapshot["retry_exhausted"], 1)
         self.assertEqual(snapshot["cooldown_hit"], 1)
 
@@ -130,7 +130,7 @@ class RdapUtilsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["success"], 1)
         self.assertEqual(snapshot["inflight_wait"], 1)
 
-    async def test_lookup_rdap_retries_429_then_succeeds_with_same_schema(self):
+    async def test_lookup_rdap_does_not_retry_429_then_succeeds_on_later_run_only(self):
         client = _FakeClient(
             [
                 _FakeResponse(429),
@@ -152,23 +152,21 @@ class RdapUtilsTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await rdap_utils.lookup_rdap("retry.example", client=client, timeout=1.0)
 
-        self.assertEqual(client.calls, 2)
+        self.assertEqual(client.calls, 1)
         self.assertEqual(
             set(result.keys()),
             {"creation_date", "registrar", "registrant_name", "registrant_country", "name_servers", "status", "raw_rdap"},
         )
-        self.assertEqual(result["creation_date"], "2024-02-02T00:00:00Z")
+        self.assertEqual(result["creation_date"], None)
         snapshot = rdap_utils.get_rdap_metrics_snapshot()
         self.assertEqual(snapshot["429"], 1)
-        self.assertEqual(snapshot["success"], 1)
-        self.assertEqual(snapshot["retry_success"], 1)
+        self.assertEqual(snapshot["success"], 0)
+        self.assertEqual(snapshot["retry_success"], 0)
 
     async def test_lookup_rdap_logs_exception_type_when_message_is_empty(self):
         request = httpx.Request("GET", "https://rdap.org/domain/silent.example")
         client = _FakeClient(
             [
-                _EmptyMessageRequestError("ignored", request=request),
-                _EmptyMessageRequestError("ignored", request=request),
                 _EmptyMessageRequestError("ignored", request=request),
             ]
         )
@@ -179,15 +177,13 @@ class RdapUtilsTests(unittest.IsolatedAsyncioTestCase):
         ), self.assertLogs("phishing_pipeline.rdap_utils", level="ERROR") as logs:
             await rdap_utils.lookup_rdap("silent.example", client=client, timeout=1.0)
 
-        self.assertEqual(client.calls, 3)
+        self.assertEqual(client.calls, 1)
         self.assertTrue(any("EmptyMessageRequestError" in line for line in logs.output))
 
     async def test_lookup_rdap_applies_cooldown_after_read_timeout_exhaustion(self):
         request = httpx.Request("GET", "https://rdap.org/domain/timeout.example")
         client = _FakeClient(
             [
-                httpx.ReadTimeout("slow", request=request),
-                httpx.ReadTimeout("slow", request=request),
                 httpx.ReadTimeout("slow", request=request),
             ]
         )
@@ -199,7 +195,7 @@ class RdapUtilsTests(unittest.IsolatedAsyncioTestCase):
             first = await rdap_utils.lookup_rdap("timeout.example", client=client, timeout=1.0)
             second = await rdap_utils.lookup_rdap("timeout.example", client=client, timeout=1.0)
 
-        self.assertEqual(client.calls, 3)
+        self.assertEqual(client.calls, 1)
         self.assertEqual(first["raw_rdap"], {})
         self.assertEqual(second["raw_rdap"], {})
         snapshot = rdap_utils.get_rdap_metrics_snapshot()

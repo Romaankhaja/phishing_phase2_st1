@@ -38,7 +38,7 @@ OUTPUT_DIR      = os.path.join(ROOT_DIR, "output")
 CHECKPOINTS_DIR = os.path.join(OUTPUT_DIR, "checkpoints")
 PIPELINE_RUN_RESULTS_CSV = os.path.join(OUTPUT_DIR, "pipeline_run_results.csv")
 PIPELINE_STAGE_EVENTS_CSV = os.path.join(OUTPUT_DIR, "pipeline_stage_events.csv")
-RUN_MANIFEST_JSON = os.path.join(OUTPUT_DIR, "run_manifest.json")
+RUN_MANIFEST_CSV = os.path.join(OUTPUT_DIR, "run_manifest.csv")
 
 # Screenshots & Evidence
 SCREENS_DIR  = os.path.join(BASE_DIR, "screens")
@@ -58,11 +58,11 @@ STAGE1_HTTP_CONFIG = {
     "dns_concurrency": 200,
     "rdap_concurrency": 10,
     "tls_concurrency": 32,
-    "connect_timeout": 4.0,
-    "head_timeout": 4.0,
-    "get_timeout": 6.0,
+    "connect_timeout": 3.0,
+    "head_timeout": 3.0,
+    "get_timeout": 5.0,
     "dns_timeout": 3.0,
-    "rdap_timeout": 5.0,
+    "rdap_timeout": 4.0,
     "tls_timeout": 3.0,
     "max_html_bytes": 32768,
     "max_redirects": 4,
@@ -81,8 +81,11 @@ STAGE3_RECALL_RESCUE_CONFIG = {
 RELIABILITY_CONFIG = {
     "stall_threshold_seconds": 180,
     "watchdog_warning_seconds": 60,
-    "export_flush_interval_seconds": 5,
-    "export_flush_row_interval": 50,
+    "append_flush_interval_seconds": 2,
+    "append_flush_row_interval": 1000,
+    "snapshot_flush_interval_seconds": 30,
+    "snapshot_flush_row_interval": 5000,
+    "stage0_progress_log_interval_seconds": 10,
     "stage1_failure_policy": "route_to_dns",
     "max_worker_restarts": 2,
 }

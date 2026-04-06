@@ -8,7 +8,6 @@ import os
 import argparse
 import asyncio
 import logging
-import json
 from typing import Any
 
 # Event loop policy on Windows
@@ -321,11 +320,21 @@ def _load_runtime_components() -> dict[str, Any]:
 
 def _load_existing_run_manifest(path: str) -> dict[str, Any] | None:
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
+        import csv
+        with open(path, newline="", encoding="utf-8") as fh:
+            rows = list(csv.DictReader(fh))
     except Exception:
         return None
-    return data if isinstance(data, dict) else None
+    if not rows:
+        return None
+    data = dict(rows[-1])
+    metadata_json = data.get("metadata_json")
+    if isinstance(metadata_json, str):
+        try:
+            data["metadata_json"] = __import__("json").loads(metadata_json)
+        except Exception:
+            data["metadata_json"] = {}
+    return data
 
 
 def _manifest_matches_inputs(manifest: dict[str, Any] | None, metadata: dict[str, Any]) -> bool:
@@ -386,10 +395,10 @@ async def main():
                         help="Minimum lexical score allowed to pass Stage 1 admission even below hash threshold (default=0.85)")
     parser.add_argument("--clip-margin-min", type=_non_negative_float, default=0.20,
                         help="Deprecated compatibility no-op. CLIP routing is disabled.")
-    parser.add_argument("--dns-timeout", type=_non_negative_float, default=5.0,
-                        help="DNS gate timeout in seconds (default=5.0)")
-    parser.add_argument("--dns-retries", type=_non_negative_int, default=2,
-                        help="DNS gate retry count for timeout/resolver errors (default=2)")
+    parser.add_argument("--dns-timeout", type=_non_negative_float, default=3.0,
+                        help="DNS gate timeout in seconds (default=3.0)")
+    parser.add_argument("--dns-retries", type=_non_negative_int, default=0,
+                        help="DNS gate retry count for timeout/resolver errors (default=0; runtime clamps to single-attempt)")
     parser.add_argument("--dns-max-workers", type=_positive_int, default=None,
                         help="Optional fixed DNS gate worker count (default=adaptive)")
     parser.add_argument("--stage1-escalate-total-threshold", type=_non_negative_int, default=None,
@@ -444,7 +453,7 @@ async def main():
                         help="Watchdog threshold for no-progress detection in long-running stages (default=180)")
     args = parser.parse_args()
 
-    from phishing_pipeline.config import OUTPUT_DIR, RELIABILITY_CONFIG
+    from phishing_pipeline.config import OUTPUT_DIR, RELIABILITY_CONFIG, RUN_MANIFEST_CSV
     from phishing_pipeline.reliability import CheckpointStore, build_run_context
 
     reliability_metadata = {
@@ -458,14 +467,14 @@ async def main():
     existing_manifest = None
     existing_run_id = None
     if args.resume and not args.force_reprocess:
-        existing_manifest = _load_existing_run_manifest(os.path.join(OUTPUT_DIR, "run_manifest.json"))
+        existing_manifest = _load_existing_run_manifest(RUN_MANIFEST_CSV)
         if (
             existing_manifest
             and str(existing_manifest.get("status", "")).strip().lower() != "completed"
             and _manifest_matches_inputs(existing_manifest, reliability_metadata)
         ):
-            checkpoint_db_path = str(existing_manifest.get("checkpoint_db_path", "") or "")
-            if checkpoint_db_path and os.path.exists(checkpoint_db_path):
+            checkpoint_events_csv = str(existing_manifest.get("url_result_events_csv", "") or "")
+            if checkpoint_events_csv and os.path.exists(checkpoint_events_csv):
                 existing_run_id = str(existing_manifest.get("run_id", "") or "").strip() or None
 
     resolved_run_id = args.run_id or existing_run_id
@@ -475,8 +484,11 @@ async def main():
         run_id=resolved_run_id,
         stall_threshold_seconds=args.stall_threshold_seconds,
         watchdog_warning_seconds=int(RELIABILITY_CONFIG.get("watchdog_warning_seconds", 60)),
-        export_flush_interval_seconds=int(RELIABILITY_CONFIG.get("export_flush_interval_seconds", 5)),
-        export_flush_row_interval=int(RELIABILITY_CONFIG.get("export_flush_row_interval", 50)),
+        append_flush_interval_seconds=int(RELIABILITY_CONFIG.get("append_flush_interval_seconds", 2)),
+        append_flush_row_interval=int(RELIABILITY_CONFIG.get("append_flush_row_interval", 1000)),
+        snapshot_flush_interval_seconds=int(RELIABILITY_CONFIG.get("snapshot_flush_interval_seconds", 30)),
+        snapshot_flush_row_interval=int(RELIABILITY_CONFIG.get("snapshot_flush_row_interval", 5000)),
+        stage0_progress_log_interval_seconds=int(RELIABILITY_CONFIG.get("stage0_progress_log_interval_seconds", 10)),
         stage1_failure_policy=args.stage1_failure_policy,
         max_worker_restarts=int(RELIABILITY_CONFIG.get("max_worker_restarts", 2)),
         metadata=reliability_metadata,
@@ -484,11 +496,12 @@ async def main():
     checkpoint_store = CheckpointStore(run_context)
     checkpoint_store.update_manifest(status="running", metadata_json=reliability_metadata)
     logger.info(
-        "Reliability run context | run_id=%s | resume=%s | force_reprocess=%s | checkpoint=%s | stage1_failure_policy=%s | stall_threshold_seconds=%d",
+        "Reliability run context | run_id=%s | resume=%s | force_reprocess=%s | manifest=%s | result_events=%s | stage1_failure_policy=%s | stall_threshold_seconds=%d",
         run_context.run_id,
         resuming_existing_run,
         args.force_reprocess,
-        run_context.checkpoint_db_path,
+        run_context.checkpoint_run_manifest_csv,
+        run_context.url_result_events_csv,
         run_context.stage1_failure_policy,
         run_context.stall_threshold_seconds,
     )
@@ -515,6 +528,9 @@ async def main():
         raise ValueError("high-confidence-threshold must be >= medium-confidence-threshold")
     if args.dns_timeout <= 0:
         raise ValueError("dns-timeout must be > 0")
+    if args.dns_retries != 0:
+        logger.warning("DNS retries are disabled in CSV checkpoint mode. Forcing dns_retries=0 instead of %s", args.dns_retries)
+        args.dns_retries = 0
     if (
         args.failed_fetch_suspected_min is not None
         and args.failed_fetch_review_min is not None
@@ -552,6 +568,15 @@ async def main():
         stage1_http_config.get("dns_concurrency", "NA"),
         stage1_http_config.get("rdap_concurrency", "NA"),
         stage1_http_config.get("tls_concurrency", "NA"),
+    )
+    logger.info(
+        "Strict attempt policy | checkpoint_mode=csv | retries={stage1=0,dns=0,rdap=0,tls=0,hash=0,classify=0} | timeouts={dns=%.1fs,stage1_connect=%s,stage1_head=%s,stage1_get=%s,stage1_rdap=%s,stage1_tls=%s}",
+        args.dns_timeout,
+        stage1_http_config.get("connect_timeout", "NA"),
+        stage1_http_config.get("head_timeout", "NA"),
+        stage1_http_config.get("get_timeout", "NA"),
+        stage1_http_config.get("rdap_timeout", "NA"),
+        stage1_http_config.get("tls_timeout", "NA"),
     )
 
     # ✅ Ensure whitelist file exists

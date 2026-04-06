@@ -2433,7 +2433,7 @@ async def run_pipeline(
     lexical_pass_min_score=0.85,
     clip_margin_min=0.20,
     dns_timeout=5.0,
-    dns_retries=2,
+    dns_retries=0,
     dns_max_workers=None,
     shortlist_debug_csv=None,
     stage1_escalate_total_threshold=None,

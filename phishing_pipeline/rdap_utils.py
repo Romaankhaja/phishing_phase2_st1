@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 # RDAP Bootstrap URL (redirects to the correct authoritative server)
 RDAP_BOOTSTRAP_URL = "https://rdap.org/domain/"
-RDAP_RETRY_ATTEMPTS = 3
+RDAP_RETRY_ATTEMPTS = 1
 RDAP_RETRY_BASE_DELAY_S = 0.25
 RDAP_RETRY_MAX_DELAY_S = 1.5
 RDAP_FAILURE_COOLDOWN_S = 90.0
@@ -164,9 +164,8 @@ async def _lookup_rdap_uncached(
                     continue
                 _record_metric("retry_exhausted")
                 logger.warning(
-                    "RDAP 429 Rate Limit for %s after %d attempts; entering %.0fs cooldown.",
+                    "RDAP 429 Rate Limit for %s; entering %.0fs cooldown.",
                     domain,
-                    RDAP_RETRY_ATTEMPTS,
                     RDAP_FAILURE_COOLDOWN_S,
                 )
                 return result, "failure_cooldown"

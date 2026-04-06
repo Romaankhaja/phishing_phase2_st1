@@ -3565,14 +3565,11 @@ async def _fetch_url_payload(
                     with suppress(Exception):
                         if not page.is_closed():
                             await page.close()
-    for attempt_index in range(2):
+    for attempt_index in range(1):
         try:
             return await asyncio.wait_for(_single_attempt(), timeout=SCRAPER_FETCH_TIMEOUT_S)
         except Exception as exc:
             error_type, error_detail, retryable = _classify_fetch_exception(exc, stage="navigation")
-            if attempt_index == 0 and retryable:
-                _clip_logger.debug("Retrying fetch for %s after %s", url, error_type)
-                continue
             fetch_status = "timeout" if error_type.endswith("_timeout") else "failed"
             return _build_fetch_failure_payload(
                 url=url,
@@ -3587,7 +3584,7 @@ async def _fetch_url_payload(
         normalized_url=url,
         fetch_status="failed",
         error_type="navigation_error",
-        error_detail="fetch attempts exhausted",
+        error_detail="navigation failed",
     )
 
 
@@ -4454,12 +4451,12 @@ async def _analyze_stage1_http_candidates(
                                     + 5.0,
                                     10.0,
                                 ),
-                                max_retries=1,
+                                max_retries=0,
                             )
                     except Exception as exc:
                         error = normalize_exception(exc)
                         timeout_hit = "timeout" in error["error_message"].lower()
-                        retry_count = 1 if timeout_hit else 0
+                        retry_count = 0
                         analysis = {
                             **_stage1_signal_defaults(),
                             "url": normalized_url,
@@ -4698,16 +4695,34 @@ async def run_hashing_shortlist_streaming(
     lexical_candidate_urls = []
     lexical_miss_urls = []
     lexical_reject_urls = set()
+    stage0_hits = 0
+    stage0_misses = 0
+    stage0_skipped = 0
+    stage0_processed = 0
+    stage0_started_monotonic = time.perf_counter()
+    last_stage0_log_monotonic = stage0_started_monotonic
+    try:
+        from tqdm import tqdm as tqdm_sync
+
+        stage0_progress_bar = tqdm_sync(
+            total=original_count,
+            desc="Stage0 lexical gate",
+            unit="url",
+            leave=True,
+            dynamic_ncols=True,
+        )
+    except Exception:
+        stage0_progress_bar = None
+
     for raw_url in input_urls:
         normalized_url = normalize_url(raw_url)
         source_workbook = source_workbook_map.get(normalized_url, "")
         if checkpoint_store is not None and run_context is not None and normalized_url:
-            checkpoint_store.ensure_url_result(
-                raw_url=raw_url,
-                normalized_url=normalized_url,
-                source_workbook=source_workbook,
-            )
             if make_record_key(normalized_url, source_workbook) in completed_record_keys:
+                stage0_skipped += 1
+                stage0_processed += 1
+                if stage0_progress_bar is not None:
+                    stage0_progress_bar.update(1)
                 continue
         if normalized_url and normalized_url not in prefetch_metrics_map:
             prefetch_metrics_map[normalized_url] = _compute_prefetch_lexical_state(raw_url, scoring_config)
@@ -4716,6 +4731,7 @@ async def run_hashing_shortlist_streaming(
         prefetch_metrics["source_workbook"] = source_workbook_map.get(normalized_url, prefetch_metrics.get("source_workbook", ""))
         if _passes_lexical_gate(prefetch_metrics):
             lexical_candidate_urls.append(raw_url)
+            stage0_hits += 1
             stage1_analysis_map[normalized_url] = _build_lexical_stage1_state(prefetch_metrics)
             _upsert_shortlist_checkpoint(
                 run_context=run_context,
@@ -4729,6 +4745,7 @@ async def run_hashing_shortlist_streaming(
             )
         else:
             lexical_miss_urls.append(raw_url)
+            stage0_misses += 1
             _upsert_shortlist_checkpoint(
                 run_context=run_context,
                 checkpoint_store=checkpoint_store,
@@ -4739,6 +4756,51 @@ async def run_hashing_shortlist_streaming(
                 stage_status="filtered_lexical_miss",
                 current_stage="stage0",
             )
+        stage0_processed += 1
+        if stage0_progress_bar is not None:
+            stage0_progress_bar.update(1)
+            stage0_progress_bar.set_postfix(
+                {
+                    "hits": stage0_hits,
+                    "miss": stage0_misses,
+                    "skip": stage0_skipped,
+                    "w": 1,
+                },
+                refresh=False,
+            )
+        now_monotonic = time.perf_counter()
+        log_interval = float(getattr(run_context, "stage0_progress_log_interval_seconds", 10) if run_context is not None else 10)
+        if (now_monotonic - last_stage0_log_monotonic) >= log_interval:
+            elapsed_s = max(0.001, now_monotonic - stage0_started_monotonic)
+            rate = stage0_processed / elapsed_s
+            remaining = max(0, original_count - stage0_processed)
+            eta_s = (remaining / rate) if rate > 0 else 0.0
+            _clip_logger.info(
+                "Stage0 lexical gate progress | processed=%d/%d | rate=%.1f url/s | elapsed=%.1fs | eta=%.1fs | hits=%d | misses=%d | skipped=%d | workers=1",
+                stage0_processed,
+                original_count,
+                rate,
+                elapsed_s,
+                eta_s,
+                stage0_hits,
+                stage0_misses,
+                stage0_skipped,
+            )
+            last_stage0_log_monotonic = now_monotonic
+
+    if stage0_progress_bar is not None:
+        stage0_progress_bar.close()
+    stage0_elapsed_s = max(0.001, time.perf_counter() - stage0_started_monotonic)
+    _clip_logger.info(
+        "Stage0 lexical gate completed | processed=%d/%d | rate=%.1f url/s | elapsed=%.1fs | hits=%d | misses=%d | skipped=%d | workers=1",
+        stage0_processed,
+        original_count,
+        stage0_processed / stage0_elapsed_s,
+        stage0_elapsed_s,
+        stage0_hits,
+        stage0_misses,
+        stage0_skipped,
+    )
 
     if completed_record_keys:
         skipped_count = max(0, original_count - len(lexical_candidate_urls) - len(lexical_miss_urls))

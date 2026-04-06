@@ -28,8 +28,8 @@ from .reliability import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DNS_TIMEOUT = 5.0
-DEFAULT_DNS_RETRIES = 2
+DEFAULT_DNS_TIMEOUT = 3.0
+DEFAULT_DNS_RETRIES = 0
 DEFAULT_AUDIT_PATH = os.path.join(OUTPUT_DIR, "dns_gate_audit.csv")
 DEFAULT_FALLBACK_NAMESERVERS = ("1.1.1.1", "8.8.8.8")
 _AUDIT_FIELDNAMES = [
@@ -204,7 +204,7 @@ async def _resolve_single_url(
     retries: int = DEFAULT_DNS_RETRIES,
     fallback_resolver: dns.asyncresolver.Resolver | None = None,
 ) -> dict:
-    retry_budget = max(0, int(retries))
+    retry_budget = 0
     final_row = None
 
     for attempt in range(retry_budget + 1):
@@ -257,6 +257,7 @@ async def _gate_urls_for_hashing_async(
 ) -> tuple[list[str], list[dict]]:
     if not target_urls:
         return [], []
+    retries = 0
 
     retries = max(0, int(retries))
     worker_count = _resolve_dns_worker_count(len(target_urls), max_workers=max_workers)
@@ -362,7 +363,7 @@ async def _gate_urls_for_hashing_async(
                         retries=retries,
                         fallback_resolver=fallback_resolver,
                     ),
-                    timeout=max(timeout * max(1, retries + 1) + 2.0, timeout + 2.0),
+                    timeout=max(timeout + 2.0, 5.0),
                     max_retries=0,
                 )
                 row["source_workbook"] = source_workbook
@@ -429,8 +430,8 @@ async def _gate_urls_for_hashing_async(
                     "resolved_ips": "",
                     "dns_status": "resolver_error",
                     "decision": "rejected",
-                    "attempts": retries + 1,
-                    "retry_count": retries,
+                    "attempts": 1,
+                    "retry_count": 0,
                     "retry_success": False,
                     "resolver_profile": "default",
                 }
@@ -446,7 +447,7 @@ async def _gate_urls_for_hashing_async(
                             stage_name="dns",
                             stage_status="failed",
                             current_stage="dns",
-                            retry_count=retries,
+                            retry_count=0,
                             timeout_hit=False,
                             worker_id=worker_id,
                             error_type=error["error_type"],
@@ -462,7 +463,7 @@ async def _gate_urls_for_hashing_async(
                             "source_workbook": source_workbook,
                             "normalized_url": normalized_url,
                             "stage_name": "dns",
-                            "attempt_index": retries + 1,
+                            "attempt_index": 1,
                             "worker_id": worker_id,
                             "started_at": stage_started_at,
                             "finished_at": utc_now_iso(),
@@ -470,7 +471,7 @@ async def _gate_urls_for_hashing_async(
                             "status": "failed",
                             "error_type": error["error_type"],
                             "error_message": error["error_message"],
-                            "retry_count": retries,
+                            "retry_count": 0,
                             "timeout_flag": 0,
                             "fallback_taken": "",
                         }

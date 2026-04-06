@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import random
-import sqlite3
+import shutil
 import threading
 import time
 import traceback
@@ -66,6 +66,45 @@ STAGE_EVENT_COLUMNS = (
     "timeout_flag",
     "fallback_taken",
 )
+
+RUN_MANIFEST_COLUMNS = (
+    "run_id",
+    "status",
+    "started_at",
+    "updated_at",
+    "completed_at",
+    "fatal_stage",
+    "fatal_error_type",
+    "fatal_error_message",
+    "metadata_json",
+    "checkpoint_dir",
+    "url_result_events_csv",
+    "stage_events_csv",
+)
+
+WORKER_HEARTBEAT_COLUMNS = (
+    "stage_name",
+    "worker_id",
+    "record_key",
+    "state",
+    "last_seen_at",
+    "details_json",
+)
+
+RUN_RESULT_INT_FIELDS = {
+    "retry_count",
+    "timeout_hit",
+    "skipped_due_to_previous_failure",
+    "duration_ms",
+    "processing_time_ms",
+}
+
+STAGE_EVENT_INT_FIELDS = {
+    "attempt_index",
+    "duration_ms",
+    "retry_count",
+    "timeout_flag",
+}
 
 TERMINAL_PIPELINE_STATUSES = {
     "completed",
@@ -197,14 +236,21 @@ def default_run_result(
 class RunContext:
     run_id: str
     output_dir: str
-    checkpoint_db_path: str
+    checkpoint_dir: str
     run_results_csv: str
     stage_events_csv: str
-    run_manifest_json: str
+    run_manifest_csv: str
+    checkpoint_run_manifest_csv: str
+    url_result_events_csv: str
+    checkpoint_stage_events_csv: str
+    worker_heartbeats_csv: str
     stall_threshold_seconds: int = 180
     watchdog_warning_seconds: int = 60
-    export_flush_interval_seconds: int = 5
-    export_flush_row_interval: int = 50
+    append_flush_interval_seconds: int = 2
+    append_flush_row_interval: int = 1000
+    snapshot_flush_interval_seconds: int = 30
+    snapshot_flush_row_interval: int = 5000
+    stage0_progress_log_interval_seconds: int = 10
     stage1_failure_policy: str = "route_to_dns"
     max_worker_restarts: int = 2
     started_at: str = field(default_factory=utc_now_iso)
@@ -218,8 +264,11 @@ def build_run_context(
     run_id: str | None = None,
     stall_threshold_seconds: int = 180,
     watchdog_warning_seconds: int = 60,
-    export_flush_interval_seconds: int = 5,
-    export_flush_row_interval: int = 50,
+    append_flush_interval_seconds: int = 2,
+    append_flush_row_interval: int = 1000,
+    snapshot_flush_interval_seconds: int = 30,
+    snapshot_flush_row_interval: int = 5000,
+    stage0_progress_log_interval_seconds: int = 10,
     stage1_failure_policy: str = "route_to_dns",
     max_worker_restarts: int = 2,
     metadata: dict[str, Any] | None = None,
@@ -231,14 +280,21 @@ def build_run_context(
     return RunContext(
         run_id=resolved_run_id,
         output_dir=output_dir,
-        checkpoint_db_path=os.path.join(checkpoint_dir, "pipeline_state.sqlite3"),
+        checkpoint_dir=checkpoint_dir,
         run_results_csv=os.path.join(output_dir, "pipeline_run_results.csv"),
         stage_events_csv=os.path.join(output_dir, "pipeline_stage_events.csv"),
-        run_manifest_json=os.path.join(output_dir, "run_manifest.json"),
+        run_manifest_csv=os.path.join(output_dir, "run_manifest.csv"),
+        checkpoint_run_manifest_csv=os.path.join(checkpoint_dir, "run_manifest.csv"),
+        url_result_events_csv=os.path.join(checkpoint_dir, "url_result_events.csv"),
+        checkpoint_stage_events_csv=os.path.join(checkpoint_dir, "stage_events.csv"),
+        worker_heartbeats_csv=os.path.join(checkpoint_dir, "worker_heartbeats.csv"),
         stall_threshold_seconds=max(30, int(stall_threshold_seconds)),
         watchdog_warning_seconds=max(15, int(watchdog_warning_seconds)),
-        export_flush_interval_seconds=max(1, int(export_flush_interval_seconds)),
-        export_flush_row_interval=max(1, int(export_flush_row_interval)),
+        append_flush_interval_seconds=max(1, int(append_flush_interval_seconds)),
+        append_flush_row_interval=max(1, int(append_flush_row_interval)),
+        snapshot_flush_interval_seconds=max(1, int(snapshot_flush_interval_seconds)),
+        snapshot_flush_row_interval=max(1, int(snapshot_flush_row_interval)),
+        stage0_progress_log_interval_seconds=max(1, int(stage0_progress_log_interval_seconds)),
         stage1_failure_policy=str(stage1_failure_policy or "route_to_dns"),
         max_worker_restarts=max(0, int(max_worker_restarts)),
         metadata=dict(metadata or {}),
@@ -256,205 +312,160 @@ def _write_csv_atomic(path: str, fieldnames: tuple[str, ...] | list[str], rows: 
     os.replace(temp_path, path)
 
 
+def _append_csv_rows(path: str, fieldnames: tuple[str, ...] | list[str], rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    file_exists = os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(fieldnames), extrasaction="ignore")
+        if not file_exists:
+            writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in fieldnames})
+        fh.flush()
+
+
+def _copy_csv_atomic(src_path: str, dst_path: str, fieldnames: tuple[str, ...] | list[str]) -> None:
+    if not os.path.exists(src_path):
+        _write_csv_atomic(dst_path, fieldnames, [])
+        return
+    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+    temp_path = f"{dst_path}.tmp"
+    with open(src_path, "r", newline="", encoding="utf-8") as src, open(temp_path, "w", newline="", encoding="utf-8") as dst:
+        shutil.copyfileobj(src, dst)
+    os.replace(temp_path, dst_path)
+
+
+def _coerce_int_fields(row: dict[str, Any], fields: set[str]) -> dict[str, Any]:
+    normalized = dict(row)
+    for field in fields:
+        value = normalized.get(field, 0)
+        if value in ("", None):
+            normalized[field] = 0
+            continue
+        try:
+            normalized[field] = int(value)
+        except Exception:
+            normalized[field] = 0
+    return normalized
+
+
+def _parse_json_field(value: Any, fallback: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return fallback
+    try:
+        return json.loads(text)
+    except Exception:
+        return fallback
+
+
 class CheckpointStore:
     def __init__(self, context: RunContext):
         self.context = context
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(self.context.checkpoint_db_path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._conn.execute("PRAGMA temp_store=MEMORY")
-        self._last_export_monotonic = time.monotonic()
-        self._dirty_updates = 0
-        self._initialize()
+        self._url_results: dict[str, dict[str, Any]] = {}
+        self._worker_heartbeats: dict[tuple[str, str], dict[str, Any]] = {}
+        self._manifest: dict[str, Any] = {
+            "run_id": self.context.run_id,
+            "status": "running",
+            "started_at": self.context.started_at,
+            "updated_at": self.context.started_at,
+            "completed_at": "",
+            "fatal_stage": "",
+            "fatal_error_type": "",
+            "fatal_error_message": "",
+            "metadata_json": dict(self.context.metadata),
+            "checkpoint_dir": self.context.checkpoint_dir,
+            "url_result_events_csv": self.context.url_result_events_csv,
+            "stage_events_csv": self.context.checkpoint_stage_events_csv,
+        }
+        self._pending_result_events: list[dict[str, Any]] = []
+        self._pending_stage_events: list[dict[str, Any]] = []
+        self._pending_event_count = 0
+        self._append_dirty = False
+        self._snapshot_dirty = False
+        self._dirty_snapshot_updates = 0
+        self._heartbeat_dirty = False
+        self._last_append_flush_monotonic = time.monotonic()
+        self._last_snapshot_flush_monotonic = time.monotonic()
+        self._load_existing_state()
         self.start_run(status="running", metadata=self.context.metadata)
 
-    def _initialize(self) -> None:
+    def _load_existing_state(self) -> None:
         with self._lock:
-            self._conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS run_manifest (
-                    run_id TEXT PRIMARY KEY,
-                    status TEXT NOT NULL,
-                    started_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    completed_at TEXT,
-                    fatal_stage TEXT,
-                    fatal_error_type TEXT,
-                    fatal_error_message TEXT,
-                    metadata_json TEXT,
-                    checkpoint_db_path TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS url_results (
-                    record_key TEXT PRIMARY KEY,
-                    run_id TEXT NOT NULL,
-                    source_workbook TEXT,
-                    raw_url TEXT,
-                    normalized_url TEXT,
-                    current_stage TEXT,
-                    stage_status TEXT,
-                    stage_error_type TEXT,
-                    stage_error_message TEXT,
-                    retry_count INTEGER,
-                    timeout_hit INTEGER,
-                    skipped_due_to_previous_failure INTEGER,
-                    fallback_taken TEXT,
-                    worker_id TEXT,
-                    stage_started_at TEXT,
-                    stage_finished_at TEXT,
-                    duration_ms INTEGER,
-                    stage0_status TEXT,
-                    stage1_status TEXT,
-                    dns_stage_status TEXT,
-                    hash_stage_status TEXT,
-                    classify_stage_status TEXT,
-                    final_pipeline_status TEXT,
-                    final_decision TEXT,
-                    failure_reason TEXT,
-                    processing_time_ms INTEGER,
-                    submission_record_json TEXT,
-                    last_updated_at TEXT
-                );
-                CREATE TABLE IF NOT EXISTS stage_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    run_id TEXT NOT NULL,
-                    record_key TEXT NOT NULL,
-                    source_workbook TEXT,
-                    normalized_url TEXT,
-                    stage_name TEXT,
-                    attempt_index INTEGER,
-                    worker_id TEXT,
-                    started_at TEXT,
-                    finished_at TEXT,
-                    duration_ms INTEGER,
-                    status TEXT,
-                    error_type TEXT,
-                    error_message TEXT,
-                    retry_count INTEGER,
-                    timeout_flag INTEGER,
-                    fallback_taken TEXT
-                );
-                CREATE TABLE IF NOT EXISTS worker_heartbeat (
-                    stage_name TEXT NOT NULL,
-                    worker_id TEXT NOT NULL,
-                    record_key TEXT,
-                    state TEXT,
-                    last_seen_at TEXT,
-                    details_json TEXT,
-                    PRIMARY KEY(stage_name, worker_id)
-                );
-                CREATE TABLE IF NOT EXISTS run_counters (
-                    run_id TEXT NOT NULL,
-                    counter_name TEXT NOT NULL,
-                    counter_value INTEGER NOT NULL,
-                    PRIMARY KEY(run_id, counter_name)
-                );
-                """
-            )
-            self._conn.commit()
+            if os.path.exists(self.context.checkpoint_run_manifest_csv):
+                try:
+                    with open(self.context.checkpoint_run_manifest_csv, newline="", encoding="utf-8") as fh:
+                        rows = list(csv.DictReader(fh))
+                    if rows:
+                        manifest = dict(rows[-1])
+                        manifest["metadata_json"] = _parse_json_field(manifest.get("metadata_json"), {})
+                        self._manifest.update(manifest)
+                except Exception:
+                    logger.exception("Failed to load existing checkpoint manifest CSV")
+
+            if os.path.exists(self.context.url_result_events_csv):
+                try:
+                    with open(self.context.url_result_events_csv, newline="", encoding="utf-8") as fh:
+                        for row in csv.DictReader(fh):
+                            normalized = _coerce_int_fields(row, RUN_RESULT_INT_FIELDS)
+                            record_key = str(normalized.get("record_key", "") or "")
+                            if record_key:
+                                self._url_results[record_key] = normalized
+                except Exception:
+                    logger.exception("Failed to load checkpoint URL result events CSV")
+
+            if os.path.exists(self.context.worker_heartbeats_csv):
+                try:
+                    with open(self.context.worker_heartbeats_csv, newline="", encoding="utf-8") as fh:
+                        for row in csv.DictReader(fh):
+                            item = dict(row)
+                            item["details_json"] = _parse_json_field(item.get("details_json"), {})
+                            key = (str(item.get("stage_name", "")), str(item.get("worker_id", "")))
+                            if key[0] and key[1]:
+                                self._worker_heartbeats[key] = item
+                except Exception:
+                    logger.exception("Failed to load checkpoint worker heartbeat CSV")
 
     def start_run(self, *, status: str = "running", metadata: dict[str, Any] | None = None) -> None:
         now = utc_now_iso()
-        payload = json.dumps(metadata or self.context.metadata or {}, ensure_ascii=True, sort_keys=True)
         with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO run_manifest (
-                    run_id, status, started_at, updated_at, completed_at,
-                    fatal_stage, fatal_error_type, fatal_error_message,
-                    metadata_json, checkpoint_db_path
-                ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)
-                ON CONFLICT(run_id) DO UPDATE SET
-                    status=excluded.status,
-                    updated_at=excluded.updated_at,
-                    metadata_json=excluded.metadata_json,
-                    checkpoint_db_path=excluded.checkpoint_db_path
-                """,
-                (
-                    self.context.run_id,
-                    status,
-                    self.context.started_at,
-                    now,
-                    payload,
-                    self.context.checkpoint_db_path,
-                ),
+            self._manifest.update(
+                {
+                    "run_id": self.context.run_id,
+                    "status": status,
+                    "started_at": self._manifest.get("started_at") or self.context.started_at,
+                    "updated_at": now,
+                    "metadata_json": dict(metadata or self.context.metadata or {}),
+                    "checkpoint_dir": self.context.checkpoint_dir,
+                    "url_result_events_csv": self.context.url_result_events_csv,
+                    "stage_events_csv": self.context.checkpoint_stage_events_csv,
+                }
             )
-            self._conn.commit()
-        self._export_manifest()
+        self._write_manifest_files()
 
     def get_manifest(self) -> dict[str, Any]:
         with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM run_manifest WHERE run_id = ?",
-                (self.context.run_id,),
-            ).fetchone()
-        if row is None:
-            return {
-                "run_id": self.context.run_id,
-                "status": "unknown",
-                "started_at": self.context.started_at,
-                "updated_at": self.context.started_at,
-                "completed_at": None,
-                "fatal_stage": None,
-                "fatal_error_type": None,
-                "fatal_error_message": None,
-                "metadata_json": self.context.metadata,
-                "checkpoint_db_path": self.context.checkpoint_db_path,
-            }
-        data = dict(row)
-        metadata = data.get("metadata_json")
-        if isinstance(metadata, str):
-            try:
-                data["metadata_json"] = json.loads(metadata)
-            except Exception:
-                pass
-        return data
+            manifest = dict(self._manifest)
+        manifest["metadata_json"] = _parse_json_field(manifest.get("metadata_json"), {})
+        return manifest
 
     def update_manifest(self, **patch: Any) -> None:
         now = utc_now_iso()
-        current = self.get_manifest()
-        merged = dict(current)
-        merged.update({key: value for key, value in patch.items() if value is not None})
-        merged.setdefault("run_id", self.context.run_id)
-        merged.setdefault("started_at", self.context.started_at)
-        merged["updated_at"] = now
-        metadata_json = merged.get("metadata_json", self.context.metadata)
-        if not isinstance(metadata_json, str):
-            metadata_json = json.dumps(metadata_json or {}, ensure_ascii=True, sort_keys=True)
         with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO run_manifest (
-                    run_id, status, started_at, updated_at, completed_at,
-                    fatal_stage, fatal_error_type, fatal_error_message,
-                    metadata_json, checkpoint_db_path
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(run_id) DO UPDATE SET
-                    status=excluded.status,
-                    updated_at=excluded.updated_at,
-                    completed_at=excluded.completed_at,
-                    fatal_stage=excluded.fatal_stage,
-                    fatal_error_type=excluded.fatal_error_type,
-                    fatal_error_message=excluded.fatal_error_message,
-                    metadata_json=excluded.metadata_json,
-                    checkpoint_db_path=excluded.checkpoint_db_path
-                """,
-                (
-                    merged.get("run_id", self.context.run_id),
-                    merged.get("status", "running"),
-                    merged.get("started_at", self.context.started_at),
-                    merged.get("updated_at", now),
-                    merged.get("completed_at"),
-                    merged.get("fatal_stage"),
-                    merged.get("fatal_error_type"),
-                    merged.get("fatal_error_message"),
-                    metadata_json,
-                    merged.get("checkpoint_db_path", self.context.checkpoint_db_path),
-                ),
-            )
-            self._conn.commit()
-        self._export_manifest()
+            merged = dict(self._manifest)
+            for key, value in patch.items():
+                if value is not None:
+                    merged[key] = value
+            merged["updated_at"] = now
+            if not isinstance(merged.get("metadata_json"), (dict, list)):
+                merged["metadata_json"] = _parse_json_field(merged.get("metadata_json"), {})
+            self._manifest = merged
+        self._write_manifest_files()
 
     def mark_completed(self) -> None:
         self.update_manifest(status="completed", completed_at=utc_now_iso())
@@ -469,59 +480,57 @@ class CheckpointStore:
             fatal_error_message=error["error_message"],
         )
 
+    def _write_manifest_files(self) -> None:
+        manifest = self.get_manifest()
+        manifest_row = {
+            "run_id": manifest.get("run_id", self.context.run_id),
+            "status": manifest.get("status", "running"),
+            "started_at": manifest.get("started_at", self.context.started_at),
+            "updated_at": manifest.get("updated_at", utc_now_iso()),
+            "completed_at": manifest.get("completed_at", ""),
+            "fatal_stage": manifest.get("fatal_stage", ""),
+            "fatal_error_type": manifest.get("fatal_error_type", ""),
+            "fatal_error_message": manifest.get("fatal_error_message", ""),
+            "metadata_json": json.dumps(manifest.get("metadata_json") or {}, ensure_ascii=True, sort_keys=True),
+            "checkpoint_dir": manifest.get("checkpoint_dir", self.context.checkpoint_dir),
+            "url_result_events_csv": manifest.get("url_result_events_csv", self.context.url_result_events_csv),
+            "stage_events_csv": manifest.get("stage_events_csv", self.context.checkpoint_stage_events_csv),
+        }
+        _write_csv_atomic(self.context.checkpoint_run_manifest_csv, RUN_MANIFEST_COLUMNS, [manifest_row])
+        _write_csv_atomic(self.context.run_manifest_csv, RUN_MANIFEST_COLUMNS, [manifest_row])
+
     def get_url_result(self, record_key: str) -> dict[str, Any] | None:
         with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM url_results WHERE record_key = ?",
-                (record_key,),
-            ).fetchone()
-        return dict(row) if row is not None else None
+            row = self._url_results.get(str(record_key or ""))
+            return dict(row) if row is not None else None
 
     def upsert_url_result(self, patch: dict[str, Any]) -> dict[str, Any]:
         record_key = str(patch.get("record_key", "") or "")
         if not record_key:
             raise ValueError("record_key is required for url result upsert")
         with self._lock:
-            existing = self.get_url_result(record_key) or {}
+            existing = self._url_results.get(record_key)
+            if existing is None:
+                existing = default_run_result(
+                    run_id=self.context.run_id,
+                    raw_url=str(patch.get("raw_url", "") or ""),
+                    normalized_url=str(patch.get("normalized_url", "") or ""),
+                    source_workbook=str(patch.get("source_workbook", "") or ""),
+                )
             merged = dict(existing)
             merged.update({key: value for key, value in patch.items() if value is not None})
             merged.setdefault("run_id", self.context.run_id)
             merged.setdefault("record_key", record_key)
-            merged.setdefault("source_workbook", "")
-            merged.setdefault("raw_url", "")
-            merged.setdefault("normalized_url", "")
-            merged.setdefault("current_stage", "")
-            merged.setdefault("stage_status", "")
-            merged.setdefault("stage_error_type", "")
-            merged.setdefault("stage_error_message", "")
-            merged.setdefault("retry_count", 0)
-            merged.setdefault("timeout_hit", 0)
-            merged.setdefault("skipped_due_to_previous_failure", 0)
-            merged.setdefault("fallback_taken", "")
-            merged.setdefault("worker_id", "")
-            merged.setdefault("stage_started_at", "")
-            merged.setdefault("stage_finished_at", "")
-            merged.setdefault("duration_ms", 0)
-            merged.setdefault("stage0_status", "pending")
-            merged.setdefault("stage1_status", "pending")
-            merged.setdefault("dns_stage_status", "pending")
-            merged.setdefault("hash_stage_status", "pending")
-            merged.setdefault("classify_stage_status", "pending")
-            merged.setdefault("final_pipeline_status", "pending")
-            merged.setdefault("final_decision", "")
-            merged.setdefault("failure_reason", "")
-            merged.setdefault("processing_time_ms", 0)
-            merged.setdefault("submission_record_json", "")
             merged["last_updated_at"] = utc_now_iso()
-            placeholders = ", ".join("?" for _ in RUN_RESULT_COLUMNS)
-            self._conn.execute(
-                f"INSERT OR REPLACE INTO url_results ({', '.join(RUN_RESULT_COLUMNS)}) VALUES ({placeholders})",
-                [merged.get(column) for column in RUN_RESULT_COLUMNS],
-            )
-            self._conn.commit()
-            self._dirty_updates += 1
+            merged = _coerce_int_fields(merged, RUN_RESULT_INT_FIELDS)
+            self._url_results[record_key] = merged
+            self._pending_result_events.append(dict(merged))
+            self._pending_event_count += 1
+            self._append_dirty = True
+            self._snapshot_dirty = True
+            self._dirty_snapshot_updates += 1
         self.maybe_export()
-        return merged
+        return dict(merged)
 
     def ensure_url_result(
         self,
@@ -530,6 +539,10 @@ class CheckpointStore:
         normalized_url: str,
         source_workbook: str,
     ) -> dict[str, Any]:
+        record_key = make_record_key(normalized_url, source_workbook)
+        existing = self.get_url_result(record_key)
+        if existing is not None:
+            return existing
         return self.upsert_url_result(
             default_run_result(
                 run_id=self.context.run_id,
@@ -540,13 +553,12 @@ class CheckpointStore:
         )
 
     def append_stage_event(self, event: dict[str, Any]) -> None:
+        normalized = _coerce_int_fields(dict(event), STAGE_EVENT_INT_FIELDS)
         with self._lock:
-            self._conn.execute(
-                f"INSERT INTO stage_events ({', '.join(STAGE_EVENT_COLUMNS)}) VALUES ({', '.join('?' for _ in STAGE_EVENT_COLUMNS)})",
-                [event.get(column) for column in STAGE_EVENT_COLUMNS],
-            )
-            self._conn.commit()
-            self._dirty_updates += 1
+            self._pending_stage_events.append(normalized)
+            self._pending_event_count += 1
+            self._append_dirty = True
+            self._dirty_snapshot_updates += 1
         self.maybe_export()
 
     def update_worker_heartbeat(
@@ -559,130 +571,129 @@ class CheckpointStore:
         details: dict[str, Any] | None = None,
     ) -> None:
         with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO worker_heartbeat (stage_name, worker_id, record_key, state, last_seen_at, details_json)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(stage_name, worker_id) DO UPDATE SET
-                    record_key=excluded.record_key,
-                    state=excluded.state,
-                    last_seen_at=excluded.last_seen_at,
-                    details_json=excluded.details_json
-                """,
-                (
-                    stage_name,
-                    worker_id,
-                    record_key,
-                    state,
-                    utc_now_iso(),
-                    json.dumps(details or {}, ensure_ascii=True, sort_keys=True),
-                ),
-            )
-            self._conn.commit()
+            self._worker_heartbeats[(stage_name, worker_id)] = {
+                "stage_name": stage_name,
+                "worker_id": worker_id,
+                "record_key": record_key,
+                "state": state,
+                "last_seen_at": utc_now_iso(),
+                "details_json": dict(details or {}),
+            }
+            self._heartbeat_dirty = True
+        self.maybe_export()
 
     def clear_worker_heartbeat(self, *, stage_name: str, worker_id: str) -> None:
         with self._lock:
-            self._conn.execute(
-                "DELETE FROM worker_heartbeat WHERE stage_name = ? AND worker_id = ?",
-                (stage_name, worker_id),
-            )
-            self._conn.commit()
+            self._worker_heartbeats.pop((stage_name, worker_id), None)
+            self._heartbeat_dirty = True
+        self.maybe_export()
 
     def list_worker_heartbeats(self, *, stage_name: str | None = None) -> list[dict[str, Any]]:
         with self._lock:
-            if stage_name:
-                rows = self._conn.execute(
-                    "SELECT * FROM worker_heartbeat WHERE stage_name = ? ORDER BY worker_id",
-                    (stage_name,),
-                ).fetchall()
-            else:
-                rows = self._conn.execute(
-                    "SELECT * FROM worker_heartbeat ORDER BY stage_name, worker_id"
-                ).fetchall()
-        output = []
-        for row in rows:
-            item = dict(row)
-            details = item.get("details_json")
-            if isinstance(details, str):
-                try:
-                    item["details_json"] = json.loads(details)
-                except Exception:
-                    pass
-            output.append(item)
-        return output
+            items = []
+            for (heartbeat_stage, _), value in sorted(self._worker_heartbeats.items()):
+                if stage_name and heartbeat_stage != stage_name:
+                    continue
+                item = dict(value)
+                item["details_json"] = dict(item.get("details_json") or {})
+                items.append(item)
+        return items
 
     def get_completed_record_keys(self) -> set[str]:
         with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT record_key
-                FROM url_results
-                WHERE final_pipeline_status IN ({})
-                """.format(", ".join("?" for _ in TERMINAL_PIPELINE_STATUSES)),
-                tuple(sorted(TERMINAL_PIPELINE_STATUSES)),
-            ).fetchall()
-        return {str(row[0]) for row in rows}
+            return {
+                record_key
+                for record_key, row in self._url_results.items()
+                if str(row.get("final_pipeline_status", "") or "") in TERMINAL_PIPELINE_STATUSES
+            }
 
     def get_terminal_submission_records(self) -> list[dict[str, Any]]:
+        output: list[dict[str, Any]] = []
         with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT submission_record_json
-                FROM url_results
-                WHERE submission_record_json IS NOT NULL
-                  AND submission_record_json != ''
-                ORDER BY normalized_url, source_workbook
-                """
-            ).fetchall()
-        output = []
+            rows = list(self._url_results.values())
         for row in rows:
+            payload = str(row.get("submission_record_json", "") or "").strip()
+            if not payload:
+                continue
             try:
-                output.append(json.loads(str(row[0])))
+                output.append(json.loads(payload))
             except Exception:
                 continue
+        output.sort(key=lambda item: (str(item.get("Identified Phishing/Suspected Domain Name", "")), str(item.get("Corresponding CSE Domain Name", ""))))
         return output
 
+    def flush_appends(self, *, force: bool = False) -> None:
+        with self._lock:
+            now = time.monotonic()
+            if not force:
+                due_by_rows = self._pending_event_count >= self.context.append_flush_row_interval
+                due_by_time = (now - self._last_append_flush_monotonic) >= self.context.append_flush_interval_seconds
+                if not self._append_dirty and not self._heartbeat_dirty:
+                    return
+                if not due_by_rows and not due_by_time:
+                    return
+
+            result_rows = list(self._pending_result_events)
+            stage_rows = list(self._pending_stage_events)
+            heartbeat_rows = [
+                {
+                    **value,
+                    "details_json": json.dumps(value.get("details_json") or {}, ensure_ascii=True, sort_keys=True),
+                }
+                for _, value in sorted(self._worker_heartbeats.items())
+            ]
+            self._pending_result_events.clear()
+            self._pending_stage_events.clear()
+            self._pending_event_count = 0
+            self._append_dirty = False
+            heartbeat_dirty = self._heartbeat_dirty
+            self._heartbeat_dirty = False
+            self._last_append_flush_monotonic = now
+
+        if result_rows:
+            _append_csv_rows(self.context.url_result_events_csv, RUN_RESULT_COLUMNS, result_rows)
+        if stage_rows:
+            _append_csv_rows(self.context.checkpoint_stage_events_csv, STAGE_EVENT_COLUMNS, stage_rows)
+        if heartbeat_dirty or force:
+            _write_csv_atomic(self.context.worker_heartbeats_csv, WORKER_HEARTBEAT_COLUMNS, heartbeat_rows)
+
     def maybe_export(self, *, force: bool = False) -> None:
+        self.flush_appends(force=force)
         now = time.monotonic()
         if not force:
-            if self._dirty_updates < self.context.export_flush_row_interval and (
-                now - self._last_export_monotonic
-            ) < self.context.export_flush_interval_seconds:
-                return
+            with self._lock:
+                due_by_rows = self._snapshot_dirty and self._dirty_snapshot_updates >= self.context.snapshot_flush_row_interval
+                due_by_time = self._snapshot_dirty and (
+                    (now - self._last_snapshot_flush_monotonic) >= self.context.snapshot_flush_interval_seconds
+                )
+                if not due_by_rows and not due_by_time:
+                    return
         self.export_all()
 
     def export_all(self) -> None:
+        self.flush_appends(force=True)
         with self._lock:
-            result_rows = self._conn.execute(
-                "SELECT * FROM url_results ORDER BY normalized_url, source_workbook, record_key"
-            ).fetchall()
-            event_rows = self._conn.execute(
-                "SELECT * FROM stage_events ORDER BY id"
-            ).fetchall()
-        _write_csv_atomic(
-            self.context.run_results_csv,
-            RUN_RESULT_COLUMNS,
-            [dict(row) for row in result_rows],
-        )
-        _write_csv_atomic(
-            self.context.stage_events_csv,
-            STAGE_EVENT_COLUMNS,
-            [dict(row) for row in event_rows],
-        )
-        self._export_manifest()
-        self._last_export_monotonic = time.monotonic()
-        self._dirty_updates = 0
+            result_rows = [
+                dict(row)
+                for _, row in sorted(
+                    self._url_results.items(),
+                    key=lambda item: (
+                        str(item[1].get("normalized_url", "")),
+                        str(item[1].get("source_workbook", "")),
+                        item[0],
+                    ),
+                )
+            ]
+            self._snapshot_dirty = False
+            self._dirty_snapshot_updates = 0
+            self._last_snapshot_flush_monotonic = time.monotonic()
 
-    def _export_manifest(self) -> None:
-        manifest = self.get_manifest()
-        with open(self.context.run_manifest_json, "w", encoding="utf-8") as fh:
-            json.dump(manifest, fh, indent=2, ensure_ascii=True, sort_keys=True)
+        _write_csv_atomic(self.context.run_results_csv, RUN_RESULT_COLUMNS, result_rows)
+        _copy_csv_atomic(self.context.checkpoint_stage_events_csv, self.context.stage_events_csv, STAGE_EVENT_COLUMNS)
+        self._write_manifest_files()
 
     def close(self) -> None:
         self.export_all()
-        with self._lock:
-            self._conn.commit()
-            self._conn.close()
 
 
 def stage_result_patch(
