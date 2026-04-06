@@ -124,11 +124,11 @@ async def _lookup_rdap_uncached(
                     await asyncio.sleep(delay_s)
                     continue
                 _record_metric("retry_exhausted")
-                logger.error("RDAP lookup exception for %s: %s", domain, message)
+                logger.debug("RDAP lookup exception for %s: %s", domain, message)
                 return result, "failure_cooldown"
             except Exception as exc:
                 _record_metric("exception")
-                logger.error("RDAP lookup exception for %s: %s", domain, _format_exception_message(exc))
+                logger.debug("RDAP lookup exception for %s: %s", domain, _format_exception_message(exc))
                 return result, "none"
 
             if response.status_code == 200:
@@ -136,7 +136,7 @@ async def _lookup_rdap_uncached(
                     data = response.json()
                 except Exception as exc:
                     _record_metric("exception")
-                    logger.error("RDAP lookup exception for %s: %s", domain, _format_exception_message(exc))
+                    logger.debug("RDAP lookup exception for %s: %s", domain, _format_exception_message(exc))
                     return result, "none"
                 result["raw_rdap"] = data
                 result.update(_parse_rdap_response(data))
@@ -163,7 +163,7 @@ async def _lookup_rdap_uncached(
                     await asyncio.sleep(delay_s)
                     continue
                 _record_metric("retry_exhausted")
-                logger.warning(
+                logger.debug(
                     "RDAP 429 Rate Limit for %s; entering %.0fs cooldown.",
                     domain,
                     RDAP_FAILURE_COOLDOWN_S,

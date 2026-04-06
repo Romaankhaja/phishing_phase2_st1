@@ -174,7 +174,7 @@ class RdapUtilsTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch("phishing_pipeline.rdap_utils.random.uniform", return_value=0.0), mock.patch(
             "phishing_pipeline.rdap_utils.asyncio.sleep",
             new=mock.AsyncMock(),
-        ), self.assertLogs("phishing_pipeline.rdap_utils", level="ERROR") as logs:
+        ), self.assertLogs("phishing_pipeline.rdap_utils", level="DEBUG") as logs:
             await rdap_utils.lookup_rdap("silent.example", client=client, timeout=1.0)
 
         self.assertEqual(client.calls, 1)
@@ -205,7 +205,7 @@ class RdapUtilsTests(unittest.IsolatedAsyncioTestCase):
     async def test_lookup_rdap_does_not_retry_non_transport_exception(self):
         client = _FakeClient([ValueError("boom")])
 
-        with self.assertLogs("phishing_pipeline.rdap_utils", level="ERROR") as logs:
+        with self.assertLogs("phishing_pipeline.rdap_utils", level="DEBUG") as logs:
             result = await rdap_utils.lookup_rdap("boom.example", client=client, timeout=1.0)
 
         self.assertEqual(client.calls, 1)
