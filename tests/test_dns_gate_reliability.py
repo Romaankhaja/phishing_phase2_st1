@@ -16,6 +16,11 @@ class DnsGateReliabilityTests(unittest.TestCase):
                 "source_workbook": "demo.xlsx",
                 "hostname": "bad.example",
                 "resolved_ips": "",
+                "dns_answer_count": 0,
+                "first_resolved_ip": "",
+                "asn": "",
+                "asn_org": "",
+                "country": "",
                 "dns_status": "no_records",
                 "decision": "rejected",
                 "attempts": 1,
@@ -33,6 +38,8 @@ class DnsGateReliabilityTests(unittest.TestCase):
         self.assertEqual(len(written_rows), 1)
         self.assertEqual(written_rows[0]["dns_status"], "no_records")
         self.assertEqual(written_rows[0]["source_workbook"], "demo.xlsx")
+        self.assertIn("first_resolved_ip", written_rows[0])
+        self.assertIn("asn_org", written_rows[0])
 
 
 if __name__ == "__main__":

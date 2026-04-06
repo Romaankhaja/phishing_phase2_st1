@@ -325,6 +325,29 @@ class Stage1HttpRoutingTests(unittest.TestCase):
         self.assertEqual(holdout_row["fetch_status"], "dns_rejected")
         self.assertTrue(holdout_row["stage1_passthrough"])
 
+    def test_dns_rejected_without_stage1_analysis_still_marks_dns_gate_first(self):
+        input_url = "https://dns-blocked.example"
+        normalized_url = comparison.normalize_url(input_url)
+
+        stage1_rows = comparison._build_stage1_debug_rows(
+            input_urls=[input_url],
+            audit_rows=[
+                {
+                    "target_url": input_url,
+                    "dns_status": "no_records",
+                    "decision": "rejected",
+                }
+            ],
+            decision_rows=[],
+            prefetch_metrics_map={normalized_url: _prefetch_metrics()},
+            stage1_analysis_map={},
+        )
+
+        self.assertEqual(stage1_rows[0]["dns_status"], "no_records")
+        self.assertEqual(stage1_rows[0]["dns_decision"], "rejected")
+        self.assertEqual(stage1_rows[0]["exclusion_stage"], "dns_gate")
+        self.assertEqual(stage1_rows[0]["reason"], "dns_rejected")
+
 
 if __name__ == "__main__":
     unittest.main()

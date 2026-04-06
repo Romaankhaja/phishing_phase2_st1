@@ -5,7 +5,9 @@ import re
 import ssl
 import tldextract
 import httpx
+from concurrent.futures import ProcessPoolExecutor
 from collections import Counter
+from functools import partial
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from PIL import Image
@@ -29,7 +31,11 @@ import warnings as _warnings
 import unicodedata
 import psutil
 from contextlib import suppress
-from .config import STAGE1_HTTP_CONFIG, resolve_stage1_http_config
+try:
+    import resource as _resource
+except Exception:
+    _resource = None
+from .config import HASH_STAGE_CONFIG, STAGE1_HTTP_CONFIG, resolve_hash_stage_config, resolve_stage1_http_config
 from .similarity_hashing import (
     SIMHASH_BITS,
     best_similarity_against_set,
@@ -38,9 +44,15 @@ from .similarity_hashing import (
     compute_ssl_simhash,
 )
 from .stage1_http_analyzer import (
+    _default_stage1_result,
     analyze_stage1_url,
     build_stage1_concurrency_controls,
+    enrich_stage1_result,
+    fetch_stage1_http_artifacts,
     get_stage1_entity_context,
+    parse_stage1_html_payload,
+    score_stage1_http_signals,
+    should_enrich_stage1_result,
 )
 from .reliability import (
     CheckpointStore,
@@ -121,6 +133,32 @@ def _read_env_bool(name: str, default: bool) -> bool:
     return default
 
 
+def _read_env_int_alias(names: tuple[str, ...], default: int, minimum: int = 1) -> int:
+    for name in names:
+        raw = os.getenv(name)
+        if raw in (None, ""):
+            continue
+        try:
+            return max(minimum, int(raw))
+        except ValueError:
+            _clip_logger.warning("Invalid integer override for %s=%r; using %d", name, raw, default)
+            return default
+    return default
+
+
+def _read_env_float_alias(names: tuple[str, ...], default: float, minimum: float = 0.0) -> float:
+    for name in names:
+        raw = os.getenv(name)
+        if raw in (None, ""):
+            continue
+        try:
+            return max(minimum, float(raw))
+        except ValueError:
+            _clip_logger.warning("Invalid float override for %s=%r; using %.3f", name, raw, default)
+            return default
+    return default
+
+
 def _probe_runtime_resources() -> tuple[int, float, float]:
     cpu_count = _mp.cpu_count() or 4
     ram_gb = psutil.virtual_memory().total / (1024 ** 3)
@@ -137,40 +175,91 @@ _CPU_COUNT, _RAM_GB, _VRAM_GB = _probe_runtime_resources()
 _SERVER_CLASS = _CPU_COUNT >= 32 and _RAM_GB >= 96
 _H100_SERVER_PROFILE = _SERVER_CLASS and _VRAM_GB >= 40
 
-_default_max_pages = 24
-_default_page_concurrency = 4
+_hash_stage_defaults = resolve_hash_stage_config(HASH_STAGE_CONFIG)
 
-MAX_CONCURRENT_PAGES = _read_env_int("PHISHING_HASH_PAGES", _default_max_pages)
-SCRAPER_PAGE_CONCURRENCY = min(
-    MAX_CONCURRENT_PAGES,
-    _read_env_int("PHISHING_HASH_PAGE_CONCURRENCY", _default_page_concurrency),
+_default_pages_per_node = int(_hash_stage_defaults.get("hash_pages_per_node", 4) or 4)
+_default_nodes_start = int(_hash_stage_defaults.get("hash_worker_nodes_start", 4) or 4)
+_default_nodes_max = int(_hash_stage_defaults.get("hash_worker_nodes_max", _default_nodes_start) or _default_nodes_start)
+_default_active_pages_start = int(_hash_stage_defaults.get("hash_active_pages_start", 24) or 24)
+_default_active_pages_max = int(_hash_stage_defaults.get("hash_active_pages_max", _default_active_pages_start) or _default_active_pages_start)
+
+HASH_PAGES_PER_NODE = _read_env_int_alias(
+    ("PHISHING_HASH_PAGES_PER_NODE", "PHISHING_HASH_PAGE_CONCURRENCY"),
+    _default_pages_per_node,
 )
-BROWSER_SHARDS = max(1, math.ceil(MAX_CONCURRENT_PAGES / SCRAPER_PAGE_CONCURRENCY))
+HASH_WORKER_NODES_START = _read_env_int("PHISHING_HASH_WORKER_NODES_START", _default_nodes_start)
+HASH_WORKER_NODES_MAX = max(
+    HASH_WORKER_NODES_START,
+    _read_env_int("PHISHING_HASH_WORKER_NODES_MAX", _default_nodes_max),
+)
+HASH_ACTIVE_PAGES_START = _read_env_int_alias(
+    ("PHISHING_HASH_ACTIVE_PAGES_START", "PHISHING_HASH_PAGES"),
+    _default_active_pages_start,
+)
+HASH_ACTIVE_PAGES_MAX = max(
+    HASH_ACTIVE_PAGES_START,
+    _read_env_int("PHISHING_HASH_ACTIVE_PAGES_MAX", _default_active_pages_max),
+)
+if HASH_WORKER_NODES_MAX * HASH_PAGES_PER_NODE < HASH_ACTIVE_PAGES_MAX:
+    HASH_WORKER_NODES_MAX = max(1, math.ceil(HASH_ACTIVE_PAGES_MAX / HASH_PAGES_PER_NODE))
+HASH_RENDER_WORKER_COUNT = max(HASH_ACTIVE_PAGES_MAX, HASH_WORKER_NODES_MAX * HASH_PAGES_PER_NODE)
 _default_nav_timeout_ms = 15000
 _default_screenshot_timeout_ms = 6000
 _default_fetch_timeout_s = 20.0
 SCRAPER_NAV_TIMEOUT_MS = _read_env_int("PHISHING_HASH_NAV_TIMEOUT_MS", _default_nav_timeout_ms)
 SCRAPER_SCREENSHOT_TIMEOUT_MS = _read_env_int("PHISHING_HASH_SCREENSHOT_TIMEOUT_MS", _default_screenshot_timeout_ms)
 SCRAPER_FETCH_TIMEOUT_S = _read_env_float("PHISHING_HASH_FETCH_TIMEOUT_S", _default_fetch_timeout_s, minimum=1.0)
+HASH_RESULT_QUEUE_MAX = _read_env_int(
+    "PHISHING_HASH_RESULT_QUEUE_MAX",
+    int(_hash_stage_defaults.get("hash_result_queue_max", HASH_RENDER_WORKER_COUNT * 4) or (HASH_RENDER_WORKER_COUNT * 4)),
+)
 GPU_QUEUE_MAXSIZE = _read_env_int(
     "PHISHING_GPU_QUEUE_MAXSIZE",
-    BROWSER_SHARDS * SCRAPER_PAGE_CONCURRENCY * (4 if _SERVER_CLASS else 2),
+    HASH_RESULT_QUEUE_MAX,
 )
 GPU_MAX_WAIT_MS = _read_env_int("PHISHING_GPU_MAX_WAIT_MS", 120 if _H100_SERVER_PROFILE else (40 if _SERVER_CLASS else 50))
-_default_http_limit = 96
-_AIOHTTP_CONNECTOR_LIMIT = _read_env_int("PHISHING_HASH_HTTP_LIMIT", _default_http_limit)
+_default_http_limit = int(_hash_stage_defaults.get("hash_aux_http_limit", 96) or 96)
+HASH_AUX_HTTP_LIMIT = _read_env_int_alias(("PHISHING_HASH_AUX_HTTP_LIMIT", "PHISHING_HASH_HTTP_LIMIT"), _default_http_limit)
 ADAPTIVE_FETCH_DOWNSHIFT_ENABLED = _read_env_bool("PHISHING_HASH_ADAPTIVE_DOWNSHIFT", True)
-ACTIVE_FETCH_LIMIT_INITIAL = MAX_CONCURRENT_PAGES
+ACTIVE_FETCH_LIMIT_INITIAL = HASH_ACTIVE_PAGES_START
+ACTIVE_FETCH_LIMIT_MAX = HASH_ACTIVE_PAGES_MAX
 ACTIVE_FETCH_LIMIT_FLOOR = min(
-    MAX_CONCURRENT_PAGES,
+    ACTIVE_FETCH_LIMIT_INITIAL,
     _read_env_int(
         "PHISHING_HASH_ACTIVE_PAGES_FLOOR",
-        8,
+        max(8, ACTIVE_FETCH_LIMIT_INITIAL // 2),
     ),
 )
-ACTIVE_FETCH_DOWNSHIFT_STEP = 8 if _H100_SERVER_PROFILE else max(1, MAX_CONCURRENT_PAGES // 4)
-_default_aux_net_limit = 48
-AUX_NET_CONCURRENCY_LIMIT = _read_env_int("PHISHING_HASH_AUX_NET_LIMIT", _default_aux_net_limit)
+ACTIVE_FETCH_DOWNSHIFT_STEP = max(1, min(HASH_PAGES_PER_NODE, 8))
+ACTIVE_FETCH_UPSHIFT_STEP = max(1, min(HASH_PAGES_PER_NODE, 8))
+HASH_RAMP_INTERVAL_SECONDS = 15.0
+HASH_RENDER_QUEUE_MAX = _read_env_int(
+    "PHISHING_HASH_RENDER_QUEUE_MAX",
+    int(_hash_stage_defaults.get("hash_render_queue_max", HASH_RENDER_WORKER_COUNT * 128) or (HASH_RENDER_WORKER_COUNT * 128)),
+)
+_default_aux_net_limit = int(_hash_stage_defaults.get("hash_aux_workers", 48) or 48)
+AUX_NET_CONCURRENCY_LIMIT = _read_env_int_alias(("PHISHING_HASH_AUX_WORKERS", "PHISHING_HASH_AUX_NET_LIMIT"), _default_aux_net_limit)
+HASH_AUX_SSL_LIMIT = _read_env_int(
+    "PHISHING_HASH_AUX_SSL_LIMIT",
+    int(_hash_stage_defaults.get("hash_aux_ssl_limit", 64) or 64),
+)
+HASH_PER_HOST_LIMIT = _read_env_int(
+    "PHISHING_HASH_PER_HOST_LIMIT",
+    int(_hash_stage_defaults.get("hash_per_host_limit", 4) or 4),
+)
+HASH_PROGRESS_LOG_INTERVAL_SECONDS = _read_env_int(
+    "PHISHING_HASH_PROGRESS_LOG_INTERVAL_SECONDS",
+    int(_hash_stage_defaults.get("hash_progress_log_interval_seconds", 10) or 10),
+)
+HASH_TARGET_URLS_PER_SEC = _read_env_float_alias(
+    ("PHISHING_HASH_TARGET_URLS_PER_SEC",),
+    float(_hash_stage_defaults.get("hash_target_urls_per_sec", 40.0) or 40.0),
+    minimum=0.0,
+)
+MAX_CONCURRENT_PAGES = ACTIVE_FETCH_LIMIT_MAX
+SCRAPER_PAGE_CONCURRENCY = HASH_PAGES_PER_NODE
+BROWSER_SHARDS = HASH_WORKER_NODES_MAX
+_AIOHTTP_CONNECTOR_LIMIT = HASH_AUX_HTTP_LIMIT
 ADAPTIVE_FETCH_MIN_PROCESSED = 500
 ADAPTIVE_FETCH_PRESSURE_WINDOWS = 2
 GPU_QUEUE_BACKLOG_THRESHOLD = max(4, GPU_QUEUE_MAXSIZE // 4)
@@ -196,19 +285,23 @@ def _probe_gpu_batch_size() -> int:
 GPU_MAX_BATCH_SIZE = _read_env_int("PHISHING_GPU_BATCH_SIZE", _probe_gpu_batch_size())
 
 _clip_logger.info(
-    "Hash shortlist parallelism: pages=%d, shard_workers=%d, shards=%d, nav_timeout_ms=%d, screenshot_timeout_ms=%d, fetch_timeout_s=%.1f, gpu_batch=%d, gpu_queue=%d, http_limit=%d, active_fetch_limit=%d, active_fetch_floor=%d, aux_net_limit=%d, adaptive_downshift=%s",
-    MAX_CONCURRENT_PAGES,
-    SCRAPER_PAGE_CONCURRENCY,
-    BROWSER_SHARDS,
+    "Hash shortlist parallelism: worker_nodes_start=%d, worker_nodes_max=%d, pages_per_node=%d, active_pages_start=%d, active_pages_max=%d, nav_timeout_ms=%d, screenshot_timeout_ms=%d, fetch_timeout_s=%.1f, gpu_batch=%d, result_queue=%d, aux_http_limit=%d, active_fetch_floor=%d, aux_workers=%d, aux_ssl_limit=%d, per_host_limit=%d, target_urls_per_sec=%.1f, adaptive_downshift=%s",
+    HASH_WORKER_NODES_START,
+    HASH_WORKER_NODES_MAX,
+    HASH_PAGES_PER_NODE,
+    ACTIVE_FETCH_LIMIT_INITIAL,
+    ACTIVE_FETCH_LIMIT_MAX,
     SCRAPER_NAV_TIMEOUT_MS,
     SCRAPER_SCREENSHOT_TIMEOUT_MS,
     SCRAPER_FETCH_TIMEOUT_S,
     GPU_MAX_BATCH_SIZE,
     GPU_QUEUE_MAXSIZE,
-    _AIOHTTP_CONNECTOR_LIMIT,
-    ACTIVE_FETCH_LIMIT_INITIAL,
+    HASH_AUX_HTTP_LIMIT,
     ACTIVE_FETCH_LIMIT_FLOOR,
     AUX_NET_CONCURRENCY_LIMIT,
+    HASH_AUX_SSL_LIMIT,
+    HASH_PER_HOST_LIMIT,
+    HASH_TARGET_URLS_PER_SEC,
     ADAPTIVE_FETCH_DOWNSHIFT_ENABLED,
 )
 
@@ -252,39 +345,66 @@ class _AdaptiveFetchLimiter:
         await self.release()
 
 
-def _compute_stage1_downshift(
+def _compute_hash_fetch_adjustment(
     *,
     current_limit: int,
+    max_limit: int,
     floor_limit: int,
     step: int,
     processed_total: int,
     window_processed: int,
     window_failed: int,
     window_timed_out: int,
-    gpu_queue_depth: int,
-    gpu_backlog_threshold: int,
+    render_queue_depth: int,
+    aux_queue_depth: int,
+    finalize_queue_depth: int,
+    result_queue_max: int,
+    fd_usage_ratio: float,
+    ram_usage_ratio: float,
     consecutive_pressure_windows: int,
+    consecutive_healthy_windows: int,
 ) -> dict:
     timeout_ratio = window_timed_out / max(1, window_processed)
     failure_ratio = (window_failed + window_timed_out) / max(1, window_processed)
-    queue_clear = gpu_queue_depth <= gpu_backlog_threshold
+    queue_pressure_ratio = (
+        max(render_queue_depth, aux_queue_depth, finalize_queue_depth) / max(1, result_queue_max)
+    )
     over_threshold = (
         processed_total >= ADAPTIVE_FETCH_MIN_PROCESSED
         and window_processed > 0
-        and queue_clear
         and (
             timeout_ratio >= 0.35
             or failure_ratio >= 0.70
+            or queue_pressure_ratio >= 0.75
+            or fd_usage_ratio >= 0.70
+            or ram_usage_ratio >= 0.75
         )
+    )
+    healthy_window = (
+        window_processed > 0
+        and timeout_ratio < 0.20
+        and failure_ratio < 0.30
+        and queue_pressure_ratio < 0.40
+        and fd_usage_ratio < 0.70
+        and ram_usage_ratio < 0.75
     )
 
     if not over_threshold:
+        next_healthy = consecutive_healthy_windows + 1 if healthy_window else 0
+        should_upshift = (
+            current_limit < max_limit
+            and next_healthy >= 2
+            and processed_total >= ADAPTIVE_FETCH_MIN_PROCESSED
+        )
         return {
-            "next_limit": current_limit,
+            "next_limit": min(max_limit, current_limit + step) if should_upshift else current_limit,
             "next_consecutive_pressure_windows": 0,
+            "next_consecutive_healthy_windows": 0 if should_upshift else next_healthy,
             "should_downshift": False,
+            "should_upshift": should_upshift,
             "timeout_ratio": timeout_ratio,
             "failure_ratio": failure_ratio,
+            "queue_pressure_ratio": queue_pressure_ratio,
         }
 
     next_consecutive = consecutive_pressure_windows + 1
@@ -292,28 +412,89 @@ def _compute_stage1_downshift(
         return {
             "next_limit": current_limit,
             "next_consecutive_pressure_windows": next_consecutive,
+            "next_consecutive_healthy_windows": 0,
             "should_downshift": False,
+            "should_upshift": False,
             "timeout_ratio": timeout_ratio,
             "failure_ratio": failure_ratio,
+            "queue_pressure_ratio": queue_pressure_ratio,
         }
 
     return {
         "next_limit": max(floor_limit, current_limit - step),
         "next_consecutive_pressure_windows": 0,
+        "next_consecutive_healthy_windows": 0,
         "should_downshift": current_limit > floor_limit,
+        "should_upshift": False,
         "timeout_ratio": timeout_ratio,
         "failure_ratio": failure_ratio,
+        "queue_pressure_ratio": queue_pressure_ratio,
     }
 
 
-_aux_net_semaphore = None
+def _get_hash_runtime_resource_snapshot() -> dict:
+    process = psutil.Process(os.getpid())
+    memory_ratio = float(psutil.virtual_memory().percent) / 100.0
+    fd_count = 0
+    fd_limit = 0
+    fd_ratio = 0.0
+    try:
+        if hasattr(process, "num_fds"):
+            fd_count = int(process.num_fds())
+        elif hasattr(process, "num_handles"):
+            fd_count = int(process.num_handles())
+    except Exception:
+        fd_count = 0
+    try:
+        if _resource is not None and hasattr(_resource, "getrlimit"):
+            soft_limit, _ = _resource.getrlimit(_resource.RLIMIT_NOFILE)
+            if soft_limit and soft_limit > 0:
+                fd_limit = int(soft_limit)
+                fd_ratio = fd_count / max(1, fd_limit)
+    except Exception:
+        fd_limit = 0
+        fd_ratio = 0.0
+    return {
+        "fd_count": fd_count,
+        "fd_limit": fd_limit,
+        "fd_usage_ratio": fd_ratio,
+        "ram_usage_ratio": memory_ratio,
+    }
 
 
-def _get_aux_net_semaphore():
-    global _aux_net_semaphore
-    if _aux_net_semaphore is None:
-        _aux_net_semaphore = asyncio.Semaphore(AUX_NET_CONCURRENCY_LIMIT)
-    return _aux_net_semaphore
+_aux_http_semaphore = None
+_aux_ssl_semaphore = None
+
+
+def _get_aux_http_semaphore():
+    global _aux_http_semaphore
+    if _aux_http_semaphore is None:
+        _aux_http_semaphore = asyncio.Semaphore(HASH_AUX_HTTP_LIMIT)
+    return _aux_http_semaphore
+
+
+def _get_aux_ssl_semaphore():
+    global _aux_ssl_semaphore
+    if _aux_ssl_semaphore is None:
+        _aux_ssl_semaphore = asyncio.Semaphore(HASH_AUX_SSL_LIMIT)
+    return _aux_ssl_semaphore
+
+
+class _PerHostLimiter:
+    def __init__(self, per_host_limit: int):
+        self._per_host_limit = max(1, int(per_host_limit))
+        self._lock = asyncio.Lock()
+        self._semaphores: dict[str, asyncio.Semaphore] = {}
+
+    async def acquire(self, host: str) -> asyncio.Semaphore:
+        normalized = str(host or "").strip().lower() or "__blank__"
+        async with self._lock:
+            semaphore = self._semaphores.get(normalized)
+            if semaphore is None:
+                semaphore = asyncio.Semaphore(self._per_host_limit)
+                self._semaphores[normalized] = semaphore
+        await semaphore.acquire()
+        return semaphore
 
 # transformers and CLIP are optional; use fallback for environments without these deps.
 try:
@@ -2164,11 +2345,9 @@ def _build_stage1_debug_rows(
             stage1_rows.append(stage_row)
             continue
 
-        if not bool(stage_row.get("escalate_to_hashing")):
-            stage_row["dns_status"] = "skipped"
-            stage_row["dns_decision"] = "skipped"
-            stage_row["exclusion_stage"] = "stage1_http"
-            stage_row["reason"] = stage_row.get("escalate_reason", "") or "stage1_low_suspicion"
+        if dns_decision and dns_decision != "accepted":
+            stage_row["exclusion_stage"] = "dns_gate"
+            stage_row["reason"] = "dns_rejected"
             passthrough_path = _stage1_passthrough_path(stage_row, scoring_config)
             if passthrough_path:
                 stage_row["stage1_passthrough"] = True
@@ -2178,9 +2357,11 @@ def _build_stage1_debug_rows(
             stage1_rows.append(stage_row)
             continue
 
-        if dns_decision and dns_decision != "accepted":
-            stage_row["exclusion_stage"] = "dns_gate"
-            stage_row["reason"] = "dns_rejected"
+        if not bool(stage_row.get("escalate_to_hashing")):
+            stage_row["dns_status"] = "skipped"
+            stage_row["dns_decision"] = "skipped"
+            stage_row["exclusion_stage"] = "stage1_http"
+            stage_row["reason"] = stage_row.get("escalate_reason", "") or "stage1_low_suspicion"
             passthrough_path = _stage1_passthrough_path(stage_row, scoring_config)
             if passthrough_path:
                 stage_row["stage1_passthrough"] = True
@@ -2581,7 +2762,7 @@ async def _route_nonessential_requests(route):
 # â”€â”€ Async favicon fetching (non-blocking) â”€â”€
 async def favicon_hash_async(domain, session=None):
     """Fetch favicon perceptual hash using aiohttp (non-blocking) or requests fallback."""
-    async with _get_aux_net_semaphore():
+    async with _get_aux_http_semaphore():
         if _has_aiohttp and session is not None:
             try:
                 async with session.get(
@@ -2624,7 +2805,8 @@ def favicon_hash(domain):
 
 async def get_ssl_hash_async(domain):
     """Non-blocking SSL identity similarity-hash fetch."""
-    async with _get_aux_net_semaphore():
+    async with _get_aux_ssl_semaphore():
+        writer = None
         try:
             ctx = ssl.create_default_context()
             reader, writer = await asyncio.wait_for(
@@ -2637,18 +2819,18 @@ async def get_ssl_hash_async(domain):
             if ssl_obj:
                 cert_info = ssl_obj.getpeercert()
                 cert_der = ssl_obj.getpeercert(binary_form=True)
-                writer.close()
-                try:
-                    await writer.wait_closed()
-                except Exception:
-                    pass
                 if _USE_SIMILARITY_HASHING and cert_info:
                     return compute_ssl_simhash(cert_info)
                 if cert_der:
                     return hashlib.sha256(cert_der).hexdigest()
-            writer.close()
         except Exception:
             pass
+        finally:
+            if writer is not None:
+                with suppress(Exception):
+                    writer.close()
+                with suppress(Exception):
+                    await writer.wait_closed()
     return None
 
 
@@ -3588,6 +3770,403 @@ async def _fetch_url_payload(
     )
 
 
+async def _render_hash_payload_on_page(
+    url,
+    page,
+    active_fetch_limiter,
+    host_limiter,
+    prefetch_metrics=None,
+):
+    url = normalize_url(url)
+    parsed = urlparse(url)
+    domain = parsed.netloc.lower()
+    prefetch_metrics = prefetch_metrics or {}
+
+    async def _single_attempt():
+        current_op = None
+        host_gate = await host_limiter.acquire(domain) if host_limiter is not None else None
+        try:
+            async with active_fetch_limiter:
+                current_op = asyncio.create_task(
+                    page.goto(
+                        url,
+                        timeout=SCRAPER_NAV_TIMEOUT_MS,
+                        wait_until="domcontentloaded",
+                    )
+                )
+                await current_op
+                current_op = asyncio.create_task(page.content())
+                html_content = await current_op
+                final_landing_url = page.url
+                soup = BeautifulSoup(html_content, "html.parser")
+                title_text = soup.title.get_text(" ", strip=True).lower() if soup.title else ""
+                visible_text = " ".join(
+                    [p.get_text() for p in soup.find_all(["p", "h1", "h2", "h3", "title"])]
+                ).lower()
+                words = set(visible_text.split())
+                visible_text_excerpt = visible_text[:500]
+                parking_signals = detect_parked_page_signals(
+                    original_url=url,
+                    final_landing_url=final_landing_url,
+                    html_content=html_content,
+                    title_text=title_text,
+                    visible_text=visible_text,
+                )
+                if parking_signals["is_parked"]:
+                    return {
+                        "url": url,
+                        "normalized_url": url,
+                        "source_workbook": prefetch_metrics.get("source_workbook", ""),
+                        "domain": domain,
+                        "fetch_status": "parked",
+                        "visual_status": "not_attempted",
+                        "fetch_error_type": "",
+                        "fetch_error_detail": "",
+                        "final_landing_url": parking_signals["final_landing_url"],
+                        "parking_provider": parking_signals["parking_provider"],
+                        "parking_reason": parking_signals["parking_reason"],
+                        "html_title_text": title_text,
+                        "visible_text_excerpt": visible_text_excerpt,
+                    }
+
+                screenshot_bytes = None
+                fetch_status = "fetched"
+                visual_status = "available"
+                fetch_error_type = ""
+                fetch_error_detail = ""
+                try:
+                    current_op = asyncio.create_task(
+                        page.screenshot(
+                            full_page=False,
+                            timeout=SCRAPER_SCREENSHOT_TIMEOUT_MS,
+                            animations="disabled",
+                            type="png",
+                        )
+                    )
+                    screenshot_bytes = await current_op
+                except Exception as exc:
+                    error_type, error_detail, _ = _classify_fetch_exception(exc, stage="screenshot")
+                    fetch_status = "fetched_visual_missing"
+                    visual_status = "missing"
+                    fetch_error_type = error_type
+                    fetch_error_detail = error_detail
+                finally:
+                    current_op = None
+
+                screenshot_path = ""
+                if screenshot_bytes:
+                    ext = tldextract.extract(domain)
+                    screenshot_name = ".".join(part for part in [ext.domain, ext.suffix] if part) or domain
+                    screenshot_path = os.path.join(BASE_DIR, "screens", f"{screenshot_name}.png")
+                    try:
+                        os.makedirs(os.path.dirname(screenshot_path), exist_ok=True)
+                        with open(screenshot_path, "wb") as screenshot_file:
+                            screenshot_file.write(screenshot_bytes)
+                    except Exception:
+                        screenshot_path = ""
+
+                return {
+                    "url": url,
+                    "normalized_url": url,
+                    "source_workbook": prefetch_metrics.get("source_workbook", ""),
+                    "domain": domain,
+                    "fetch_status": fetch_status,
+                    "visual_status": visual_status,
+                    "fetch_error_type": fetch_error_type,
+                    "fetch_error_detail": fetch_error_detail,
+                    "final_landing_url": final_landing_url,
+                    "parking_provider": "",
+                    "parking_reason": "",
+                    "screenshot_path": screenshot_path,
+                    "html_title_text": title_text,
+                    "visible_text_excerpt": visible_text_excerpt,
+                    "screenshot_bytes": screenshot_bytes,
+                    "html_content": html_content,
+                    "visible_text_words": words,
+                    "page_hash": compute_image_phash(screenshot_bytes) if (_USE_SIMILARITY_HASHING and screenshot_bytes) else None,
+                    "domain_hash": compute_domain_simhash(domain) if _USE_SIMILARITY_HASHING else sha256_text(domain),
+                    "html_hash": None if _USE_SIMILARITY_HASHING else sha256_text(html_content),
+                }
+        finally:
+            if current_op is not None and not current_op.done():
+                current_op.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await current_op
+            if host_gate is not None:
+                host_gate.release()
+
+    try:
+        return await asyncio.wait_for(_single_attempt(), timeout=SCRAPER_FETCH_TIMEOUT_S)
+    except Exception as exc:
+        error_type, error_detail, _ = _classify_fetch_exception(exc, stage="navigation")
+        fetch_status = "timeout" if error_type.endswith("_timeout") else "failed"
+        return _build_fetch_failure_payload(
+            url=url,
+            normalized_url=url,
+            fetch_status=fetch_status,
+            error_type=error_type,
+            error_detail=error_detail,
+        )
+
+
+async def _enrich_render_payload_for_hashing(
+    render_payload,
+    *,
+    aio_session,
+    scoring_config,
+    prefetch_metrics,
+    stage1_analysis,
+):
+    payload = dict(render_payload or {})
+    prefetch_metrics = prefetch_metrics or {}
+    stage1_analysis = stage1_analysis or {}
+    domain = str(payload.get("domain", "") or "").strip().lower()
+    html_content = str(payload.get("html_content", "") or "")
+    words = set(payload.get("visible_text_words", set()) or set())
+    resolved_weights = scoring_config["weights"]
+    domain_similarity_floor = scoring_config["domain_similarity_threshold"]
+
+    fav_task = favicon_hash_async(domain, session=aio_session)
+    ssl_task = get_ssl_hash_async(domain)
+    fav_hash, ssl_hash = await asyncio.gather(fav_task, ssl_task)
+
+    n_entities = len(_entity_index["names"])
+    typo_scores = np.asarray(prefetch_metrics["typo_scores"], dtype="float64")
+    candidate_mask = np.array(prefetch_metrics["candidate_mask"], dtype=bool).copy()
+    lexical_scores = np.asarray(prefetch_metrics["lexical_scores"], dtype="float64")
+    jw_scores = np.asarray(prefetch_metrics["jw_scores"], dtype="float64")
+    token_scores = np.asarray(prefetch_metrics["token_scores"], dtype="float64")
+    lexical_rule_hit = np.array(prefetch_metrics["lexical_rule_hits"], dtype=bool)
+    brand_token_hit = np.array(prefetch_metrics["brand_token_hits"], dtype=bool)
+    candidate_reasons = list(prefetch_metrics["candidate_reasons"])
+    stage1_candidate_entities = list(stage1_analysis.get("candidate_entities", []) or [])
+    if stage1_candidate_entities:
+        seeded_mask = np.zeros(n_entities, dtype=bool)
+        stage1_best_domains = stage1_analysis.get("candidate_best_matching_domains", {}) or {}
+        for entity_name in stage1_candidate_entities:
+            try:
+                entity_idx = _entity_index["names"].index(entity_name)
+            except ValueError:
+                continue
+            seeded_mask[entity_idx] = True
+            candidate_reasons[entity_idx] = f"{candidate_reasons[entity_idx]}|stage1_brand_seed".strip("|")
+            best_domain = str(stage1_best_domains.get(entity_name, "") or "")
+            if best_domain and len(prefetch_metrics.get("best_matching_domains", [])) > entity_idx:
+                prefetch_metrics["best_matching_domains"][entity_idx] = best_domain
+        if seeded_mask.any():
+            candidate_mask = seeded_mask
+
+    use_similarity_hashing = bool(_entity_index.get("use_similarity_hashing", False))
+    page_hash = payload.get("page_hash")
+    html_hash = payload.get("html_hash")
+    domain_hash = payload.get("domain_hash")
+    if use_similarity_hashing:
+        (
+            favicon_similarity,
+            favicon_distance,
+            favicon_hit,
+            favicon_anchor,
+        ) = _similarity_arrays_from_reference_sets(
+            fav_hash,
+            _entity_index["fav_similarity_refs"],
+            hit_distance=_FAVICON_HASH_HIT_DISTANCE,
+            anchor_distance=_FAVICON_HASH_ANCHOR_DISTANCE,
+        )
+        (
+            ssl_hash_similarity,
+            ssl_hash_distance,
+            ssl_hash_hit,
+            ssl_hash_anchor,
+        ) = _similarity_arrays_from_reference_sets(
+            ssl_hash,
+            _entity_index["ssl_similarity_refs"],
+            hit_distance=_SSL_HASH_HIT_DISTANCE,
+            anchor_distance=_SSL_HASH_ANCHOR_DISTANCE,
+        )
+        (
+            page_hash_similarity,
+            page_hash_distance,
+            html_hash_hit,
+            html_hash_anchor,
+        ) = _similarity_arrays_from_reference_sets(
+            page_hash,
+            _entity_index["page_similarity_refs"],
+            hit_distance=_PAGE_HASH_HIT_DISTANCE,
+            anchor_distance=_PAGE_HASH_ANCHOR_DISTANCE,
+        )
+        (
+            domain_hash_similarity,
+            domain_hash_distance,
+            domain_hash_hit,
+            domain_hash_anchor,
+        ) = _similarity_arrays_from_reference_sets(
+            domain_hash,
+            _entity_index["domain_similarity_refs"],
+            hit_distance=_DOMAIN_HASH_HIT_DISTANCE,
+            anchor_distance=None,
+        )
+        hash_hit_count = (
+            favicon_hit.astype(int)
+            + ssl_hash_hit.astype(int)
+            + html_hash_hit.astype(int)
+            + domain_hash_hit.astype(int)
+        )
+        hash_bypass_mask = np.array(
+            favicon_anchor | ssl_hash_anchor | html_hash_anchor | (hash_hit_count >= 2),
+            dtype=bool,
+        )
+    else:
+        hash_bypass_mask = np.zeros(n_entities, dtype=bool)
+        favicon_similarity = np.zeros(n_entities, dtype="float64")
+        favicon_distance = np.full(n_entities, -1, dtype="int32")
+        favicon_hit = np.zeros(n_entities, dtype=bool)
+        favicon_anchor = np.zeros(n_entities, dtype=bool)
+        ssl_hash_similarity = np.zeros(n_entities, dtype="float64")
+        ssl_hash_distance = np.full(n_entities, -1, dtype="int32")
+        ssl_hash_hit = np.zeros(n_entities, dtype=bool)
+        ssl_hash_anchor = np.zeros(n_entities, dtype=bool)
+        page_hash_similarity = np.zeros(n_entities, dtype="float64")
+        page_hash_distance = np.full(n_entities, -1, dtype="int32")
+        html_hash_hit = np.zeros(n_entities, dtype=bool)
+        html_hash_anchor = np.zeros(n_entities, dtype=bool)
+        domain_hash_similarity = np.zeros(n_entities, dtype="float64")
+        domain_hash_distance = np.full(n_entities, -1, dtype="int32")
+        domain_hash_hit = np.zeros(n_entities, dtype=bool)
+        domain_hash_anchor = np.zeros(n_entities, dtype=bool)
+        if fav_hash:
+            favicon_hit = np.array([fav_hash in _entity_index["fav_sets"][i] for i in range(n_entities)], dtype=bool)
+            hash_bypass_mask |= favicon_hit
+            favicon_similarity = favicon_hit.astype("float64")
+            favicon_distance = np.where(favicon_hit, 0, -1).astype("int32")
+            favicon_anchor = favicon_hit.copy()
+        if ssl_hash:
+            ssl_hash_hit = np.array([ssl_hash in _entity_index["ssl_hash_sets"][i] for i in range(n_entities)], dtype=bool)
+            hash_bypass_mask |= ssl_hash_hit
+            ssl_hash_similarity = ssl_hash_hit.astype("float64")
+            ssl_hash_distance = np.where(ssl_hash_hit, 0, -1).astype("int32")
+            ssl_hash_anchor = ssl_hash_hit.copy()
+        if html_hash:
+            html_hash_hit = np.array([html_hash in _entity_index["html_hash_sets"][i] for i in range(n_entities)], dtype=bool)
+            hash_bypass_mask |= html_hash_hit
+            page_hash_similarity = html_hash_hit.astype("float64")
+            page_hash_distance = np.where(html_hash_hit, 0, -1).astype("int32")
+            html_hash_anchor = html_hash_hit.copy()
+        if domain_hash:
+            domain_hash_hit = np.array([domain_hash in _entity_index["domain_hash_sets"][i] for i in range(n_entities)], dtype=bool)
+            hash_bypass_mask |= domain_hash_hit
+            domain_hash_similarity = domain_hash_hit.astype("float64")
+            domain_hash_distance = np.where(domain_hash_hit, 0, -1).astype("int32")
+    candidate_mask |= hash_bypass_mask
+    for idx in np.where(hash_bypass_mask)[0]:
+        candidate_reasons[idx] = f"{candidate_reasons[idx]}|hash_bypass".strip("|")
+
+    cpu_scores = np.zeros(n_entities, dtype="float64")
+    cpu_denominators = np.zeros(n_entities, dtype="float64")
+    domain_hit = np.zeros(n_entities, dtype=bool)
+    keyword_hit = np.zeros(n_entities, dtype=bool)
+    for i in range(n_entities):
+        if not candidate_mask[i]:
+            continue
+        entity_domains = _entity_index["domains"][i]
+        if entity_domains:
+            domain_sim = max(domain_similarity(domain, d) for d in entity_domains)
+            combined_lexical = max(
+                float(lexical_scores[i]),
+                domain_sim if domain_sim >= domain_similarity_floor else 0.0,
+            )
+            if bool(lexical_rule_hit[i]) or bool(brand_token_hit[i]) or domain_sim >= domain_similarity_floor:
+                cpu_scores[i] += combined_lexical * resolved_weights["domain"]
+                cpu_denominators[i] += resolved_weights["domain"]
+                domain_hit[i] = combined_lexical > 0
+        fav_set = _entity_index["fav_sets"][i]
+        if fav_hash and fav_set:
+            cpu_denominators[i] += resolved_weights["favicon"]
+            if favicon_hit[i]:
+                cpu_scores[i] += resolved_weights["favicon"] * float(favicon_similarity[i])
+        ssl_set = _entity_index["ssl_hash_sets"][i]
+        if ssl_hash and ssl_set:
+            cpu_denominators[i] += resolved_weights["ssl_hash"]
+            if ssl_hash_hit[i]:
+                cpu_scores[i] += resolved_weights["ssl_hash"] * float(ssl_hash_similarity[i])
+        html_candidate_hash = page_hash if use_similarity_hashing else html_hash
+        html_set = _entity_index["page_similarity_refs"][i] if use_similarity_hashing else _entity_index["html_hash_sets"][i]
+        if html_candidate_hash and html_set:
+            cpu_denominators[i] += resolved_weights["html_hash"]
+            if html_hash_hit[i]:
+                cpu_scores[i] += resolved_weights["html_hash"] * float(page_hash_similarity[i])
+        domain_hash_set = _entity_index["domain_similarity_refs"][i] if use_similarity_hashing else _entity_index["domain_hash_sets"][i]
+        if domain_hash and domain_hash_set:
+            cpu_denominators[i] += resolved_weights["domain_hash"]
+            if domain_hash_hit[i]:
+                cpu_scores[i] += resolved_weights["domain_hash"] * float(domain_hash_similarity[i])
+        if _entity_index["kw_sets"][i] and words:
+            cpu_denominators[i] += resolved_weights["keywords"]
+            overlap = len(words & _entity_index["kw_sets"][i])
+            keyword_score = min(overlap / 5, 1.0) * resolved_weights["keywords"]
+            cpu_scores[i] += keyword_score
+            keyword_hit[i] = keyword_score > 0
+
+    return {
+        "url": payload["url"],
+        "normalized_url": payload.get("normalized_url", payload["url"]),
+        "source_workbook": payload.get("source_workbook", ""),
+        "domain": domain,
+        "fetch_status": payload.get("fetch_status", "fetched"),
+        "visual_status": payload.get("visual_status", "available"),
+        "fetch_error_type": payload.get("fetch_error_type", ""),
+        "fetch_error_detail": payload.get("fetch_error_detail", ""),
+        "final_landing_url": payload.get("final_landing_url", ""),
+        "parking_provider": payload.get("parking_provider", ""),
+        "parking_reason": payload.get("parking_reason", ""),
+        "screenshot_path": payload.get("screenshot_path", ""),
+        "html_title_text": payload.get("html_title_text", ""),
+        "visible_text_excerpt": payload.get("visible_text_excerpt", ""),
+        "screenshot_bytes": payload.get("screenshot_bytes"),
+        "cpu_scores": cpu_scores,
+        "cpu_denominators": cpu_denominators,
+        "lexical_scores": lexical_scores,
+        "jw_scores": jw_scores,
+        "token_scores": token_scores,
+        "domain_hit": domain_hit,
+        "lexical_hit": np.array(lexical_rule_hit, dtype=bool),
+        "lexical_rule_hit": lexical_rule_hit,
+        "brand_token_hit": brand_token_hit,
+        "generic_token_only_hit": np.array(prefetch_metrics.get("generic_token_only_hits", np.zeros(n_entities, dtype=bool)), dtype=bool),
+        "favicon_hit": favicon_hit,
+        "favicon_anchor": favicon_anchor,
+        "favicon_hash_similarity": favicon_similarity,
+        "favicon_hash_distance": favicon_distance,
+        "ssl_hash_hit": ssl_hash_hit,
+        "ssl_hash_anchor": ssl_hash_anchor,
+        "ssl_hash_similarity": ssl_hash_similarity,
+        "ssl_hash_distance": ssl_hash_distance,
+        "html_hash_hit": html_hash_hit,
+        "html_hash_anchor": html_hash_anchor,
+        "page_hash_similarity": page_hash_similarity,
+        "page_hash_distance": page_hash_distance,
+        "domain_hash_hit": domain_hash_hit,
+        "domain_hash_anchor": domain_hash_anchor,
+        "domain_hash_similarity": domain_hash_similarity,
+        "domain_hash_distance": domain_hash_distance,
+        "keyword_hit": keyword_hit,
+        "typo_scores": typo_scores,
+        "candidate_mask": candidate_mask,
+        "candidate_reasons": candidate_reasons,
+        "best_matching_domains": list(prefetch_metrics.get("best_matching_domains", [])),
+        "old_fuzzy_hit": prefetch_metrics["old_fuzzy_hit"],
+        "old_fuzzy_cse": prefetch_metrics["old_fuzzy_cse"],
+        "old_fuzzy_domain": prefetch_metrics["old_fuzzy_domain"],
+        "old_fuzzy_score": prefetch_metrics["old_fuzzy_score"],
+        "strict_lexical_hit": prefetch_metrics["strict_lexical_hit"],
+        "lexical_score_pass": prefetch_metrics["lexical_score_pass"],
+        "fallback_rank_only": prefetch_metrics["fallback_rank_only"],
+        **{
+            key: stage1_analysis.get(key, _STAGE1_SIGNAL_FIELD_DEFAULTS[key])
+            for key in _STAGE1_SIGNAL_FIELD_DEFAULTS
+        },
+    }
+
+
 ###############################################
 # BROWSER SHARDS
 ###############################################
@@ -4149,7 +4728,7 @@ def _finalize_scored_hash_payload(
         review_results.append(review_record)
 
 
-async def _gpu_microbatch_scorer(gpu_queue, results, review_results, decision_rows, metrics, threshold, scoring_config):
+async def _gpu_microbatch_scorer(gpu_queue, results, review_results, decision_rows, metrics, threshold, scoring_config, hash_progress):
     """
     Queue scorer for browser-fetched payloads.
     CLIP runtime scoring is disabled; payloads are finalized with hash/domain signals only.
@@ -4189,6 +4768,10 @@ async def _gpu_microbatch_scorer(gpu_queue, results, review_results, decision_ro
                 threshold=threshold,
                 scoring_config=scoring_config,
             )
+            metrics["hashed_success"] += 1
+            metrics["processed"] += 1
+            metrics["finalized"] += 1
+            hash_progress.mark_completed(final_status="hashed_success")
 
     while True:
         loop = asyncio.get_running_loop()
@@ -4198,12 +4781,14 @@ async def _gpu_microbatch_scorer(gpu_queue, results, review_results, decision_ro
             payload = await asyncio.wait_for(gpu_queue.get(), timeout=wait)
             if payload is None:  # sentinel â€” flush and exit
                 await _flush()
+                gpu_queue.task_done()
                 break
             batch.append(payload)
             if deadline is None:
                 deadline = loop.time() + GPU_MAX_WAIT_MS / 1000
             if len(batch) >= GPU_MAX_BATCH_SIZE:
                 await _flush()
+            gpu_queue.task_done()
         except asyncio.TimeoutError:
             await _flush()
 
@@ -4215,46 +4800,56 @@ async def _gpu_microbatch_scorer(gpu_queue, results, review_results, decision_ro
 def _build_progress_postfix(metrics):
     elapsed = max(float(metrics.get("stage_elapsed_s", 0.0)), 1e-6)
     return {
-        "proc": metrics["processed"],
-        "dns": metrics["passed_dns_gate"],
-        "ok": metrics["hashed_success"],
-        "fail": metrics["fetch_failed"],
-        "tout": metrics["fetch_timed_out"],
+        "proc": metrics.get("processed", 0),
+        "render": metrics.get("render_completed", 0),
+        "aux": metrics.get("aux_completed", 0),
+        "ok": metrics.get("hashed_success", 0),
+        "fail": metrics.get("fetch_failed", 0),
+        "tout": metrics.get("fetch_timed_out", 0),
         "park": metrics.get("fetch_parked", 0),
-        "match": metrics["final_matches_above_threshold"],
-        "gpu_batches": metrics["gpu_batches_flushed"],
-        "gpu_items": metrics.get("gpu_items_scored", 0),
-        "gpu_queue": metrics.get("gpu_queue_depth", 0),
-        "active_fetch": metrics.get("active_fetch_limit", 0),
-        "urls_per_sec": round(metrics["processed"] / elapsed, 2),
+        "match": metrics.get("final_matches_above_threshold", 0),
+        "final_q": metrics.get("gpu_queue_depth", 0),
+        "render_q": metrics.get("render_queue_depth", 0),
+        "aux_q": metrics.get("aux_queue_depth", 0),
+        "active": metrics.get("active_fetch_limit", 0),
+        "urls_per_sec": round(metrics.get("processed", 0) / elapsed, 2),
     }
 
 
 def _log_hashing_periodic_status(metrics, accepted_count):
-    processed = int(metrics["processed"])
+    processed = int(metrics.get("processed", 0))
     if processed <= 0:
         return
-    timeout_ratio = metrics["fetch_timed_out"] / max(1, processed)
-    success_ratio = metrics["hashed_success"] / max(1, processed)
+    timeout_ratio = metrics.get("fetch_timed_out", 0) / max(1, processed)
+    success_ratio = metrics.get("hashed_success", 0) / max(1, processed)
     _clip_logger.info(
-        "Hashing progress | processed=%d/%d | ok=%d | fail=%d | tout=%d | park=%d | match=%d | "
-        "gpu_batches=%d | gpu_items=%d | gpu_queue=%d | active_fetch_limit=%d | avg_gpu_batch=%.2f | "
-        "urls_per_sec=%.2f | success_ratio=%.3f | timeout_ratio=%.3f",
+        "Hashing progress | processed=%d/%d | render=%d | aux=%d | ok=%d | fail=%d | tout=%d | park=%d | match=%d | "
+        "queues={render=%d,aux=%d,final=%d} | nodes_alive=%d | active_pages=%d | finalized=%d | avg_finalize_batch=%.2f | "
+        "urls_per_sec=%.2f | success_ratio=%.3f | timeout_ratio=%.3f | fd=%d/%d | ram=%.1f%% | target=%.1f | limiting_lane=%s",
         processed,
         accepted_count,
-        metrics["hashed_success"],
-        metrics["fetch_failed"],
-        metrics["fetch_timed_out"],
+        metrics.get("render_completed", 0),
+        metrics.get("aux_completed", 0),
+        metrics.get("hashed_success", 0),
+        metrics.get("fetch_failed", 0),
+        metrics.get("fetch_timed_out", 0),
         metrics.get("fetch_parked", 0),
-        metrics["final_matches_above_threshold"],
-        metrics["gpu_batches_flushed"],
-        metrics.get("gpu_items_scored", 0),
+        metrics.get("final_matches_above_threshold", 0),
+        metrics.get("render_queue_depth", 0),
+        metrics.get("aux_queue_depth", 0),
         metrics.get("gpu_queue_depth", 0),
+        metrics.get("worker_nodes_alive", 0),
         metrics.get("active_fetch_limit", 0),
+        metrics.get("gpu_items_scored", 0),
         metrics.get("avg_gpu_batch_size", 0.0),
         processed / max(float(metrics.get("stage_elapsed_s", 0.0)), 1e-6),
         success_ratio,
         timeout_ratio,
+        metrics.get("fd_count", 0),
+        metrics.get("fd_limit", 0),
+        metrics.get("ram_usage_ratio", 0.0) * 100.0,
+        HASH_TARGET_URLS_PER_SEC,
+        metrics.get("limiting_lane", "render"),
     )
 
 
@@ -4319,25 +4914,439 @@ def _log_hashing_metrics_summary(
     )
 
 
+def _commit_terminal_hash_outcome(
+    payload_outcome,
+    *,
+    metrics,
+    decision_rows,
+    prefetch_admitted_failures,
+    hash_progress,
+):
+    if payload_outcome["decision_row"] is not None:
+        decision_rows.append(payload_outcome["decision_row"])
+    admitted_prefetch_match = payload_outcome["admitted_prefetch_match"]
+    if admitted_prefetch_match is not None:
+        metrics["final_matches_above_threshold"] += 1
+        prefetch_admitted_failures.append(admitted_prefetch_match)
+    metrics[payload_outcome["metric_key"]] += 1
+    metrics["processed"] += 1
+    metrics["finalized"] += 1
+    hash_progress.mark_completed(final_status=payload_outcome["metric_key"])
+
+
+async def _queue_hash_lane_item(queue, item, *, lane_name, metrics, active_fetch_limiter):
+    while True:
+        try:
+            await asyncio.wait_for(queue.put(item), timeout=2.0)
+            return
+        except asyncio.TimeoutError:
+            metrics["limiting_lane"] = lane_name
+            if active_fetch_limiter.limit > ACTIVE_FETCH_LIMIT_FLOOR:
+                await active_fetch_limiter.set_limit(max(ACTIVE_FETCH_LIMIT_FLOOR, active_fetch_limiter.limit - ACTIVE_FETCH_DOWNSHIFT_STEP))
+                metrics["active_fetch_limit"] = active_fetch_limiter.limit
+            _clip_logger.warning(
+                "Hash %s queue saturated | depth=%d | active_pages=%d",
+                lane_name,
+                queue.qsize(),
+                active_fetch_limiter.limit,
+            )
+
+
+async def _reset_hash_page(page, browser_context, *, recycle: bool):
+    if page is not None and not page.is_closed():
+        if recycle:
+            with suppress(Exception):
+                await page.close()
+            page = None
+        else:
+            try:
+                await page.goto("about:blank", wait_until="domcontentloaded", timeout=3000)
+            except Exception:
+                with suppress(Exception):
+                    await page.close()
+                page = None
+    if page is None:
+        page = await browser_context.new_page()
+    return page
+
+
+async def _run_hash_browser_node(
+    *,
+    node_id,
+    render_queue,
+    aux_queue,
+    metrics,
+    decision_rows,
+    prefetch_admitted_failures,
+    prefetch_metrics_map,
+    stage1_analysis_map,
+    active_fetch_limiter,
+    host_limiter,
+    hash_progress,
+    scoring_config,
+    active_workers,
+):
+    p = await async_playwright().start()
+    browser = await p.chromium.launch(headless=True)
+    ctx = await browser.new_context(ignore_https_errors=True, service_workers="block")
+    await ctx.route("**/*", _route_nonessential_requests)
+    ctx.set_default_navigation_timeout(SCRAPER_NAV_TIMEOUT_MS)
+    ctx.set_default_timeout(SCRAPER_SCREENSHOT_TIMEOUT_MS)
+
+    async def _page_worker(slot_id: int):
+        worker_id = f"node-{node_id}:page-{slot_id}"
+        page = None
+        urls_since_recycle = 0
+        try:
+            page = await _reset_hash_page(None, ctx, recycle=False)
+            while True:
+                item = await render_queue.get()
+                if item is None:
+                    render_queue.task_done()
+                    break
+                raw_url = str(item.get("url", "") or "")
+                normalized_url = str(item.get("normalized_url", "") or normalize_url(raw_url))
+                prefetch_metrics = item.get("prefetch_metrics") or prefetch_metrics_map.get(normalized_url) or {}
+                stage1_analysis = item.get("stage1_analysis") or stage1_analysis_map.get(normalized_url, {}) or {}
+                active_workers[worker_id] = normalized_url
+                recycle_page = False
+                try:
+                    render_payload = await _render_hash_payload_on_page(
+                        raw_url,
+                        page,
+                        active_fetch_limiter,
+                        host_limiter,
+                        prefetch_metrics=prefetch_metrics,
+                    )
+                    metrics["render_completed"] += 1
+                    if str(render_payload.get("fetch_status", "")).strip().lower() in {"fetched", "fetched_visual_missing"}:
+                        await _queue_hash_lane_item(
+                            aux_queue,
+                            {
+                                "render_payload": render_payload,
+                                "prefetch_metrics": prefetch_metrics,
+                                "stage1_analysis": stage1_analysis,
+                            },
+                            lane_name="aux",
+                            metrics=metrics,
+                            active_fetch_limiter=active_fetch_limiter,
+                        )
+                    else:
+                        payload_outcome = _handle_stage1_fetch_payload(
+                            payload=render_payload,
+                            normalized_url=normalized_url,
+                            prefetch_metrics=prefetch_metrics,
+                            scoring_config=scoring_config,
+                            stage1_analysis=stage1_analysis,
+                        )
+                        _commit_terminal_hash_outcome(
+                            payload_outcome,
+                            metrics=metrics,
+                            decision_rows=decision_rows,
+                            prefetch_admitted_failures=prefetch_admitted_failures,
+                            hash_progress=hash_progress,
+                        )
+                        recycle_page = True
+                except Exception as exc:
+                    payload_outcome = _handle_stage1_fetch_payload(
+                        payload={
+                            "url": normalized_url or raw_url,
+                            "normalized_url": normalized_url or raw_url,
+                            "source_workbook": prefetch_metrics.get("source_workbook", ""),
+                            "fetch_status": "failed",
+                            "visual_status": "not_attempted",
+                            "fetch_error_type": "render_worker_error",
+                            "fetch_error_detail": _compact_exception_message(exc),
+                            "final_landing_url": "",
+                            "parking_provider": "",
+                            "parking_reason": "",
+                        },
+                        normalized_url=normalized_url or raw_url,
+                        prefetch_metrics=prefetch_metrics,
+                        scoring_config=scoring_config,
+                        stage1_analysis=stage1_analysis,
+                    )
+                    _commit_terminal_hash_outcome(
+                        payload_outcome,
+                        metrics=metrics,
+                        decision_rows=decision_rows,
+                        prefetch_admitted_failures=prefetch_admitted_failures,
+                        hash_progress=hash_progress,
+                    )
+                    recycle_page = True
+                    _clip_logger.warning(
+                        "Hash render worker %s error on %s: %s: %s",
+                        worker_id,
+                        raw_url,
+                        exc.__class__.__name__,
+                        _compact_exception_message(exc),
+                    )
+                finally:
+                    active_workers.pop(worker_id, None)
+                    render_queue.task_done()
+                    urls_since_recycle += 1
+                    try:
+                        page = await _reset_hash_page(
+                            page,
+                            ctx,
+                            recycle=recycle_page or urls_since_recycle >= 50,
+                        )
+                        if recycle_page or urls_since_recycle >= 50:
+                            urls_since_recycle = 0
+                    except Exception:
+                        with suppress(Exception):
+                            if page is not None and not page.is_closed():
+                                await page.close()
+                        page = None
+        finally:
+            with suppress(Exception):
+                if page is not None and not page.is_closed():
+                    await page.close()
+
+    workers = [asyncio.create_task(_page_worker(slot_id)) for slot_id in range(HASH_PAGES_PER_NODE)]
+    try:
+        await asyncio.gather(*workers)
+    finally:
+        for cleanup in (ctx.close, browser.close, p.stop):
+            with suppress(Exception):
+                await cleanup()
+
+
+async def _run_hash_aux_worker(
+    *,
+    worker_id,
+    aux_queue,
+    gpu_queue,
+    metrics,
+    decision_rows,
+    prefetch_admitted_failures,
+    active_fetch_limiter,
+    aio_session,
+    hash_progress,
+    scoring_config,
+    active_workers,
+):
+    while True:
+        item = await aux_queue.get()
+        if item is None:
+            aux_queue.task_done()
+            break
+        render_payload = item.get("render_payload") or {}
+        normalized_url = str(render_payload.get("normalized_url", render_payload.get("url", "")) or "")
+        prefetch_metrics = item.get("prefetch_metrics") or {}
+        stage1_analysis = item.get("stage1_analysis") or {}
+        active_workers[worker_id] = normalized_url
+        try:
+            scored_payload = await _enrich_render_payload_for_hashing(
+                render_payload,
+                aio_session=aio_session,
+                scoring_config=scoring_config,
+                prefetch_metrics=prefetch_metrics,
+                stage1_analysis=stage1_analysis,
+            )
+            metrics["aux_completed"] += 1
+            await _queue_hash_lane_item(
+                gpu_queue,
+                scored_payload,
+                lane_name="finalize",
+                metrics=metrics,
+                active_fetch_limiter=active_fetch_limiter,
+            )
+        except Exception as exc:
+            payload_outcome = _handle_stage1_fetch_payload(
+                payload={
+                    "url": normalized_url,
+                    "normalized_url": normalized_url,
+                    "source_workbook": prefetch_metrics.get("source_workbook", ""),
+                    "fetch_status": "failed",
+                    "visual_status": render_payload.get("visual_status", "not_attempted"),
+                    "fetch_error_type": "aux_hash_error",
+                    "fetch_error_detail": _compact_exception_message(exc),
+                    "final_landing_url": render_payload.get("final_landing_url", ""),
+                    "parking_provider": render_payload.get("parking_provider", ""),
+                    "parking_reason": render_payload.get("parking_reason", ""),
+                },
+                normalized_url=normalized_url,
+                prefetch_metrics=prefetch_metrics,
+                scoring_config=scoring_config,
+                stage1_analysis=stage1_analysis,
+            )
+            _commit_terminal_hash_outcome(
+                payload_outcome,
+                metrics=metrics,
+                decision_rows=decision_rows,
+                prefetch_admitted_failures=prefetch_admitted_failures,
+                hash_progress=hash_progress,
+            )
+            _clip_logger.warning(
+                "Hash aux worker %s error on %s: %s: %s",
+                worker_id,
+                normalized_url,
+                exc.__class__.__name__,
+                _compact_exception_message(exc),
+            )
+        finally:
+            active_workers.pop(worker_id, None)
+            aux_queue.task_done()
+
+
+class _Stage1PerHostLimiter:
+    def __init__(self, limit: int):
+        self._limit = max(1, int(limit))
+        self._lock = asyncio.Lock()
+        self._semaphores: dict[str, asyncio.Semaphore] = {}
+
+    async def run(self, host: str, awaitable_factory):
+        host_key = str(host or "").strip().lower()
+        if not host_key:
+            return await awaitable_factory()
+        async with self._lock:
+            semaphore = self._semaphores.get(host_key)
+            if semaphore is None:
+                semaphore = asyncio.Semaphore(self._limit)
+                self._semaphores[host_key] = semaphore
+        async with semaphore:
+            return await awaitable_factory()
+
+
+def _build_stage1_dns_prefetch_map(audit_rows: list[dict]) -> dict[str, dict]:
+    prefetch_map: dict[str, dict] = {}
+    for row in audit_rows or []:
+        if str(row.get("decision", "")).strip().lower() != "accepted":
+            continue
+        normalized_target = normalize_url(str(row.get("target_url", "")).strip())
+        if not normalized_target:
+            continue
+        resolved_ips_raw = row.get("resolved_ips", [])
+        if isinstance(resolved_ips_raw, str):
+            resolved_ips = [part.strip() for part in resolved_ips_raw.split(";") if part.strip()]
+        else:
+            resolved_ips = [str(part).strip() for part in (resolved_ips_raw or []) if str(part).strip()]
+        prefetch_map[normalized_target] = {
+            "resolved_ips": resolved_ips,
+            "dns_answer_count": int(row.get("dns_answer_count", len(resolved_ips)) or len(resolved_ips)),
+            "first_resolved_ip": str(row.get("first_resolved_ip", "") or (resolved_ips[0] if resolved_ips else "")),
+            "asn": row.get("asn"),
+            "asn_org": str(row.get("asn_org", "") or ""),
+            "country": str(row.get("country", "") or ""),
+            "dns_status": str(row.get("dns_status", "") or ""),
+        }
+    return prefetch_map
+
+
+def _stage1_fd_usage() -> tuple[int | None, int | None, float | None]:
+    count = None
+    limit = None
+    try:
+        process = psutil.Process(os.getpid())
+        if hasattr(process, "num_fds"):
+            count = int(process.num_fds())
+        elif hasattr(process, "num_handles"):
+            count = int(process.num_handles())
+    except Exception:
+        count = None
+    try:
+        import resource  # type: ignore
+
+        soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if isinstance(soft_limit, int) and soft_limit > 0:
+            limit = int(soft_limit)
+    except Exception:
+        limit = None
+    ratio = (float(count) / float(limit)) if (count is not None and limit not in (None, 0)) else None
+    return count, limit, ratio
+
+
+def _stage1_timeout_flag_from_message(*messages: str) -> bool:
+    surface = " ".join(str(message or "") for message in messages).lower()
+    return "timeout" in surface
+
+
+def _build_stage1_failed_result(
+    raw_url: str,
+    *,
+    normalized_url: str,
+    error_type: str,
+    error_message: str,
+    timeout_hit: bool,
+    base_result: dict | None = None,
+    reason: str = "stage1_fetch_failed",
+) -> dict:
+    analysis = _default_stage1_result(raw_url)
+    if base_result:
+        analysis.update(dict(base_result))
+    analysis["url"] = normalized_url
+    analysis["normalized_url"] = normalized_url
+    analysis["fetch_status"] = "failed"
+    analysis["fetch_error_type"] = str((base_result or {}).get("fetch_error_type") or error_type or "stage1_http_error")
+    analysis["fetch_error_detail"] = str((base_result or {}).get("fetch_error_detail") or error_message or error_type)
+    analysis["stage1_error_type"] = str(error_type or analysis.get("stage1_error_type") or "stage1_http_error")
+    analysis["stage1_error_message"] = str(error_message or analysis.get("stage1_error_message") or error_type or "stage1_http_error")
+    analysis["stage1_retry_count"] = 0
+    analysis["stage1_timeout_hit"] = bool(timeout_hit)
+    analysis["stage1_reasons"] = reason
+    analysis["escalate_reason"] = reason
+    analysis["escalate_to_hashing"] = False
+    return analysis
+
+
 async def _analyze_stage1_http_candidates(
     urls: list[str],
     stage1_http_config: dict | None = None,
     run_context: RunContext | None = None,
     checkpoint_store: CheckpointStore | None = None,
     source_workbook_map: dict[str, str] | None = None,
+    dns_prefetch_map: dict[str, dict] | None = None,
 ) -> dict[str, dict]:
     if not urls:
         return {}
 
     stage1_http_config = dict(stage1_http_config or STAGE1_HTTP_CONFIG)
     source_workbook_map = dict(source_workbook_map or {})
+    dns_prefetch_map = dict(dns_prefetch_map or {})
+    fetch_concurrency = max(
+        1,
+        int(stage1_http_config.get("stage1_fetch_concurrency_start", stage1_http_config.get("concurrency", 24))),
+    )
+    fetch_concurrency_max = max(
+        fetch_concurrency,
+        int(stage1_http_config.get("stage1_fetch_concurrency_max", fetch_concurrency)),
+    )
+    stage1_http_config["http_concurrency"] = max(
+        1,
+        int(
+            stage1_http_config.get(
+                "stage1_http_connection_limit",
+                stage1_http_config.get("http_concurrency", fetch_concurrency_max),
+            )
+        ),
+    )
+    stage1_http_config["dns_concurrency"] = max(
+        1,
+        int(stage1_http_config.get("stage1_enrich_dns_concurrency", stage1_http_config.get("dns_concurrency", fetch_concurrency))),
+    )
+    stage1_http_config["rdap_concurrency"] = max(
+        1,
+        int(stage1_http_config.get("stage1_enrich_rdap_concurrency", stage1_http_config.get("rdap_concurrency", 8))),
+    )
+    stage1_http_config["tls_concurrency"] = max(
+        1,
+        int(stage1_http_config.get("stage1_enrich_tls_concurrency", stage1_http_config.get("tls_concurrency", 32))),
+    )
     entity_context, ordered_entities = get_stage1_entity_context()
     concurrency_controls = build_stage1_concurrency_controls(stage1_http_config)
-    url_concurrency = max(1, int(stage1_http_config.get("concurrency", 24)))
+    url_concurrency = max(1, fetch_concurrency)
     http_concurrency = max(1, int(stage1_http_config.get("http_concurrency", url_concurrency)))
+    keepalive_concurrency = max(
+        1,
+        min(
+            http_concurrency,
+            int(stage1_http_config.get("stage1_http_keepalive_limit", min(http_concurrency, url_concurrency))),
+        ),
+    )
     limits = httpx.Limits(
         max_connections=http_concurrency,
-        max_keepalive_connections=http_concurrency,
+        max_keepalive_connections=keepalive_concurrency,
     )
     timeout = httpx.Timeout(
         stage1_http_config["get_timeout"],
@@ -4351,8 +5360,22 @@ async def _analyze_stage1_http_candidates(
         "head_only": 0,
         "fetched": 0,
         "fallback_dns": 0,
+        "timeout": 0,
     }
     active_workers: dict[str, str] = {}
+    fetch_limiter = _AdaptiveFetchLimiter(url_concurrency)
+    per_host_limiter = _Stage1PerHostLimiter(
+        max(1, int(stage1_http_config.get("stage1_per_host_limit", 4)))
+    )
+    telemetry = {
+        "event_loop_lag_ms": 0.0,
+        "fd_count": None,
+        "fd_limit": None,
+        "fd_ratio": None,
+        "timeout_ratio": 0.0,
+    }
+    stage1_started_monotonic = time.perf_counter()
+    last_progress_log_monotonic = stage1_started_monotonic
     queue: asyncio.Queue[str | None] = asyncio.Queue()
     for raw_url in urls:
         await queue.put(raw_url)
@@ -4366,6 +5389,16 @@ async def _analyze_stage1_http_candidates(
         verify=False,
         headers={"User-Agent": "Mozilla/5.0 (compatible; stage1-router/1.0)"},
     ) as client:
+        _clip_logger.info(
+            "Stage1 fast-path runtime | urls=%d | fetch_concurrency=%d..%d | http_limit=%d | keepalive_limit=%d | per_host_limit=%d | dns_reuse=%s",
+            len(urls),
+            url_concurrency,
+            fetch_concurrency_max,
+            http_concurrency,
+            keepalive_concurrency,
+            int(stage1_http_config.get("stage1_per_host_limit", 4) or 4),
+            True,
+        )
         try:
             from tqdm import tqdm
 
@@ -4380,29 +5413,112 @@ async def _analyze_stage1_http_candidates(
             progress_bar = None
 
         async def _progress_monitor():
-            if progress_bar is None:
-                return
+            nonlocal last_progress_log_monotonic
             last_completed = 0
             while True:
+                before_sleep = time.perf_counter()
                 await asyncio.sleep(0.5)
-                completed = progress.completed
-                if completed > last_completed:
-                    progress_bar.update(completed - last_completed)
-                    last_completed = completed
-                progress_bar.set_postfix(
-                    {
-                        "act": len(active_workers),
-                        "q": queue.qsize(),
-                        "esc": progress_metrics["escalated"],
-                        "fail": progress_metrics["failed"],
-                        "dnsfb": progress_metrics["fallback_dns"],
-                    },
-                    refresh=False,
+                telemetry["event_loop_lag_ms"] = max(
+                    0.0,
+                    (time.perf_counter() - before_sleep - 0.5) * 1000.0,
                 )
+                completed = progress.completed
+                if progress_bar is not None and completed > last_completed:
+                    progress_bar.update(completed - last_completed)
+                last_completed = completed
+                if progress_bar is not None:
+                    progress_bar.set_postfix(
+                        {
+                            "act": len(active_workers),
+                            "q": queue.qsize(),
+                            "limit": fetch_limiter.limit,
+                            "esc": progress_metrics["escalated"],
+                            "fail": progress_metrics["failed"],
+                            "dnsfb": progress_metrics["fallback_dns"],
+                        },
+                        refresh=False,
+                    )
+                now_monotonic = time.perf_counter()
+                if (now_monotonic - last_progress_log_monotonic) >= float(
+                    stage1_http_config.get("stage1_progress_log_interval_seconds", 10) or 10
+                ):
+                    elapsed_s = max(0.001, now_monotonic - stage1_started_monotonic)
+                    rate = completed / elapsed_s
+                    remaining = max(0, len(urls) - completed)
+                    eta_s = (remaining / rate) if rate > 0 else 0.0
+                    fd_count, fd_limit, fd_ratio = _stage1_fd_usage()
+                    telemetry["fd_count"] = fd_count
+                    telemetry["fd_limit"] = fd_limit
+                    telemetry["fd_ratio"] = fd_ratio
+                    _clip_logger.info(
+                        "Stage1 cheap HTTP progress | processed=%d/%d | rate=%.1f url/s | elapsed=%.1fs | eta=%.1fs | active=%d | queue=%d | fetch_limit=%d | escalated=%d | failed=%d | fallback_dns=%d | fd=%s/%s | event_loop_lag_ms=%.1f | timeout_ratio=%.3f",
+                        completed,
+                        len(urls),
+                        rate,
+                        elapsed_s,
+                        eta_s,
+                        len(active_workers),
+                        queue.qsize(),
+                        fetch_limiter.limit,
+                        progress_metrics["escalated"],
+                        progress_metrics["failed"],
+                        progress_metrics["fallback_dns"],
+                        fd_count if fd_count is not None else "n/a",
+                        fd_limit if fd_limit is not None else "n/a",
+                        float(telemetry["event_loop_lag_ms"] or 0.0),
+                        float(telemetry["timeout_ratio"] or 0.0),
+                    )
+                    last_progress_log_monotonic = now_monotonic
                 if completed >= len(urls):
                     break
 
-        monitor_task = asyncio.create_task(_progress_monitor()) if progress_bar is not None else None
+        async def _ramp_monitor():
+            last_fetch_timeout = 0
+            bad_windows = 0
+            while True:
+                await asyncio.sleep(15.0)
+                if progress.completed >= len(urls):
+                    break
+                window_timeout = max(0, progress_metrics["timeout"] - last_fetch_timeout)
+                last_fetch_timeout = progress_metrics["timeout"]
+                telemetry["timeout_ratio"] = window_timeout / max(1, progress.completed)
+                fd_count, fd_limit, fd_ratio = _stage1_fd_usage()
+                telemetry["fd_count"] = fd_count
+                telemetry["fd_limit"] = fd_limit
+                telemetry["fd_ratio"] = fd_ratio
+                healthy = (
+                    float(telemetry["event_loop_lag_ms"] or 0.0) < 50.0
+                    and (fd_ratio is None or fd_ratio < 0.70)
+                    and float(telemetry["timeout_ratio"] or 0.0) < 0.25
+                    and queue.qsize() < max(1, int(len(urls) * 0.90))
+                )
+                if healthy and fetch_limiter.limit < fetch_concurrency_max:
+                    previous_limit = fetch_limiter.limit
+                    await fetch_limiter.set_limit(min(fetch_concurrency_max, fetch_limiter.limit + 64))
+                    _clip_logger.info(
+                        "Stage1 fetch ramp up | limit %d -> %d | timeout_ratio=%.3f | fd_ratio=%s",
+                        previous_limit,
+                        fetch_limiter.limit,
+                        float(telemetry["timeout_ratio"] or 0.0),
+                        "n/a" if fd_ratio is None else f"{fd_ratio:.3f}",
+                    )
+                    bad_windows = 0
+                elif not healthy:
+                    bad_windows += 1
+                    if bad_windows >= 2 and fetch_limiter.limit > url_concurrency:
+                        previous_limit = fetch_limiter.limit
+                        await fetch_limiter.set_limit(max(url_concurrency, fetch_limiter.limit - 64))
+                        _clip_logger.info(
+                            "Stage1 fetch downshift | limit %d -> %d | timeout_ratio=%.3f | fd_ratio=%s",
+                            previous_limit,
+                            fetch_limiter.limit,
+                            float(telemetry["timeout_ratio"] or 0.0),
+                            "n/a" if fd_ratio is None else f"{fd_ratio:.3f}",
+                        )
+                        bad_windows = 0
+
+        monitor_task = asyncio.create_task(_progress_monitor())
+        ramp_task = asyncio.create_task(_ramp_monitor())
 
         async def _worker(worker_index: int):
             worker_id = f"stage1-{worker_index}"
@@ -4441,36 +5557,32 @@ async def _analyze_stage1_http_candidates(
                                     ordered_entities=ordered_entities,
                                     config=stage1_http_config,
                                     concurrency_controls=concurrency_controls,
+                                    dns_prefetch=dns_prefetch_map.get(normalized_url, {}),
+                                    fetch_limiter=fetch_limiter,
+                                    per_host_limiter=per_host_limiter,
                                 ),
-                                timeout=max(
-                                    float(stage1_http_config.get("head_timeout", 4.0))
-                                    + float(stage1_http_config.get("get_timeout", 6.0))
-                                    + float(stage1_http_config.get("dns_timeout", 3.0))
-                                    + float(stage1_http_config.get("rdap_timeout", 5.0))
-                                    + float(stage1_http_config.get("tls_timeout", 3.0))
-                                    + 5.0,
-                                    10.0,
-                                ),
+                                timeout=18.0,
                                 max_retries=0,
                             )
                     except Exception as exc:
                         error = normalize_exception(exc)
-                        timeout_hit = "timeout" in error["error_message"].lower()
+                        timeout_hit = _stage1_timeout_flag_from_message(error["error_message"])
                         retry_count = 0
-                        analysis = {
-                            **_stage1_signal_defaults(),
-                            "url": normalized_url,
-                            "normalized_url": normalized_url,
-                            "fetch_status": "failed",
-                            "fetch_error_type": "stage1_http_error",
-                            "fetch_error_detail": _compact_exception_message(exc),
-                            "stage1_reasons": "stage1_fetch_failed",
-                            "escalate_reason": "stage1_fetch_failed",
-                            "stage1_error_type": error["error_type"],
-                            "stage1_error_message": error["error_message"],
-                            "stage1_retry_count": retry_count,
-                            "stage1_timeout_hit": timeout_hit,
-                        }
+                        analysis = _build_stage1_failed_result(
+                            raw_url,
+                            normalized_url=normalized_url,
+                            error_type=error["error_type"],
+                            error_message=error["error_message"],
+                            timeout_hit=timeout_hit,
+                        )
+                    analysis["stage1_timeout_hit"] = bool(
+                        analysis.get("stage1_timeout_hit", False)
+                        or timeout_hit
+                        or _stage1_timeout_flag_from_message(
+                            analysis.get("stage1_error_message", ""),
+                            analysis.get("fetch_error_detail", ""),
+                        )
+                    )
                     fallback_taken = ""
                     if (
                         str(analysis.get("fetch_status", "")).strip().lower() == "failed"
@@ -4490,6 +5602,8 @@ async def _analyze_stage1_http_candidates(
                         progress_metrics["head_only"] += 1
                     elif fetch_status in {"fetched", "fetched_visual_missing"}:
                         progress_metrics["fetched"] += 1
+                    if bool(analysis.get("stage1_timeout_hit", False)):
+                        progress_metrics["timeout"] += 1
                     if fallback_taken:
                         progress_metrics["fallback_dns"] += 1
                     results[normalized_url] = analysis
@@ -4556,27 +5670,27 @@ async def _analyze_stage1_http_candidates(
             warn_after_seconds=run_context.watchdog_warning_seconds if run_context is not None else 60,
             stall_after_seconds=run_context.stall_threshold_seconds if run_context is not None else 180,
             queue_size_getter=queue.qsize,
-            active_summary_getter=lambda: {"workers": url_concurrency, "results": len(results)},
+            active_summary_getter=lambda: {
+                "workers": url_concurrency,
+                "results": len(results),
+                "active_workers": dict(active_workers),
+                "fetch_limit": fetch_limiter.limit,
+                "telemetry": dict(telemetry),
+            },
             logger_instance=_clip_logger,
         )
         workers = [asyncio.create_task(_worker(index)) for index in range(url_concurrency)]
         watchdog.start()
         try:
-            join_timeout = max(
-                run_context.stall_threshold_seconds if run_context is not None else 180,
-                30,
-            )
-            await asyncio.wait_for(queue.join(), timeout=join_timeout)
+            await queue.join()
             await asyncio.gather(*workers)
-        except asyncio.TimeoutError as exc:
-            for worker in workers:
-                worker.cancel()
-            await asyncio.gather(*workers, return_exceptions=True)
-            raise RuntimeError("Stage1 cheap HTTP worker pool stalled before draining the queue") from exc
         finally:
             if monitor_task is not None:
                 monitor_task.cancel()
                 await asyncio.gather(monitor_task, return_exceptions=True)
+            if ramp_task is not None:
+                ramp_task.cancel()
+                await asyncio.gather(ramp_task, return_exceptions=True)
             if progress_bar is not None:
                 completed = progress.completed
                 if completed > progress_bar.n:
@@ -4585,6 +5699,7 @@ async def _analyze_stage1_http_candidates(
                     {
                         "act": len(active_workers),
                         "q": queue.qsize(),
+                        "limit": fetch_limiter.limit,
                         "esc": progress_metrics["escalated"],
                         "fail": progress_metrics["failed"],
                         "dnsfb": progress_metrics["fallback_dns"],
@@ -4593,6 +5708,19 @@ async def _analyze_stage1_http_candidates(
                 )
                 progress_bar.close()
             await watchdog.stop()
+
+    elapsed_s = max(0.001, time.perf_counter() - stage1_started_monotonic)
+    _clip_logger.info(
+        "Stage1 cheap HTTP completed | processed=%d/%d | rate=%.1f url/s | elapsed=%.1fs | escalated=%d | failed=%d | fallback_dns=%d | final_fetch_limit=%d",
+        progress.completed,
+        len(urls),
+        progress.completed / elapsed_s,
+        elapsed_s,
+        progress_metrics["escalated"],
+        progress_metrics["failed"],
+        progress_metrics["fallback_dns"],
+        fetch_limiter.limit,
+    )
 
     return results
 
@@ -4677,6 +5805,9 @@ async def run_hashing_shortlist_streaming(
     metrics = {
         "passed_dns_gate": 0,
         "processed": 0,
+        "render_completed": 0,
+        "aux_completed": 0,
+        "finalized": 0,
         "hashed_success": 0,
         "fetch_failed": 0,
         "fetch_timed_out": 0,
@@ -4686,8 +5817,17 @@ async def run_hashing_shortlist_streaming(
         "gpu_items_scored": 0,
         "avg_gpu_batch_size": 0.0,
         "gpu_queue_depth": 0,
+        "render_queue_depth": 0,
+        "aux_queue_depth": 0,
         "stage_elapsed_s": 0.0,
         "active_fetch_limit": ACTIVE_FETCH_LIMIT_INITIAL,
+        "worker_nodes_alive": 0,
+        "node_restarts": 0,
+        "fd_count": 0,
+        "fd_limit": 0,
+        "fd_usage_ratio": 0.0,
+        "ram_usage_ratio": 0.0,
+        "limiting_lane": "render",
     }
     decision_rows = []
     prefetch_metrics_map = {}
@@ -4701,6 +5841,152 @@ async def run_hashing_shortlist_streaming(
     stage0_processed = 0
     stage0_started_monotonic = time.perf_counter()
     last_stage0_log_monotonic = stage0_started_monotonic
+    stage1_dns_eligible_miss_urls = []
+
+    from .dns_gate import (
+        DEFAULT_AUDIT_PATH as DEFAULT_DNS_AUDIT_PATH,
+        DEFAULT_DNS_TIMEOUT,
+        DEFAULT_DNS_RETRIES,
+        _resolve_dns_worker_count,
+        _gate_urls_for_hashing_async,
+        write_dns_gate_audit,
+    )
+    if dns_timeout is None:
+        dns_timeout_effective = float(DEFAULT_DNS_TIMEOUT)
+    else:
+        if not isinstance(dns_timeout, numbers.Real):
+            raise ValueError("dns_timeout must be numeric")
+        dns_timeout_effective = float(dns_timeout)
+        if dns_timeout_effective <= 0:
+            raise ValueError("dns_timeout must be > 0")
+
+    if dns_retries is None:
+        dns_retries_effective = int(DEFAULT_DNS_RETRIES)
+    else:
+        if not isinstance(dns_retries, numbers.Real):
+            raise ValueError("dns_retries must be numeric")
+        dns_retries_effective = int(dns_retries)
+        if dns_retries_effective < 0:
+            raise ValueError("dns_retries must be >= 0")
+
+    if dns_max_workers is None:
+        dns_max_workers_effective = None
+    else:
+        if not isinstance(dns_max_workers, numbers.Real):
+            raise ValueError("dns_max_workers must be numeric")
+        dns_max_workers_effective = int(dns_max_workers)
+        if dns_max_workers_effective <= 0:
+            raise ValueError("dns_max_workers must be > 0")
+
+    _clip_logger.info(
+        "Hashing shortlist (streaming) started | urls=%d | threshold=%s | "
+        "domain_similarity_threshold=%.3f | high_confidence_threshold=%.2f | "
+        "medium_confidence_threshold=%.2f | typo_top_k=%d | typo_min_score=%.3f | "
+        "lexical_pass_min_score=%.3f | clip_margin_min=%.3f | dns_timeout=%.2f | dns_retries=%d | dns_max_workers=%s",
+        original_count,
+        threshold,
+        scoring_config["domain_similarity_threshold"],
+        scoring_config["high_confidence_threshold"],
+        scoring_config["medium_confidence_threshold"],
+        scoring_config["typo_top_k"],
+        scoring_config["typo_min_score"],
+        scoring_config["lexical_pass_min_score"],
+        scoring_config["clip_margin_min"],
+        dns_timeout_effective,
+        dns_retries_effective,
+        dns_max_workers_effective if dns_max_workers_effective is not None else "adaptive",
+    )
+    _clip_logger.info(
+        "Scoring weights | %s",
+        _format_weights_for_logging(resolved_weights),
+    )
+    effective_dns_workers = _resolve_dns_worker_count(original_count, dns_max_workers_effective)
+    _clip_logger.info(
+        "Hash stage topology | dns_workers=%d | worker_nodes={start=%d,max=%d} | pages_per_node=%d | "
+        "active_pages={start=%d,max=%d,floor=%d} | queues={render=%d,result=%d} | "
+        "aux={workers=%d,http=%d,ssl=%d} | nav_timeout_ms=%d | screenshot_timeout_ms=%d | "
+        "fetch_timeout_s=%.1f | gpu_batch=%d | per_host_limit=%d | adaptive_downshift_enabled=%s",
+        effective_dns_workers,
+        HASH_WORKER_NODES_START,
+        HASH_WORKER_NODES_MAX,
+        HASH_PAGES_PER_NODE,
+        ACTIVE_FETCH_LIMIT_INITIAL,
+        ACTIVE_FETCH_LIMIT_MAX,
+        ACTIVE_FETCH_LIMIT_FLOOR,
+        HASH_RENDER_QUEUE_MAX,
+        HASH_RESULT_QUEUE_MAX,
+        AUX_NET_CONCURRENCY_LIMIT,
+        HASH_AUX_HTTP_LIMIT,
+        HASH_AUX_SSL_LIMIT,
+        SCRAPER_NAV_TIMEOUT_MS,
+        SCRAPER_SCREENSHOT_TIMEOUT_MS,
+        SCRAPER_FETCH_TIMEOUT_S,
+        GPU_MAX_BATCH_SIZE,
+        HASH_PER_HOST_LIMIT,
+        ADAPTIVE_FETCH_DOWNSHIFT_ENABLED,
+    )
+    _clip_logger.info(
+        "Stage1 note | OCR/Screenshots/ImgProc/RDAP/WHOIS limits from phishing_pipeline.utils are not the active hashing-stage browser worker counts."
+    )
+    _clip_logger.info(
+        "Stage1 runtime thresholds | escalate_total=%d | brand_min=%d | credential_min=%d | low_band_min=%d | hard_trigger_brand_min=%d | passthroughs={stage1_suspected=%s,dns_rejected_strict_lexical=%s,fetch_failed_strict_lexical=%s}",
+        int(stage1_http_config.get("escalate_total_threshold", 0) or 0),
+        int(stage1_http_config.get("brand_min", 0) or 0),
+        int(stage1_http_config.get("credential_min", 0) or 0),
+        int(stage1_http_config.get("low_band_min", 0) or 0),
+        int(stage1_http_config.get("hard_trigger_brand_min", 0) or 0),
+        scoring_config["keep_stage1_suspected"],
+        scoring_config["keep_dns_rejected_strict_lexical"],
+        scoring_config["keep_fetch_failed_strict_lexical"],
+    )
+
+    dns_accepted_urls, audit_rows = await _gate_urls_for_hashing_async(
+        input_urls,
+        timeout=dns_timeout_effective,
+        max_workers=dns_max_workers_effective,
+        retries=dns_retries_effective,
+        source_workbook_map=source_workbook_map,
+        run_context=run_context,
+        checkpoint_store=checkpoint_store,
+        audit_output_path=DEFAULT_DNS_AUDIT_PATH,
+    )
+    for audit_row in audit_rows:
+        normalized_target = normalize_url(str(audit_row.get("target_url", "")).strip())
+        audit_row["source_workbook"] = source_workbook_map.get(normalized_target, "")
+    write_dns_gate_audit(audit_rows)
+    dns_accepted_normalized_urls = {
+        normalize_url(url)
+        for url in dns_accepted_urls
+        if normalize_url(url)
+    }
+    stage1_dns_prefetch_map = _build_stage1_dns_prefetch_map(audit_rows)
+    metrics["passed_dns_gate"] = len(dns_accepted_urls)
+    dns_status_counts = Counter(
+        str(row.get("dns_status", "")).strip()
+        for row in audit_rows
+    )
+    retry_success_count = sum(1 for row in audit_rows if row.get("retry_success"))
+    _clip_logger.info(
+        "DNS gate kept %d/%d input URLs before lexical/stage1 at %.1fs timeout (retries=%d, retry_success=%d) | "
+        "resolved=%d timeout=%d resolver_error=%d no_records=%d dns_error=%d",
+        len(dns_accepted_urls),
+        original_count,
+        dns_timeout_effective,
+        dns_retries_effective,
+        retry_success_count,
+        dns_status_counts.get("resolved", 0),
+        dns_status_counts.get("timeout", 0),
+        dns_status_counts.get("resolver_error", 0),
+        dns_status_counts.get("no_records", 0),
+        dns_status_counts.get("dns_error", 0),
+    )
+    print(
+        f"DNS gate kept {len(dns_accepted_urls)}/{original_count} input URLs "
+        f"(timeout={dns_timeout_effective:.1f}s, retries={dns_retries_effective})"
+    )
+    _clip_logger.info("Hashing log file: %s", log_path)
+    print(f"Hashing log: {log_path}")
+
     try:
         from tqdm import tqdm as tqdm_sync
 
@@ -4717,6 +6003,7 @@ async def run_hashing_shortlist_streaming(
     for raw_url in input_urls:
         normalized_url = normalize_url(raw_url)
         source_workbook = source_workbook_map.get(normalized_url, "")
+        dns_gate_accepted = bool(normalized_url and normalized_url in dns_accepted_normalized_urls)
         if checkpoint_store is not None and run_context is not None and normalized_url:
             if make_record_key(normalized_url, source_workbook) in completed_record_keys:
                 stage0_skipped += 1
@@ -4730,9 +6017,10 @@ async def run_hashing_shortlist_streaming(
         prefetch_metrics = prefetch_metrics_map.get(normalized_url, {})
         prefetch_metrics["source_workbook"] = source_workbook_map.get(normalized_url, prefetch_metrics.get("source_workbook", ""))
         if _passes_lexical_gate(prefetch_metrics):
-            lexical_candidate_urls.append(raw_url)
             stage0_hits += 1
             stage1_analysis_map[normalized_url] = _build_lexical_stage1_state(prefetch_metrics)
+            if dns_gate_accepted:
+                lexical_candidate_urls.append(raw_url)
             _upsert_shortlist_checkpoint(
                 run_context=run_context,
                 checkpoint_store=checkpoint_store,
@@ -4746,6 +6034,8 @@ async def run_hashing_shortlist_streaming(
         else:
             lexical_miss_urls.append(raw_url)
             stage0_misses += 1
+            if dns_gate_accepted:
+                stage1_dns_eligible_miss_urls.append(raw_url)
             _upsert_shortlist_checkpoint(
                 run_context=run_context,
                 checkpoint_store=checkpoint_store,
@@ -4810,15 +6100,16 @@ async def run_hashing_shortlist_streaming(
                 skipped_count,
             )
 
-    if lexical_miss_urls:
+    if stage1_dns_eligible_miss_urls:
         analyzed_lexical_misses = await _analyze_stage1_http_candidates(
-            lexical_miss_urls,
+            stage1_dns_eligible_miss_urls,
             stage1_http_config=stage1_http_config,
             run_context=run_context,
             checkpoint_store=checkpoint_store,
             source_workbook_map=source_workbook_map,
+            dns_prefetch_map=stage1_dns_prefetch_map,
         )
-        for raw_url in lexical_miss_urls:
+        for raw_url in stage1_dns_eligible_miss_urls:
             normalized_url = normalize_url(raw_url)
             analysis = dict(analyzed_lexical_misses.get(normalized_url, {}) or {})
             stage1_analysis_map[normalized_url] = {
@@ -4836,526 +6127,40 @@ async def run_hashing_shortlist_streaming(
 
     rdap_metrics = get_rdap_metrics_snapshot()
 
-    try:
-        from .dns_gate import (
-            DEFAULT_AUDIT_PATH as DEFAULT_DNS_AUDIT_PATH,
-            DEFAULT_DNS_TIMEOUT,
-            DEFAULT_DNS_RETRIES,
-            _resolve_dns_worker_count,
-            _gate_urls_for_hashing_async,
-            write_dns_gate_audit,
-        )
-        if dns_timeout is None:
-            dns_timeout_effective = float(DEFAULT_DNS_TIMEOUT)
-        else:
-            if not isinstance(dns_timeout, numbers.Real):
-                raise ValueError("dns_timeout must be numeric")
-            dns_timeout_effective = float(dns_timeout)
-            if dns_timeout_effective <= 0:
-                raise ValueError("dns_timeout must be > 0")
+    _clip_logger.info(
+        "Stage1 routing kept %d/%d DNS-accepted URLs before hashing | dns_accepted=%d | lexical_hits=%d | lexical_misses=%d | stage1_http_eligible=%d | non_escalated=%d",
+        len(lexical_candidate_urls),
+        max(len(dns_accepted_urls), 1),
+        len(dns_accepted_urls),
+        stage0_hits,
+        stage0_misses,
+        len(stage1_dns_eligible_miss_urls),
+        sum(
+            1
+            for normalized_url, row in stage1_analysis_map.items()
+            if normalized_url in dns_accepted_normalized_urls and not bool(row.get("escalate_to_hashing", False))
+        ),
+    )
+    _clip_logger.info(
+        "Stage1 RDAP summary | success=%d | 429=%d | retry_success=%d | retry_exhausted=%d | exception=%d | cache_hit=%d | inflight_wait=%d | cooldown_hit=%d",
+        int(rdap_metrics.get("success", 0) or 0),
+        int(rdap_metrics.get("429", 0) or 0),
+        int(rdap_metrics.get("retry_success", 0) or 0),
+        int(rdap_metrics.get("retry_exhausted", 0) or 0),
+        int(rdap_metrics.get("exception", 0) or 0),
+        int(rdap_metrics.get("cache_hit", 0) or 0),
+        int(rdap_metrics.get("inflight_wait", 0) or 0),
+        int(rdap_metrics.get("cooldown_hit", 0) or 0),
+    )
+    print(
+        f"Stage1 routing kept {len(lexical_candidate_urls)}/{len(dns_accepted_urls)} DNS-accepted URLs"
+    )
 
-        if dns_retries is None:
-            dns_retries_effective = int(DEFAULT_DNS_RETRIES)
-        else:
-            if not isinstance(dns_retries, numbers.Real):
-                raise ValueError("dns_retries must be numeric")
-            dns_retries_effective = int(dns_retries)
-            if dns_retries_effective < 0:
-                raise ValueError("dns_retries must be >= 0")
-
-        if dns_max_workers is None:
-            dns_max_workers_effective = None
-        else:
-            if not isinstance(dns_max_workers, numbers.Real):
-                raise ValueError("dns_max_workers must be numeric")
-            dns_max_workers_effective = int(dns_max_workers)
-            if dns_max_workers_effective <= 0:
-                raise ValueError("dns_max_workers must be > 0")
-
-        _clip_logger.info(
-            "Hashing shortlist (streaming) started | urls=%d | threshold=%s | "
-            "domain_similarity_threshold=%.3f | high_confidence_threshold=%.2f | "
-            "medium_confidence_threshold=%.2f | typo_top_k=%d | typo_min_score=%.3f | "
-            "lexical_pass_min_score=%.3f | clip_margin_min=%.3f | dns_timeout=%.2f | dns_retries=%d | dns_max_workers=%s",
-            original_count,
-            threshold,
-            scoring_config["domain_similarity_threshold"],
-            scoring_config["high_confidence_threshold"],
-            scoring_config["medium_confidence_threshold"],
-            scoring_config["typo_top_k"],
-            scoring_config["typo_min_score"],
-            scoring_config["lexical_pass_min_score"],
-            scoring_config["clip_margin_min"],
-            dns_timeout_effective,
-            dns_retries_effective,
-            dns_max_workers_effective if dns_max_workers_effective is not None else "adaptive",
-        )
-        _clip_logger.info(
-            "Scoring weights | %s",
-            _format_weights_for_logging(resolved_weights),
-        )
-        effective_dns_workers = _resolve_dns_worker_count(original_count, dns_max_workers_effective)
-        _clip_logger.info(
-            "Stage1 hashing parallelism | dns_workers=%d | total_pages=%d | page_workers_per_shard=%d | "
-            "shards=%d | http_limit=%d | nav_timeout_ms=%d | screenshot_timeout_ms=%d | "
-            "fetch_timeout_s=%.1f | gpu_queue=%d | gpu_batch=%d | active_fetch_limit=%d | "
-            "active_fetch_floor=%d | aux_net_limit=%d | adaptive_downshift_enabled=%s",
-            effective_dns_workers,
-            MAX_CONCURRENT_PAGES,
-            SCRAPER_PAGE_CONCURRENCY,
-            BROWSER_SHARDS,
-            _AIOHTTP_CONNECTOR_LIMIT,
-            SCRAPER_NAV_TIMEOUT_MS,
-            SCRAPER_SCREENSHOT_TIMEOUT_MS,
-            SCRAPER_FETCH_TIMEOUT_S,
-            GPU_QUEUE_MAXSIZE,
-            GPU_MAX_BATCH_SIZE,
-            ACTIVE_FETCH_LIMIT_INITIAL,
-            ACTIVE_FETCH_LIMIT_FLOOR,
-            AUX_NET_CONCURRENCY_LIMIT,
-            ADAPTIVE_FETCH_DOWNSHIFT_ENABLED,
-        )
-        _clip_logger.info(
-            "Stage1 note | OCR/Screenshots/ImgProc/RDAP/WHOIS limits from phishing_pipeline.utils are not the active hashing-stage browser worker counts."
-        )
-        _clip_logger.info(
-            "Stage1 runtime thresholds | escalate_total=%d | brand_min=%d | credential_min=%d | low_band_min=%d | hard_trigger_brand_min=%d | passthroughs={stage1_suspected=%s,dns_rejected_strict_lexical=%s,fetch_failed_strict_lexical=%s}",
-            int(stage1_http_config.get("escalate_total_threshold", 0) or 0),
-            int(stage1_http_config.get("brand_min", 0) or 0),
-            int(stage1_http_config.get("credential_min", 0) or 0),
-            int(stage1_http_config.get("low_band_min", 0) or 0),
-            int(stage1_http_config.get("hard_trigger_brand_min", 0) or 0),
-            scoring_config["keep_stage1_suspected"],
-            scoring_config["keep_dns_rejected_strict_lexical"],
-            scoring_config["keep_fetch_failed_strict_lexical"],
-        )
-
-        _clip_logger.info(
-            "Stage1 routing kept %d/%d URLs before DNS | lexical_hits=%d | lexical_misses=%d | non_escalated=%d",
-            len(lexical_candidate_urls),
-            original_count,
-            len(input_urls) - len(lexical_miss_urls),
-            len(lexical_miss_urls),
-            sum(
-                1
-                for row in stage1_analysis_map.values()
-                if not bool(row.get("escalate_to_hashing", False))
-            ),
-        )
-        _clip_logger.info(
-            "Stage1 RDAP summary | success=%d | 429=%d | retry_success=%d | retry_exhausted=%d | exception=%d | cache_hit=%d | inflight_wait=%d | cooldown_hit=%d",
-            int(rdap_metrics.get("success", 0) or 0),
-            int(rdap_metrics.get("429", 0) or 0),
-            int(rdap_metrics.get("retry_success", 0) or 0),
-            int(rdap_metrics.get("retry_exhausted", 0) or 0),
-            int(rdap_metrics.get("exception", 0) or 0),
-            int(rdap_metrics.get("cache_hit", 0) or 0),
-            int(rdap_metrics.get("inflight_wait", 0) or 0),
-            int(rdap_metrics.get("cooldown_hit", 0) or 0),
-        )
-        print(
-            f"Stage1 routing kept {len(lexical_candidate_urls)}/{original_count} URLs"
-        )
-
-        if not lexical_candidate_urls:
-            stage1_rows = _build_stage1_debug_rows(
-                input_urls,
-                audit_rows=[],
-                decision_rows=[],
-                prefetch_metrics_map=prefetch_metrics_map,
-                lexical_reject_urls=lexical_reject_urls,
-                stage1_analysis_map=stage1_analysis_map,
-                scoring_config=scoring_config,
-                source_workbook_map=source_workbook_map,
-            )
-            methods_path, deep_analysis_path = _write_stage1_method_artifacts(stage1_rows)
-            passthrough_rows = [
-                row
-                for row in (
-                    _build_stage1_passthrough_holdout_row(stage1_row, scoring_config)
-                    for stage1_row in stage1_rows
-                )
-                if row
-            ]
-            stage1_review_rows = _build_stage1_review_queue_rows(stage1_rows, scoring_config=scoring_config)
-            os.makedirs(os.path.dirname(STAGE1_REVIEW_QUEUE_PATH), exist_ok=True)
-            pd.DataFrame(stage1_review_rows).to_csv(STAGE1_REVIEW_QUEUE_PATH, index=False, encoding="utf-8")
-            if shortlist_debug_csv:
-                debug_path = _write_stage1_debug_csv(stage1_rows, output_path=shortlist_debug_csv)
-                _clip_logger.info("Stage1 debug CSV written to %s with %d rows", debug_path, len(stage1_rows))
-            excluded_rows = _build_excluded_url_rows(stage1_rows)
-            excluded_path = _write_excluded_urls_audit(excluded_rows)
-            _write_stage1_subset_csv(
-                stage1_rows,
-                DNS_REJECTED_LEXICAL_HITS_PATH,
-                lambda row: row.get("reason") == "dns_rejected" and bool(row.get("strict_lexical_hit")),
-            )
-            _write_stage1_subset_csv(
-                stage1_rows,
-                FETCH_FAILED_LEXICAL_HITS_PATH,
-                lambda row: str(row.get("fetch_status", "")).strip().lower() in {"failed", "timeout"} and bool(row.get("strict_lexical_hit")),
-            )
-            _write_stage1_subset_csv(
-                stage1_rows,
-                PARKED_PAGE_EXCLUSIONS_PATH,
-                lambda row: row.get("reason") == "parking_or_placeholder_excluded",
-            )
-            _clip_logger.info(
-                "Excluded URL audit written to %s with %d rows",
-                excluded_path,
-                len(excluded_rows),
-            )
-            _clip_logger.info(
-                "Stage1 review queue written to %s with %d rows",
-                STAGE1_REVIEW_QUEUE_PATH,
-                len(stage1_review_rows),
-            )
-            print(f"Excluded URLs: {excluded_path} ({len(excluded_rows)} rows)")
-            print(f"Stage1 methods: {methods_path}")
-            print(f"Stage1 deep-analysis candidates: {deep_analysis_path}")
-            _clip_logger.info("No URLs escalated past Stage1 routing; skipping hashing.")
-            if not passthrough_rows:
-                return _empty_shortlist_df()
-            return pd.DataFrame(passthrough_rows)
-
-        shortlisted_urls, audit_rows = await _gate_urls_for_hashing_async(
-            lexical_candidate_urls,
-            timeout=dns_timeout_effective,
-            max_workers=dns_max_workers_effective,
-            retries=dns_retries_effective,
-            source_workbook_map=source_workbook_map,
-            run_context=run_context,
-            checkpoint_store=checkpoint_store,
-            audit_output_path=DEFAULT_DNS_AUDIT_PATH,
-        )
-        for audit_row in audit_rows:
-            normalized_target = normalize_url(str(audit_row.get("target_url", "")).strip())
-            audit_row["source_workbook"] = source_workbook_map.get(normalized_target, "")
-        write_dns_gate_audit(audit_rows)
-        accepted_count = len(shortlisted_urls)
-        metrics["passed_dns_gate"] = accepted_count
-        dns_status_counts = Counter(
-            str(row.get("dns_status", "")).strip()
-            for row in audit_rows
-        )
-        retry_success_count = sum(1 for row in audit_rows if row.get("retry_success"))
-        _clip_logger.info(
-            "DNS gate kept %d/%d Stage1 escalations at %.1fs timeout (retries=%d, retry_success=%d) | "
-            "resolved=%d timeout=%d resolver_error=%d no_records=%d dns_error=%d",
-            accepted_count,
-            len(lexical_candidate_urls),
-            dns_timeout_effective,
-            dns_retries_effective,
-            retry_success_count,
-            dns_status_counts.get("resolved", 0),
-            dns_status_counts.get("timeout", 0),
-            dns_status_counts.get("resolver_error", 0),
-            dns_status_counts.get("no_records", 0),
-            dns_status_counts.get("dns_error", 0),
-        )
-        print(
-            f"DNS gate kept {accepted_count}/{len(lexical_candidate_urls)} Stage1 escalations "
-            f"(timeout={dns_timeout_effective:.1f}s, retries={dns_retries_effective})"
-        )
-        _clip_logger.info("Hashing log file: %s", log_path)
-        print(f"Hashing log: {log_path}")
-
-        if not shortlisted_urls:
-            stage1_rows = _build_stage1_debug_rows(
-                input_urls,
-                audit_rows,
-                decision_rows=[],
-                prefetch_metrics_map=prefetch_metrics_map,
-                lexical_reject_urls=lexical_reject_urls,
-                stage1_analysis_map=stage1_analysis_map,
-                scoring_config=scoring_config,
-                source_workbook_map=source_workbook_map,
-            )
-            methods_path, deep_analysis_path = _write_stage1_method_artifacts(stage1_rows)
-            passthrough_rows = [
-                row
-                for row in (
-                    _build_stage1_passthrough_holdout_row(stage1_row, scoring_config)
-                    for stage1_row in stage1_rows
-                )
-                if row
-            ]
-            stage1_review_rows = _build_stage1_review_queue_rows(stage1_rows, scoring_config=scoring_config)
-            os.makedirs(os.path.dirname(STAGE1_REVIEW_QUEUE_PATH), exist_ok=True)
-            pd.DataFrame(stage1_review_rows).to_csv(STAGE1_REVIEW_QUEUE_PATH, index=False, encoding="utf-8")
-            if shortlist_debug_csv:
-                debug_path = _write_stage1_debug_csv(stage1_rows, output_path=shortlist_debug_csv)
-                _clip_logger.info("Stage1 debug CSV written to %s with %d rows", debug_path, len(stage1_rows))
-            excluded_rows = _build_excluded_url_rows(stage1_rows)
-            excluded_path = _write_excluded_urls_audit(excluded_rows)
-            _write_stage1_subset_csv(
-                stage1_rows,
-                DNS_REJECTED_LEXICAL_HITS_PATH,
-                lambda row: row.get("reason") == "dns_rejected" and bool(row.get("strict_lexical_hit")),
-            )
-            _write_stage1_subset_csv(
-                stage1_rows,
-                FETCH_FAILED_LEXICAL_HITS_PATH,
-                lambda row: str(row.get("fetch_status", "")).strip().lower() in {"failed", "timeout"} and bool(row.get("strict_lexical_hit")),
-            )
-            _write_stage1_subset_csv(
-                stage1_rows,
-                PARKED_PAGE_EXCLUSIONS_PATH,
-                lambda row: row.get("reason") == "parking_or_placeholder_excluded",
-            )
-            _clip_logger.info(
-                "Excluded URL audit written to %s with %d rows",
-                excluded_path,
-                len(excluded_rows),
-            )
-            _clip_logger.info(
-                "Stage1 review queue written to %s with %d rows",
-                STAGE1_REVIEW_QUEUE_PATH,
-                len(stage1_review_rows),
-            )
-            print(f"Excluded URLs: {excluded_path} ({len(excluded_rows)} rows)")
-            print(f"Stage1 methods: {methods_path}")
-            print(f"Stage1 deep-analysis candidates: {deep_analysis_path}")
-            _clip_logger.info("No URLs passed DNS gate; skipping hashing.")
-            _clip_logger.info(
-                "Anchor summary (shortlisted) | typo_anchor=0 | hash_anchor=0 | clip_anchor=0 | shortlisted=0"
-            )
-            _clip_logger.info(
-                "Typo similarity summary (shortlisted) | min=0.0000 | avg=0.0000 | p95=0.0000 | max=0.0000 | typo_min_score=%.4f",
-                scoring_config["typo_min_score"],
-            )
-            print("No URLs passed the DNS gate. Skipping hashing shortlist.")
-            if not passthrough_rows:
-                return _empty_shortlist_df()
-            return pd.DataFrame(passthrough_rows)
-
-        t0 = time.perf_counter()
-        url_queue = asyncio.Queue()
-        gpu_queue = asyncio.Queue(maxsize=GPU_QUEUE_MAXSIZE)
-        active_fetch_limiter = _AdaptiveFetchLimiter(ACTIVE_FETCH_LIMIT_INITIAL)
-        results = []
-        review_results = []
-        prefetch_admitted_failures = []
-        hash_progress = ProgressTracker(total=len(shortlisted_urls))
-        last_progress_log = t0
-        last_window_processed = 0
-        last_window_failed = 0
-        last_window_timed_out = 0
-        consecutive_pressure_windows = 0
-
-        for u in shortlisted_urls:
-            await url_queue.put(u)
-        # Poison pills: one per worker coroutine across all shards
-        for _ in range(BROWSER_SHARDS * SCRAPER_PAGE_CONCURRENCY):
-            await url_queue.put(None)
-
-        connector = aiohttp.TCPConnector(
-            limit=_AIOHTTP_CONNECTOR_LIMIT, ttl_dns_cache=300
-        ) if _has_aiohttp else None
-        aio_session = aiohttp.ClientSession(
-            connector=connector
-        ) if _has_aiohttp else None
-
-        try:
-            from tqdm import tqdm
-            progress_bar = tqdm(
-                total=len(shortlisted_urls),
-                desc="Hashing shortlist",
-                unit="url",
-                leave=True,
-            )
-        except ImportError:
-            progress_bar = None
-
-        try:
-            # Install asyncio exception logging
-            loop = asyncio.get_running_loop()
-            _install_asyncio_exception_logging(loop)
-
-            shard_tasks = [
-                asyncio.create_task(
-                    _run_browser_shard(
-                        i,
-                        url_queue,
-                        gpu_queue,
-                        metrics,
-                        decision_rows,
-                        prefetch_metrics_map,
-                        stage1_analysis_map,
-                        prefetch_admitted_failures,
-                        active_fetch_limiter,
-                        aio_session,
-                        scoring_config,
-                    )
-                )
-                for i in range(BROWSER_SHARDS)
-            ]
-            scorer_task = asyncio.create_task(
-                _gpu_microbatch_scorer(
-                    gpu_queue,
-                    results,
-                    review_results,
-                    decision_rows,
-                    metrics,
-                    threshold,
-                    scoring_config,
-                )
-            )
-            hash_watchdog = StageWatchdog(
-                stage_name="hash",
-                progress_tracker=hash_progress,
-                checkpoint_store=checkpoint_store,
-                warn_after_seconds=run_context.watchdog_warning_seconds if run_context is not None else 60,
-                stall_after_seconds=run_context.stall_threshold_seconds if run_context is not None else 180,
-                queue_size_getter=url_queue.qsize,
-                active_summary_getter=lambda: {
-                    "processed": metrics.get("processed", 0),
-                    "gpu_queue_depth": gpu_queue.qsize(),
-                    "active_fetch_limit": active_fetch_limiter.limit,
-                    "shards_done": sum(1 for task in shard_tasks if task.done()),
-                    "shards_total": len(shard_tasks),
-                },
-                logger_instance=_clip_logger,
-            )
-            hash_watchdog.start()
-
-            # Monitor progress while shards are running
-            last_processed = 0
-            while not all(t.done() for t in shard_tasks):
-                await asyncio.sleep(0.5)
-                now = time.perf_counter()
-                current = metrics["processed"]
-                metrics["stage_elapsed_s"] = now - t0
-                metrics["gpu_queue_depth"] = gpu_queue.qsize()
-                metrics["active_fetch_limit"] = active_fetch_limiter.limit
-                if progress_bar and current > last_processed:
-                    progress_bar.update(current - last_processed)
-                    progress_bar.set_postfix(
-                        _build_progress_postfix(metrics), refresh=False
-                    )
-                    last_processed = current
-                    for _ in range(current - hash_progress.completed):
-                        hash_progress.mark_completed(final_status="hash_processed")
-                if (
-                    run_context is not None
-                    and hash_progress.seconds_since_progress() >= run_context.stall_threshold_seconds
-                ):
-                    for task in shard_tasks:
-                        task.cancel()
-                    scorer_task.cancel()
-                    await asyncio.gather(*shard_tasks, return_exceptions=True)
-                    await asyncio.gather(scorer_task, return_exceptions=True)
-                    raise RuntimeError(
-                        f"Hashing browser shard pool stalled for >= {run_context.stall_threshold_seconds}s without progress"
-                    )
-                if now - last_progress_log >= 15.0:
-                    window_processed = current - last_window_processed
-                    window_failed = metrics["fetch_failed"] - last_window_failed
-                    window_timed_out = metrics["fetch_timed_out"] - last_window_timed_out
-                    if ADAPTIVE_FETCH_DOWNSHIFT_ENABLED:
-                        downshift = _compute_stage1_downshift(
-                            current_limit=active_fetch_limiter.limit,
-                            floor_limit=ACTIVE_FETCH_LIMIT_FLOOR,
-                            step=ACTIVE_FETCH_DOWNSHIFT_STEP,
-                            processed_total=current,
-                            window_processed=window_processed,
-                            window_failed=window_failed,
-                            window_timed_out=window_timed_out,
-                            gpu_queue_depth=metrics["gpu_queue_depth"],
-                            gpu_backlog_threshold=GPU_QUEUE_BACKLOG_THRESHOLD,
-                            consecutive_pressure_windows=consecutive_pressure_windows,
-                        )
-                        consecutive_pressure_windows = downshift["next_consecutive_pressure_windows"]
-                        if downshift["should_downshift"] and downshift["next_limit"] < active_fetch_limiter.limit:
-                            previous_limit = active_fetch_limiter.limit
-                            await active_fetch_limiter.set_limit(downshift["next_limit"])
-                            metrics["active_fetch_limit"] = active_fetch_limiter.limit
-                            _clip_logger.info(
-                                "Stage1 adaptive downshift | active_fetch_limit %d -> %d | timeout_ratio=%.3f | success_ratio=%.3f",
-                                previous_limit,
-                                active_fetch_limiter.limit,
-                                downshift["timeout_ratio"],
-                                metrics["hashed_success"] / max(1, current),
-                            )
-                    _log_hashing_periodic_status(metrics, len(shortlisted_urls))
-                    last_window_processed = current
-                    last_window_failed = metrics["fetch_failed"]
-                    last_window_timed_out = metrics["fetch_timed_out"]
-                    last_progress_log = now
-
-            await asyncio.gather(*shard_tasks)
-
-            # Final progress update before GPU flush
-            if progress_bar:
-                current = metrics["processed"]
-                metrics["stage_elapsed_s"] = time.perf_counter() - t0
-                metrics["gpu_queue_depth"] = gpu_queue.qsize()
-                metrics["active_fetch_limit"] = active_fetch_limiter.limit
-                if current > last_processed:
-                    progress_bar.update(current - last_processed)
-                    progress_bar.set_postfix(
-                        _build_progress_postfix(metrics), refresh=False
-                    )
-                    for _ in range(current - hash_progress.completed):
-                        hash_progress.mark_completed(final_status="hash_processed")
-
-            # Signal scorer to flush remaining batch and exit
-            await gpu_queue.put(None)
-            await scorer_task
-            if prefetch_admitted_failures:
-                results.extend(prefetch_admitted_failures)
-
-        finally:
-            try:
-                await hash_watchdog.stop()
-            except Exception:
-                pass
-            if progress_bar:
-                progress_bar.close()
-            if aio_session:
-                await aio_session.close()
-
-        elapsed = time.perf_counter() - t0
-        metrics["stage_elapsed_s"] = elapsed
-        metrics["gpu_queue_depth"] = 0
-        print(
-            f"\nHashing shortlist completed in {elapsed:.1f}s "
-            f"({metrics['processed']} processed, "
-            f"{metrics['final_matches_above_threshold']} matched)"
-        )
-        print(
-            "Hashing metrics: "
-            f"passed_dns_gate={metrics['passed_dns_gate']} "
-            f"processed={metrics['processed']} "
-            f"hashed_success={metrics['hashed_success']} "
-            f"fetch_failed={metrics['fetch_failed']} "
-            f"fetch_timed_out={metrics['fetch_timed_out']} "
-            f"fetch_parked={metrics['fetch_parked']} "
-            f"gpu_batches_flushed={metrics['gpu_batches_flushed']} "
-            f"gpu_items_scored={metrics['gpu_items_scored']} "
-            f"avg_gpu_batch_size={metrics['avg_gpu_batch_size']:.1f} "
-            f"urls_per_sec={metrics['processed'] / max(elapsed, 1e-6):.2f} "
-            f"final_matches={metrics['final_matches_above_threshold']}"
-        )
-        _log_hashing_metrics_summary(
-            metrics,
-            elapsed,
-            threshold,
-            shortlisted_results=results,
-            typo_min_score=scoring_config["typo_min_score"],
-        )
-
-        rows = [_build_shortlist_output_row(match, scoring_config) for match in results]
-        review_rows = []
-        for match in review_results:
-            review_row = _build_shortlist_output_row(match, scoring_config)
-            review_row["review_reason"] = match.get("review_reason", "stage1_review_only")
-            review_rows.append(review_row)
-
+    if not lexical_candidate_urls:
         stage1_rows = _build_stage1_debug_rows(
             input_urls,
             audit_rows,
-            decision_rows=decision_rows,
+            decision_rows=[],
             prefetch_metrics_map=prefetch_metrics_map,
             lexical_reject_urls=lexical_reject_urls,
             stage1_analysis_map=stage1_analysis_map,
@@ -5371,33 +6176,14 @@ async def run_hashing_shortlist_streaming(
             )
             if row
         ]
-        rows.extend(passthrough_rows)
-        review_rows.extend(_build_stage1_review_queue_rows(stage1_rows, scoring_config=scoring_config))
-        review_df = pd.DataFrame(review_rows)
-        if not review_df.empty:
-            dedupe_columns = [
-                column
-                for column in [
-                    "Identified Phishing/Suspected Domain Name",
-                    "Cooresponding CSE",
-                    "Legitimate Domains",
-                    "review_reason",
-                ]
-                if column in review_df.columns
-            ]
-            if dedupe_columns:
-                review_df = review_df.drop_duplicates(subset=dedupe_columns, keep="last")
+        stage1_review_rows = _build_stage1_review_queue_rows(stage1_rows, scoring_config=scoring_config)
         os.makedirs(os.path.dirname(STAGE1_REVIEW_QUEUE_PATH), exist_ok=True)
-        review_df.to_csv(STAGE1_REVIEW_QUEUE_PATH, index=False, encoding="utf-8")
-        _clip_logger.info(
-            "Stage1 review queue written to %s with %d rows",
-            STAGE1_REVIEW_QUEUE_PATH,
-            len(review_df),
-        )
+        pd.DataFrame(stage1_review_rows).to_csv(STAGE1_REVIEW_QUEUE_PATH, index=False, encoding="utf-8")
         if shortlist_debug_csv:
             debug_path = _write_stage1_debug_csv(stage1_rows, output_path=shortlist_debug_csv)
             _clip_logger.info("Stage1 debug CSV written to %s with %d rows", debug_path, len(stage1_rows))
-            print(f"Stage1 debug: {debug_path} ({len(stage1_rows)} rows)")
+        excluded_rows = _build_excluded_url_rows(stage1_rows)
+        excluded_path = _write_excluded_urls_audit(excluded_rows)
         _write_stage1_subset_csv(
             stage1_rows,
             DNS_REJECTED_LEXICAL_HITS_PATH,
@@ -5413,81 +6199,487 @@ async def run_hashing_shortlist_streaming(
             PARKED_PAGE_EXCLUSIONS_PATH,
             lambda row: row.get("reason") == "parking_or_placeholder_excluded",
         )
-        excluded_rows = _build_excluded_url_rows(stage1_rows)
-        excluded_path = _write_excluded_urls_audit(excluded_rows)
         _clip_logger.info(
             "Excluded URL audit written to %s with %d rows",
             excluded_path,
             len(excluded_rows),
         )
-        if checkpoint_store is not None and run_context is not None:
-            for stage1_row in stage1_rows:
-                raw_url = str(stage1_row.get("input_url", "") or "")
-                normalized_url = str(stage1_row.get("normalized_url", "") or "")
-                source_workbook = str(stage1_row.get("source_workbook", "") or "")
-                final_status = None
-                failure_reason = ""
-                hash_status = "pending"
-                if bool(stage1_row.get("admitted")) or str(stage1_row.get("survival_path", "") or "").strip():
-                    final_status = "holdout_ready"
-                    hash_status = "admitted"
-                elif str(stage1_row.get("reason", "") or "").strip() == "dns_rejected":
-                    final_status = "dns_rejected"
-                    hash_status = "dns_rejected"
-                    failure_reason = "dns_rejected"
-                elif str(stage1_row.get("reason", "") or "").strip() == "parking_or_placeholder_excluded":
-                    final_status = "parked_or_placeholder"
-                    hash_status = "parked_or_placeholder"
-                    failure_reason = "parking_or_placeholder_excluded"
-                elif bool(stage1_row.get("kept_for_review_only")):
-                    final_status = "review_only"
-                    hash_status = "review_only"
-                    failure_reason = str(stage1_row.get("review_only_reason", "") or "stage1_review_only")
-                elif str(stage1_row.get("fetch_status", "")).strip().lower() in {"failed", "timeout"}:
-                    final_status = "hash_failed"
-                    hash_status = "fetch_failed"
-                    failure_reason = str(stage1_row.get("reason", "") or "fetch_timeout_or_fetch_failed")
-                elif str(stage1_row.get("exclusion_stage", "")).strip() in {"stage1_http", "lexical_gate"}:
-                    final_status = "filtered_lexical_miss"
-                    hash_status = "filtered"
-                    failure_reason = str(stage1_row.get("reason", "") or "filtered_lexical_miss")
-                _upsert_shortlist_checkpoint(
-                    run_context=run_context,
-                    checkpoint_store=checkpoint_store,
-                    raw_url=raw_url,
-                    normalized_url=normalized_url,
-                    source_workbook=source_workbook,
-                    stage_name="hash",
-                    stage_status=hash_status,
-                    current_stage="hash",
-                    final_pipeline_status=final_status,
-                    failure_reason=failure_reason,
-                )
+        _clip_logger.info(
+            "Stage1 review queue written to %s with %d rows",
+            STAGE1_REVIEW_QUEUE_PATH,
+            len(stage1_review_rows),
+        )
         print(f"Excluded URLs: {excluded_path} ({len(excluded_rows)} rows)")
         print(f"Stage1 methods: {methods_path}")
         print(f"Stage1 deep-analysis candidates: {deep_analysis_path}")
-
-        if not rows:
+        _clip_logger.info("No URLs escalated past Stage1 routing after DNS prefilter; skipping hashing.")
+        _close_hashing_log()
+        if not passthrough_rows:
             return _empty_shortlist_df()
-        output_df = pd.DataFrame(rows)
+        return pd.DataFrame(passthrough_rows)
+
+    shortlisted_urls = list(lexical_candidate_urls)
+
+    try:
+        t0 = time.perf_counter()
+        render_queue = asyncio.Queue(maxsize=HASH_RENDER_QUEUE_MAX)
+        aux_queue = asyncio.Queue(maxsize=max(HASH_RESULT_QUEUE_MAX, HASH_AUX_HTTP_LIMIT))
+        gpu_queue = asyncio.Queue(maxsize=GPU_QUEUE_MAXSIZE)
+        active_fetch_limiter = _AdaptiveFetchLimiter(ACTIVE_FETCH_LIMIT_INITIAL)
+        host_limiter = _PerHostLimiter(HASH_PER_HOST_LIMIT)
+        results = []
+        review_results = []
+        prefetch_admitted_failures = []
+        hash_progress = ProgressTracker(total=len(shortlisted_urls))
+        render_active_workers = {}
+        aux_active_workers = {}
+        last_progress_log = t0
+        last_window_processed = 0
+        last_window_failed = 0
+        last_window_timed_out = 0
+        consecutive_pressure_windows = 0
+        consecutive_healthy_windows = 0
+
+        connector = aiohttp.TCPConnector(limit=HASH_AUX_HTTP_LIMIT, ttl_dns_cache=300) if _has_aiohttp else None
+        aio_session = aiohttp.ClientSession(connector=connector) if _has_aiohttp else None
+        aggregate_bar = None
+        render_bar = None
+        aux_bar = None
+        finalize_bar = None
+        hash_watchdog = None
+
+        try:
+            from tqdm import tqdm
+
+            aggregate_bar = tqdm(total=len(shortlisted_urls), desc="Hashing shortlist", unit="url", leave=True, position=0, dynamic_ncols=True)
+            render_bar = tqdm(total=len(shortlisted_urls), desc="Hash render", unit="url", leave=False, position=1, dynamic_ncols=True)
+            aux_bar = tqdm(total=len(shortlisted_urls), desc="Hash aux", unit="url", leave=False, position=2, dynamic_ncols=True)
+            finalize_bar = tqdm(total=len(shortlisted_urls), desc="Hash finalize", unit="url", leave=False, position=3, dynamic_ncols=True)
+        except Exception:
+            pass
+
+        try:
+            loop = asyncio.get_running_loop()
+            _install_asyncio_exception_logging(loop)
+
+            async def _produce_render_inputs():
+                for raw_url in shortlisted_urls:
+                    normalized_url = normalize_url(raw_url)
+                    await render_queue.put(
+                        {
+                            "url": raw_url,
+                            "normalized_url": normalized_url,
+                            "prefetch_metrics": prefetch_metrics_map.get(normalized_url, {}),
+                            "stage1_analysis": stage1_analysis_map.get(normalized_url, {}),
+                        }
+                    )
+                for _ in range(HASH_WORKER_NODES_MAX * HASH_PAGES_PER_NODE):
+                    await render_queue.put(None)
+
+            producer_task = asyncio.create_task(_produce_render_inputs())
+            node_tasks = [
+                asyncio.create_task(
+                    _run_hash_browser_node(
+                        node_id=node_id,
+                        render_queue=render_queue,
+                        aux_queue=aux_queue,
+                        metrics=metrics,
+                        decision_rows=decision_rows,
+                        prefetch_admitted_failures=prefetch_admitted_failures,
+                        prefetch_metrics_map=prefetch_metrics_map,
+                        stage1_analysis_map=stage1_analysis_map,
+                        active_fetch_limiter=active_fetch_limiter,
+                        host_limiter=host_limiter,
+                        hash_progress=hash_progress,
+                        scoring_config=scoring_config,
+                        active_workers=render_active_workers,
+                    )
+                )
+                for node_id in range(HASH_WORKER_NODES_MAX)
+            ]
+            aux_tasks = [
+                asyncio.create_task(
+                    _run_hash_aux_worker(
+                        worker_id=f"aux-{worker_id}",
+                        aux_queue=aux_queue,
+                        gpu_queue=gpu_queue,
+                        metrics=metrics,
+                        decision_rows=decision_rows,
+                        prefetch_admitted_failures=prefetch_admitted_failures,
+                        active_fetch_limiter=active_fetch_limiter,
+                        aio_session=aio_session,
+                        hash_progress=hash_progress,
+                        scoring_config=scoring_config,
+                        active_workers=aux_active_workers,
+                    )
+                )
+                for worker_id in range(AUX_NET_CONCURRENCY_LIMIT)
+            ]
+            scorer_task = asyncio.create_task(
+                _gpu_microbatch_scorer(
+                    gpu_queue,
+                    results,
+                    review_results,
+                    decision_rows,
+                    metrics,
+                    threshold,
+                    scoring_config,
+                    hash_progress,
+                )
+            )
+
+            async def _drain_hash_pipeline():
+                await producer_task
+                await render_queue.join()
+                await asyncio.gather(*node_tasks)
+                for _ in aux_tasks:
+                    await aux_queue.put(None)
+                await aux_queue.join()
+                await asyncio.gather(*aux_tasks)
+                await gpu_queue.put(None)
+                await scorer_task
+
+            pipeline_task = asyncio.create_task(_drain_hash_pipeline())
+            hash_watchdog = StageWatchdog(
+                stage_name="hash",
+                progress_tracker=hash_progress,
+                checkpoint_store=checkpoint_store,
+                warn_after_seconds=run_context.watchdog_warning_seconds if run_context is not None else 60,
+                stall_after_seconds=run_context.stall_threshold_seconds if run_context is not None else 180,
+                queue_size_getter=lambda: render_queue.qsize() + aux_queue.qsize() + gpu_queue.qsize(),
+                active_summary_getter=lambda: {
+                    "processed": metrics.get("processed", 0),
+                    "render_queue_depth": render_queue.qsize(),
+                    "aux_queue_depth": aux_queue.qsize(),
+                    "finalize_queue_depth": gpu_queue.qsize(),
+                    "active_fetch_limit": active_fetch_limiter.limit,
+                    "render_active": len(render_active_workers),
+                    "aux_active": len(aux_active_workers),
+                    "worker_nodes_alive": sum(1 for task in node_tasks if not task.done()),
+                },
+                logger_instance=_clip_logger,
+            )
+            hash_watchdog.start()
+
+            while not pipeline_task.done():
+                await asyncio.sleep(0.5)
+                now = time.perf_counter()
+                metrics["stage_elapsed_s"] = now - t0
+                metrics["render_queue_depth"] = render_queue.qsize()
+                metrics["aux_queue_depth"] = aux_queue.qsize()
+                metrics["gpu_queue_depth"] = gpu_queue.qsize()
+                metrics["worker_nodes_alive"] = sum(1 for task in node_tasks if not task.done())
+                metrics["active_fetch_limit"] = active_fetch_limiter.limit
+                metrics.update(_get_hash_runtime_resource_snapshot())
+                metrics["limiting_lane"] = max(
+                    (
+                        ("render", metrics["render_queue_depth"]),
+                        ("aux", metrics["aux_queue_depth"]),
+                        ("finalize", metrics["gpu_queue_depth"]),
+                    ),
+                    key=lambda item: item[1],
+                )[0]
+
+                if aggregate_bar is not None:
+                    aggregate_bar.n = metrics["processed"]
+                    aggregate_bar.set_postfix(_build_progress_postfix(metrics), refresh=False)
+                    aggregate_bar.refresh()
+                if render_bar is not None:
+                    render_bar.n = metrics["render_completed"]
+                    render_bar.set_postfix({"act": len(render_active_workers), "q": metrics["render_queue_depth"], "pages": active_fetch_limiter.limit}, refresh=False)
+                    render_bar.refresh()
+                if aux_bar is not None:
+                    aux_bar.n = metrics["aux_completed"]
+                    aux_bar.set_postfix({"act": len(aux_active_workers), "q": metrics["aux_queue_depth"], "ssl": HASH_AUX_SSL_LIMIT}, refresh=False)
+                    aux_bar.refresh()
+                if finalize_bar is not None:
+                    finalize_bar.n = metrics["processed"]
+                    finalize_bar.set_postfix({"q": metrics["gpu_queue_depth"], "ok": metrics["hashed_success"], "fail": metrics["fetch_failed"]}, refresh=False)
+                    finalize_bar.refresh()
+
+                if run_context is not None and hash_progress.seconds_since_progress() >= run_context.stall_threshold_seconds:
+                    producer_task.cancel()
+                    for task in node_tasks + aux_tasks:
+                        task.cancel()
+                    scorer_task.cancel()
+                    await asyncio.gather(producer_task, *node_tasks, *aux_tasks, scorer_task, return_exceptions=True)
+                    raise RuntimeError(
+                        f"Hashing worker-node pipeline stalled for >= {run_context.stall_threshold_seconds}s without progress"
+                    )
+
+                if now - last_progress_log >= HASH_RAMP_INTERVAL_SECONDS:
+                    current = metrics["processed"]
+                    window_processed = current - last_window_processed
+                    window_failed = metrics["fetch_failed"] - last_window_failed
+                    window_timed_out = metrics["fetch_timed_out"] - last_window_timed_out
+                    adjustment = _compute_hash_fetch_adjustment(
+                        current_limit=active_fetch_limiter.limit,
+                        max_limit=ACTIVE_FETCH_LIMIT_MAX,
+                        floor_limit=ACTIVE_FETCH_LIMIT_FLOOR,
+                        step=ACTIVE_FETCH_UPSHIFT_STEP,
+                        processed_total=current,
+                        window_processed=window_processed,
+                        window_failed=window_failed,
+                        window_timed_out=window_timed_out,
+                        render_queue_depth=metrics["render_queue_depth"],
+                        aux_queue_depth=metrics["aux_queue_depth"],
+                        finalize_queue_depth=metrics["gpu_queue_depth"],
+                        result_queue_max=max(HASH_RENDER_QUEUE_MAX, HASH_RESULT_QUEUE_MAX, GPU_QUEUE_MAXSIZE),
+                        fd_usage_ratio=metrics["fd_usage_ratio"],
+                        ram_usage_ratio=metrics["ram_usage_ratio"],
+                        consecutive_pressure_windows=consecutive_pressure_windows,
+                        consecutive_healthy_windows=consecutive_healthy_windows,
+                    )
+                    consecutive_pressure_windows = adjustment["next_consecutive_pressure_windows"]
+                    consecutive_healthy_windows = adjustment["next_consecutive_healthy_windows"]
+                    if adjustment["next_limit"] != active_fetch_limiter.limit:
+                        previous_limit = active_fetch_limiter.limit
+                        await active_fetch_limiter.set_limit(adjustment["next_limit"])
+                        metrics["active_fetch_limit"] = active_fetch_limiter.limit
+                        _clip_logger.info(
+                            "Hash adaptive scaling | active_pages %d -> %d | timeout_ratio=%.3f | failure_ratio=%.3f | queue_pressure=%.3f",
+                            previous_limit,
+                            active_fetch_limiter.limit,
+                            adjustment["timeout_ratio"],
+                            adjustment["failure_ratio"],
+                            adjustment["queue_pressure_ratio"],
+                        )
+                    _log_hashing_periodic_status(metrics, len(shortlisted_urls))
+                    last_window_processed = current
+                    last_window_failed = metrics["fetch_failed"]
+                    last_window_timed_out = metrics["fetch_timed_out"]
+                    last_progress_log = now
+
+            await pipeline_task
+            if prefetch_admitted_failures:
+                results.extend(prefetch_admitted_failures)
+        finally:
+            if hash_watchdog is not None:
+                with suppress(Exception):
+                    await hash_watchdog.stop()
+            for progress_bar in (aggregate_bar, render_bar, aux_bar, finalize_bar):
+                if progress_bar is not None:
+                    progress_bar.close()
+            if aio_session is not None:
+                await aio_session.close()
+
+        return _finish_hashing_shortlist_output(
+            t0=t0,
+            metrics=metrics,
+            threshold=threshold,
+            results=results,
+            review_results=review_results,
+            input_urls=input_urls,
+            audit_rows=audit_rows,
+            decision_rows=decision_rows,
+            prefetch_metrics_map=prefetch_metrics_map,
+            lexical_reject_urls=lexical_reject_urls,
+            stage1_analysis_map=stage1_analysis_map,
+            scoring_config=scoring_config,
+            source_workbook_map=source_workbook_map,
+            shortlist_debug_csv=shortlist_debug_csv,
+            run_context=run_context,
+            checkpoint_store=checkpoint_store,
+        )
+    except Exception:
+        _clip_logger.exception("Hashing shortlist (streaming) crashed.")
+        raise
+    finally:
+        _close_hashing_log()
+
+
+def _finish_hashing_shortlist_output(
+    *,
+    t0,
+    metrics,
+    threshold,
+    results,
+    review_results,
+    input_urls,
+    audit_rows,
+    decision_rows,
+    prefetch_metrics_map,
+    lexical_reject_urls,
+    stage1_analysis_map,
+    scoring_config,
+    source_workbook_map,
+    shortlist_debug_csv,
+    run_context,
+    checkpoint_store,
+):
+    import pandas as pd
+
+    elapsed = time.perf_counter() - t0
+    metrics["stage_elapsed_s"] = elapsed
+    metrics["gpu_queue_depth"] = 0
+    metrics["render_queue_depth"] = 0
+    metrics["aux_queue_depth"] = 0
+    print(
+        f"\nHashing shortlist completed in {elapsed:.1f}s "
+        f"({metrics['processed']} processed, "
+        f"{metrics['final_matches_above_threshold']} matched)"
+    )
+    print(
+        "Hashing metrics: "
+        f"passed_dns_gate={metrics['passed_dns_gate']} "
+        f"processed={metrics['processed']} "
+        f"render={metrics.get('render_completed', 0)} "
+        f"aux={metrics.get('aux_completed', 0)} "
+        f"hashed_success={metrics['hashed_success']} "
+        f"fetch_failed={metrics['fetch_failed']} "
+        f"fetch_timed_out={metrics['fetch_timed_out']} "
+        f"fetch_parked={metrics['fetch_parked']} "
+        f"gpu_batches_flushed={metrics['gpu_batches_flushed']} "
+        f"gpu_items_scored={metrics['gpu_items_scored']} "
+        f"avg_gpu_batch_size={metrics['avg_gpu_batch_size']:.1f} "
+        f"urls_per_sec={metrics['processed'] / max(elapsed, 1e-6):.2f} "
+        f"final_matches={metrics['final_matches_above_threshold']}"
+    )
+    _log_hashing_metrics_summary(
+        metrics,
+        elapsed,
+        threshold,
+        shortlisted_results=results,
+        typo_min_score=scoring_config["typo_min_score"],
+    )
+
+    rows = [_build_shortlist_output_row(match, scoring_config) for match in results]
+    review_rows = []
+    for match in review_results:
+        review_row = _build_shortlist_output_row(match, scoring_config)
+        review_row["review_reason"] = match.get("review_reason", "stage1_review_only")
+        review_rows.append(review_row)
+
+    stage1_rows = _build_stage1_debug_rows(
+        input_urls,
+        audit_rows,
+        decision_rows=decision_rows,
+        prefetch_metrics_map=prefetch_metrics_map,
+        lexical_reject_urls=lexical_reject_urls,
+        stage1_analysis_map=stage1_analysis_map,
+        scoring_config=scoring_config,
+        source_workbook_map=source_workbook_map,
+    )
+    methods_path, deep_analysis_path = _write_stage1_method_artifacts(stage1_rows)
+    passthrough_rows = [
+        row
+        for row in (
+            _build_stage1_passthrough_holdout_row(stage1_row, scoring_config)
+            for stage1_row in stage1_rows
+        )
+        if row
+    ]
+    rows.extend(passthrough_rows)
+    review_rows.extend(_build_stage1_review_queue_rows(stage1_rows, scoring_config=scoring_config))
+    review_df = pd.DataFrame(review_rows)
+    if not review_df.empty:
         dedupe_columns = [
             column
             for column in [
                 "Identified Phishing/Suspected Domain Name",
                 "Cooresponding CSE",
                 "Legitimate Domains",
+                "review_reason",
             ]
-            if column in output_df.columns
+            if column in review_df.columns
         ]
         if dedupe_columns:
-            output_df = output_df.drop_duplicates(subset=dedupe_columns, keep="first")
-        return output_df
+            review_df = review_df.drop_duplicates(subset=dedupe_columns, keep="last")
+    os.makedirs(os.path.dirname(STAGE1_REVIEW_QUEUE_PATH), exist_ok=True)
+    review_df.to_csv(STAGE1_REVIEW_QUEUE_PATH, index=False, encoding="utf-8")
+    _clip_logger.info(
+        "Stage1 review queue written to %s with %d rows",
+        STAGE1_REVIEW_QUEUE_PATH,
+        len(review_df),
+    )
+    if shortlist_debug_csv:
+        debug_path = _write_stage1_debug_csv(stage1_rows, output_path=shortlist_debug_csv)
+        _clip_logger.info("Stage1 debug CSV written to %s with %d rows", debug_path, len(stage1_rows))
+        print(f"Stage1 debug: {debug_path} ({len(stage1_rows)} rows)")
+    _write_stage1_subset_csv(
+        stage1_rows,
+        DNS_REJECTED_LEXICAL_HITS_PATH,
+        lambda row: row.get("reason") == "dns_rejected" and bool(row.get("strict_lexical_hit")),
+    )
+    _write_stage1_subset_csv(
+        stage1_rows,
+        FETCH_FAILED_LEXICAL_HITS_PATH,
+        lambda row: str(row.get("fetch_status", "")).strip().lower() in {"failed", "timeout"} and bool(row.get("strict_lexical_hit")),
+    )
+    _write_stage1_subset_csv(
+        stage1_rows,
+        PARKED_PAGE_EXCLUSIONS_PATH,
+        lambda row: row.get("reason") == "parking_or_placeholder_excluded",
+    )
+    excluded_rows = _build_excluded_url_rows(stage1_rows)
+    excluded_path = _write_excluded_urls_audit(excluded_rows)
+    _clip_logger.info(
+        "Excluded URL audit written to %s with %d rows",
+        excluded_path,
+        len(excluded_rows),
+    )
+    if checkpoint_store is not None and run_context is not None:
+        for stage1_row in stage1_rows:
+            raw_url = str(stage1_row.get("input_url", "") or "")
+            normalized_url = str(stage1_row.get("normalized_url", "") or "")
+            source_workbook = str(stage1_row.get("source_workbook", "") or "")
+            final_status = None
+            failure_reason = ""
+            hash_status = "pending"
+            if bool(stage1_row.get("admitted")) or str(stage1_row.get("survival_path", "") or "").strip():
+                final_status = "holdout_ready"
+                hash_status = "admitted"
+            elif str(stage1_row.get("reason", "") or "").strip() == "dns_rejected":
+                final_status = "dns_rejected"
+                hash_status = "dns_rejected"
+                failure_reason = "dns_rejected"
+            elif str(stage1_row.get("reason", "") or "").strip() == "parking_or_placeholder_excluded":
+                final_status = "parked_or_placeholder"
+                hash_status = "parked_or_placeholder"
+                failure_reason = "parking_or_placeholder_excluded"
+            elif bool(stage1_row.get("kept_for_review_only")):
+                final_status = "review_only"
+                hash_status = "review_only"
+                failure_reason = str(stage1_row.get("review_only_reason", "") or "stage1_review_only")
+            elif str(stage1_row.get("fetch_status", "")).strip().lower() in {"failed", "timeout"}:
+                final_status = "hash_failed"
+                hash_status = "fetch_failed"
+                failure_reason = str(stage1_row.get("reason", "") or "fetch_timeout_or_fetch_failed")
+            elif str(stage1_row.get("exclusion_stage", "")).strip() in {"stage1_http", "lexical_gate"}:
+                final_status = "filtered_lexical_miss"
+                hash_status = "filtered"
+                failure_reason = str(stage1_row.get("reason", "") or "filtered_lexical_miss")
+            _upsert_shortlist_checkpoint(
+                run_context=run_context,
+                checkpoint_store=checkpoint_store,
+                raw_url=raw_url,
+                normalized_url=normalized_url,
+                source_workbook=source_workbook,
+                stage_name="hash",
+                stage_status=hash_status,
+                current_stage="hash",
+                final_pipeline_status=final_status,
+                failure_reason=failure_reason,
+            )
+    print(f"Excluded URLs: {excluded_path} ({len(excluded_rows)} rows)")
+    print(f"Stage1 methods: {methods_path}")
+    print(f"Stage1 deep-analysis candidates: {deep_analysis_path}")
 
-    except Exception:
-        _clip_logger.exception("Hashing shortlist (streaming) crashed.")
-        raise
-    finally:
-        _close_hashing_log()
+    if not rows:
+        return _empty_shortlist_df()
+    output_df = pd.DataFrame(rows)
+    dedupe_columns = [
+        column
+        for column in [
+            "Identified Phishing/Suspected Domain Name",
+            "Cooresponding CSE",
+            "Legitimate Domains",
+        ]
+        if column in output_df.columns
+    ]
+    if dedupe_columns:
+        output_df = output_df.drop_duplicates(subset=dedupe_columns, keep="first")
+    return output_df
 
 
 ###############################################

@@ -13,6 +13,7 @@ import dns.exception
 import dns.resolver
 
 from .config import OUTPUT_DIR
+from .stage1_http_analyzer import lookup_geoip_summary
 from .reliability import (
     CheckpointStore,
     ProgressTracker,
@@ -37,6 +38,11 @@ _AUDIT_FIELDNAMES = [
     "source_workbook",
     "hostname",
     "resolved_ips",
+    "dns_answer_count",
+    "first_resolved_ip",
+    "asn",
+    "asn_org",
+    "country",
     "dns_status",
     "decision",
     "attempts",
@@ -59,6 +65,29 @@ def _read_env_int(name: str, default: int, minimum: int = 1) -> int:
 
 DEFAULT_MIN_WORKERS = _read_env_int("PHISHING_DNS_GATE_MIN_WORKERS", 128)
 DEFAULT_MAX_WORKERS = _read_env_int("PHISHING_DNS_GATE_MAX_WORKERS", 384)
+
+
+def _empty_geoip_fields() -> dict:
+    return {
+        "dns_answer_count": 0,
+        "first_resolved_ip": "",
+        "asn": "",
+        "asn_org": "",
+        "country": "",
+    }
+
+
+def _geoip_fields_for_ips(resolved_ips: list[str]) -> dict:
+    ordered_ips = [str(ip).strip() for ip in (resolved_ips or []) if str(ip).strip()]
+    first_ip = ordered_ips[0] if ordered_ips else ""
+    geoip = lookup_geoip_summary(first_ip) if first_ip else {}
+    return {
+        "dns_answer_count": len(ordered_ips),
+        "first_resolved_ip": first_ip,
+        "asn": "" if geoip.get("asn") in (None, "") else str(geoip.get("asn")),
+        "asn_org": str(geoip.get("asn_org") or ""),
+        "country": str(geoip.get("country") or ""),
+    }
 
 
 def normalize_url(url: str) -> str:
@@ -107,6 +136,7 @@ async def _resolve_single_url_once(
             "target_url": target_url,
             "hostname": hostname,
             "resolved_ips": "",
+            **_empty_geoip_fields(),
             "dns_status": "invalid_host",
             "decision": "rejected",
         }
@@ -134,6 +164,7 @@ async def _resolve_single_url_once(
                         "target_url": target_url,
                         "hostname": hostname,
                         "resolved_ips": "",
+                        **_empty_geoip_fields(),
                         "dns_status": "dns_error",
                         "decision": "rejected",
                     }
@@ -152,10 +183,12 @@ async def _resolve_single_url_once(
                     resolved_ips.add(text)
 
         if resolved_ips:
+            ordered_ips = sorted(resolved_ips)
             return {
                 "target_url": target_url,
                 "hostname": hostname,
-                "resolved_ips": ";".join(sorted(resolved_ips)),
+                "resolved_ips": ";".join(ordered_ips),
+                **_geoip_fields_for_ips(ordered_ips),
                 "dns_status": "resolved",
                 "decision": "accepted",
             }
@@ -165,6 +198,7 @@ async def _resolve_single_url_once(
                 "target_url": target_url,
                 "hostname": hostname,
                 "resolved_ips": "",
+                **_empty_geoip_fields(),
                 "dns_status": "timeout",
                 "decision": "rejected",
             }
@@ -173,6 +207,7 @@ async def _resolve_single_url_once(
             "target_url": target_url,
             "hostname": hostname,
             "resolved_ips": "",
+            **_empty_geoip_fields(),
             "dns_status": "resolver_error" if saw_resolver_error else "no_records",
             "decision": "rejected",
         }
@@ -191,9 +226,10 @@ async def _resolve_single_url_once(
         "target_url": target_url,
         "hostname": hostname,
         "resolved_ips": "",
+        **_empty_geoip_fields(),
         "dns_status": dns_status,
-            "decision": "rejected",
-        }
+        "decision": "rejected",
+    }
 
 
 async def _resolve_single_url(
@@ -235,6 +271,7 @@ async def _resolve_single_url(
         "target_url": target_url,
         "hostname": "",
         "resolved_ips": "",
+        **_empty_geoip_fields(),
         "dns_status": "resolver_error",
         "decision": "rejected",
         "attempts": retry_budget + 1,
@@ -278,6 +315,8 @@ async def _gate_urls_for_hashing_async(
         "timeout": 0,
         "retry_success": 0,
     }
+    progress_started_monotonic = time.perf_counter()
+    last_progress_log_monotonic = progress_started_monotonic
     active_workers: dict[str, str] = {}
     queue: asyncio.Queue[str | None] = asyncio.Queue()
     for target_url in target_urls:
@@ -302,6 +341,7 @@ async def _gate_urls_for_hashing_async(
         progress_bar = None
 
     async def _progress_monitor() -> None:
+        nonlocal last_progress_log_monotonic
         if progress_bar is None:
             return
         last_completed = 0
@@ -321,6 +361,27 @@ async def _gate_urls_for_hashing_async(
                 },
                 refresh=False,
             )
+            now_monotonic = time.perf_counter()
+            log_interval = float(getattr(run_context, "stage0_progress_log_interval_seconds", 10) if run_context is not None else 10)
+            if (now_monotonic - last_progress_log_monotonic) >= log_interval:
+                elapsed_s = max(0.001, now_monotonic - progress_started_monotonic)
+                rate = completed / elapsed_s
+                remaining = max(0, len(target_urls) - completed)
+                eta_s = (remaining / rate) if rate > 0 else 0.0
+                logger.info(
+                    "DNS gate progress | processed=%d/%d | rate=%.1f url/s | elapsed=%.1fs | eta=%.1fs | accepted=%d | rejected=%d | timeout=%d | workers=%d | active=%d",
+                    completed,
+                    len(target_urls),
+                    rate,
+                    elapsed_s,
+                    eta_s,
+                    progress_metrics["accepted"],
+                    progress_metrics["rejected"],
+                    progress_metrics["timeout"],
+                    worker_count,
+                    len(active_workers),
+                )
+                last_progress_log_monotonic = now_monotonic
             if completed >= len(target_urls):
                 break
 
@@ -428,6 +489,7 @@ async def _gate_urls_for_hashing_async(
                     "source_workbook": source_workbook,
                     "hostname": (urlparse(normalized_url).hostname or "").lower(),
                     "resolved_ips": "",
+                    **_empty_geoip_fields(),
                     "dns_status": "resolver_error",
                     "decision": "rejected",
                     "attempts": 1,
@@ -506,17 +568,8 @@ async def _gate_urls_for_hashing_async(
     workers = [asyncio.create_task(_worker(index)) for index in range(worker_count)]
     watchdog.start()
     try:
-        join_timeout = max(
-            run_context.stall_threshold_seconds if run_context is not None else 180,
-            30,
-        )
-        await asyncio.wait_for(queue.join(), timeout=join_timeout)
+        await queue.join()
         await asyncio.gather(*workers)
-    except asyncio.TimeoutError as exc:
-        for worker in workers:
-            worker.cancel()
-        await asyncio.gather(*workers, return_exceptions=True)
-        raise RuntimeError("DNS gate worker pool stalled before draining the queue") from exc
     finally:
         if monitor_task is not None:
             monitor_task.cancel()
@@ -536,6 +589,18 @@ async def _gate_urls_for_hashing_async(
                 refresh=False,
             )
             progress_bar.close()
+        elapsed_s = max(0.001, time.perf_counter() - progress_started_monotonic)
+        logger.info(
+            "DNS gate completed | processed=%d/%d | rate=%.1f url/s | elapsed=%.1fs | accepted=%d | rejected=%d | timeout=%d | workers=%d",
+            progress.completed,
+            len(target_urls),
+            progress.completed / elapsed_s,
+            elapsed_s,
+            progress_metrics["accepted"],
+            progress_metrics["rejected"],
+            progress_metrics["timeout"],
+            worker_count,
+        )
         await watchdog.stop()
         write_dns_gate_audit(audit_rows, output_path=audit_output_path)
 

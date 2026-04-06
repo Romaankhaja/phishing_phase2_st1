@@ -442,6 +442,10 @@ def _lookup_geoip(ip_address: str) -> dict[str, Any]:
     return result
 
 
+def lookup_geoip_summary(ip_address: str) -> dict[str, Any]:
+    return dict(_lookup_geoip(ip_address))
+
+
 def _fetch_tls_summary_sync(host: str, timeout: float) -> dict[str, Any]:
     summary = {
         "cert_cn": "",
@@ -906,107 +910,154 @@ def _default_stage1_result(url: str) -> dict[str, Any]:
     }
 
 
-async def analyze_stage1_url(
+def parse_stage1_html_payload(
+    html_bytes: bytes,
+    *,
+    charset: str | None,
+    final_url: str,
+    max_html_bytes: int,
+) -> dict[str, Any]:
+    if not html_bytes:
+        return {
+            "html_excerpt": "",
+            "html_bytes_read": 0,
+            "html_truncated": False,
+        }
+
+    try:
+        html_text = html_bytes.decode(charset or "utf-8", errors="ignore")
+    except Exception:
+        html_text = html_bytes.decode("utf-8", errors="ignore")
+    html_features = _extract_stage1_html_features(html_text, final_url)
+    return {
+        **html_features,
+        "html_excerpt": html_text[: int(max_html_bytes)],
+        "html_bytes_read": len(html_bytes),
+    }
+
+
+async def fetch_stage1_http_artifacts(
     url: str,
     client: httpx.AsyncClient,
-    entity_context: dict[str, dict[str, Any]] | None = None,
-    ordered_entities: tuple[str, ...] | None = None,
+    *,
     config: dict[str, Any] | None = None,
     concurrency_controls: Stage1ConcurrencyControls | None = None,
+    fetch_limiter=None,
+    per_host_limiter=None,
 ) -> dict[str, Any]:
     config = config or STAGE1_HTTP_CONFIG
     concurrency_controls = concurrency_controls or Stage1ConcurrencyControls()
     result = _default_stage1_result(url)
-    if entity_context is None or ordered_entities is None:
-        entity_context, ordered_entities = get_stage1_entity_context()
-
     normalized_url = result["normalized_url"]
     if not normalized_url:
         result["fetch_error_type"] = "invalid_url"
         result["fetch_error_detail"] = "empty url"
         result["stage1_error_type"] = "invalid_url"
         result["stage1_error_message"] = "empty url"
-        return result
+        return {
+            "result": result,
+            "html_bytes": b"",
+            "response_encoding": None,
+        }
 
+    original_host = _normalize_host(urlparse(normalized_url).netloc)
     redirect_chain: list[str] = []
     head_response = None
     response_headers = {}
     html_bytes = b""
     response = None
+    response_encoding = None
 
-    async def _fetch_http_artifacts():
-        nonlocal head_response, redirect_chain, response_headers, html_bytes, response
+    async def _do_get() -> None:
+        nonlocal redirect_chain, response_headers, html_bytes, response, response_encoding
+        async with client.stream(
+            "GET",
+            normalized_url,
+            follow_redirects=True,
+            timeout=httpx.Timeout(config["get_timeout"], connect=config["connect_timeout"]),
+        ) as streamed_response:
+            response = streamed_response
+            redirect_chain = [str(item.url) for item in response.history[: config["max_redirects"]]]
+            response_headers = dict(response.headers)
+            content_type = str(response.headers.get("content-type", "") or "")
+            content_length_raw = response.headers.get("content-length")
+            try:
+                content_length = int(content_length_raw) if content_length_raw is not None else 0
+            except Exception:
+                content_length = 0
+
+            result["status_code"] = int(response.status_code or 0)
+            result["redirect_chain"] = redirect_chain
+            result["redirect_count"] = len(redirect_chain)
+            result["final_landing_url"] = str(response.url)
+            result["final_domain"] = _normalize_host(urlparse(str(response.url)).netloc)
+            result["response_headers"] = response_headers
+            result["content_type"] = content_type
+            result["content_length"] = content_length
+            result["fetch_status"] = "fetched"
+
+            should_read_body = ("html" in content_type.lower()) or (not content_type)
+            if should_read_body:
+                total = 0
+                chunks = []
+                async for chunk in response.aiter_bytes():
+                    if not chunk:
+                        continue
+                    remaining = int(config["max_html_bytes"]) - total
+                    if remaining <= 0:
+                        break
+                    piece = chunk[:remaining]
+                    chunks.append(piece)
+                    total += len(piece)
+                    if total >= int(config["max_html_bytes"]):
+                        result["html_truncated"] = True
+                        break
+                html_bytes = b"".join(chunks)
+                response_encoding = getattr(response, "charset_encoding", None) or getattr(response, "encoding", None)
+
+    async def _do_head() -> None:
+        nonlocal head_response, redirect_chain
+        head_response = await client.head(
+            normalized_url,
+            follow_redirects=True,
+            timeout=httpx.Timeout(config["head_timeout"], connect=config["connect_timeout"]),
+        )
+        redirect_chain = [str(item.url) for item in head_response.history[: config["max_redirects"]]]
+
+    async def _run_network(factory):
+        async def _inner():
+            if fetch_limiter is None:
+                return await _run_with_optional_semaphore(
+                    concurrency_controls.http_semaphore,
+                    factory,
+                )
+            async with fetch_limiter:
+                return await _run_with_optional_semaphore(
+                    concurrency_controls.http_semaphore,
+                    factory,
+                )
+
+        if per_host_limiter is None:
+            return await _inner()
+        return await per_host_limiter.run(original_host, _inner)
+
+    try:
+        await _run_network(_do_get)
+    except Exception as exc:
+        result["fetch_status"] = "failed"
+        result["fetch_error_type"] = "get_error"
+        result["fetch_error_detail"] = str(exc)
+        result["stage1_error_type"] = exc.__class__.__name__
+        result["stage1_error_message"] = str(exc) or exc.__class__.__name__
         try:
-            head_response = await client.head(
-                normalized_url,
-                follow_redirects=True,
-                timeout=httpx.Timeout(config["head_timeout"], connect=config["connect_timeout"]),
-            )
-            redirect_chain = [str(item.url) for item in head_response.history[: config["max_redirects"]]]
-        except Exception as exc:
-            result["fetch_error_type"] = "head_error"
-            result["fetch_error_detail"] = str(exc)
-            result["stage1_error_type"] = exc.__class__.__name__
-            result["stage1_error_message"] = str(exc) or exc.__class__.__name__
-
-        try:
-            async with client.stream(
-                "GET",
-                normalized_url,
-                follow_redirects=True,
-                timeout=httpx.Timeout(config["get_timeout"], connect=config["connect_timeout"]),
-            ) as streamed_response:
-                response = streamed_response
-                redirect_chain = [str(item.url) for item in response.history[: config["max_redirects"]]]
-                response_headers = dict(response.headers)
-                content_type = str(response.headers.get("content-type", "") or "")
-                content_length_raw = response.headers.get("content-length")
-                try:
-                    content_length = int(content_length_raw) if content_length_raw is not None else 0
-                except Exception:
-                    content_length = 0
-
-                result["status_code"] = int(response.status_code or 0)
-                result["redirect_chain"] = redirect_chain
-                result["redirect_count"] = len(redirect_chain)
-                result["final_landing_url"] = str(response.url)
-                result["final_domain"] = _normalize_host(urlparse(str(response.url)).netloc)
-                result["response_headers"] = response_headers
-                result["content_type"] = content_type
-                result["content_length"] = content_length
-                result["fetch_status"] = "fetched"
-
-                should_read_body = ("html" in content_type.lower()) or (not content_type)
-                if should_read_body:
-                    total = 0
-                    chunks = []
-                    async for chunk in response.aiter_bytes():
-                        if not chunk:
-                            continue
-                        remaining = int(config["max_html_bytes"]) - total
-                        if remaining <= 0:
-                            break
-                        piece = chunk[:remaining]
-                        chunks.append(piece)
-                        total += len(piece)
-                        if total >= int(config["max_html_bytes"]):
-                            result["html_truncated"] = True
-                            break
-                    html_bytes = b"".join(chunks)
-        except Exception as exc:
-            if head_response is None:
-                result["fetch_status"] = "failed"
-            else:
-                result["fetch_status"] = "head_only"
-            result["fetch_error_type"] = "get_error"
-            result["fetch_error_detail"] = str(exc)
-            result["stage1_error_type"] = exc.__class__.__name__
-            result["stage1_error_message"] = str(exc) or exc.__class__.__name__
-
-    await _run_with_optional_semaphore(
-        concurrency_controls.http_semaphore,
-        _fetch_http_artifacts,
-    )
+            await _run_network(_do_head)
+        except Exception as head_exc:
+            if not result["stage1_error_type"]:
+                result["stage1_error_type"] = head_exc.__class__.__name__
+            if not result["stage1_error_message"]:
+                result["stage1_error_message"] = str(head_exc) or head_exc.__class__.__name__
+            if not result["fetch_error_detail"]:
+                result["fetch_error_detail"] = str(head_exc)
 
     if not result["final_landing_url"] and head_response is not None:
         result["status_code"] = int(head_response.status_code or 0)
@@ -1022,67 +1073,162 @@ async def analyze_stage1_url(
         except Exception:
             result["content_length"] = 0
         if result["fetch_status"] == "failed":
-            result["fetch_status"] = "fetched"
+            result["fetch_status"] = "head_only"
 
-    if html_bytes:
-        charset = None
-        if response is not None:
-            charset = getattr(response, "charset_encoding", None) or response.encoding
-        try:
-            html_text = html_bytes.decode(charset or "utf-8", errors="ignore")
-        except Exception:
-            html_text = html_bytes.decode("utf-8", errors="ignore")
-        html_features = _extract_stage1_html_features(html_text, result["final_landing_url"] or normalized_url)
-        result.update(html_features)
-        result["html_excerpt"] = html_text[: int(config["max_html_bytes"])]
-        result["html_bytes_read"] = len(html_bytes)
+    return {
+        "result": result,
+        "html_bytes": html_bytes,
+        "response_encoding": response_encoding,
+    }
+
+
+def should_enrich_stage1_result(
+    extracted: dict[str, Any],
+    *,
+    config: dict[str, Any] | None = None,
+) -> bool:
+    config = config or STAGE1_HTTP_CONFIG
+    final_domain = _normalize_host(extracted.get("final_domain") or urlparse(str(extracted.get("final_landing_url") or "")).netloc)
+    fetch_status = str(extracted.get("fetch_status", "") or "").strip().lower()
+    if not final_domain or fetch_status in {"failed", ""}:
+        return False
+    if bool(extracted.get("escalate_to_hashing")):
+        return True
+    try:
+        preliminary_score = int(extracted.get("total_stage1_score", 0) or 0)
+    except Exception:
+        preliminary_score = 0
+    low_band_min = int(config.get("low_band_min", 20) or 20)
+    if preliminary_score + 19 >= low_band_min:
+        return True
+    stage1_reasons = str(extracted.get("stage1_reasons", "") or "")
+    brand_score = int(extracted.get("brand_score", 0) or 0)
+    hard_trigger_brand_min = int(config.get("hard_trigger_brand_min", 10) or 10)
+    if brand_score >= hard_trigger_brand_min and (
+        "auth_wording" in stage1_reasons or "submit_auth_wording" in stage1_reasons
+    ):
+        return True
+    return False
+
+
+async def enrich_stage1_result(
+    result: dict[str, Any],
+    client: httpx.AsyncClient,
+    *,
+    config: dict[str, Any] | None = None,
+    concurrency_controls: Stage1ConcurrencyControls | None = None,
+    dns_prefetch: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    config = config or STAGE1_HTTP_CONFIG
+    concurrency_controls = concurrency_controls or Stage1ConcurrencyControls()
+    enriched = dict(result)
+    final_domain = _normalize_host(enriched.get("final_domain") or urlparse(str(enriched.get("final_landing_url") or "")).netloc)
+    original_domain = _normalize_host(enriched.get("original_domain") or urlparse(str(enriched.get("normalized_url") or "")).netloc)
+    if not final_domain:
+        return enriched
+
+    dns_task = None
+    same_domain_reuse = bool(dns_prefetch) and bool(final_domain) and final_domain == original_domain
+    if same_domain_reuse:
+        raw_ips = dns_prefetch.get("resolved_ips", [])
+        if isinstance(raw_ips, str):
+            resolved_ips = [item.strip() for item in raw_ips.split(";") if item.strip()]
+        else:
+            resolved_ips = [str(item).strip() for item in (raw_ips or []) if str(item).strip()]
+        enriched["resolved_ips"] = _unique_ordered(resolved_ips)
+        enriched["dns_answer_count"] = int(dns_prefetch.get("dns_answer_count", len(enriched["resolved_ips"])) or len(enriched["resolved_ips"]))
+        enriched["asn"] = dns_prefetch.get("asn")
+        enriched["asn_org"] = str(dns_prefetch.get("asn_org") or "")
+        enriched["country"] = str(dns_prefetch.get("country") or "")
     else:
-        result["html_excerpt"] = ""
-        result["html_bytes_read"] = 0
-
-    final_domain = result["final_domain"]
-    if final_domain:
         dns_task = asyncio.create_task(
             _run_with_optional_semaphore(
                 concurrency_controls.dns_semaphore,
                 lambda: _resolve_dns_answers(final_domain, float(config["dns_timeout"])),
             )
         )
-        rdap_task = asyncio.create_task(
-            _run_with_optional_semaphore(
-                concurrency_controls.rdap_semaphore,
-                lambda: lookup_rdap(
-                    final_domain,
-                    client=client,
-                    timeout=float(config["rdap_timeout"]),
-                ),
-            )
-        )
-        tls_task = asyncio.create_task(
-            _run_with_optional_semaphore(
-                concurrency_controls.tls_semaphore,
-                lambda: _fetch_tls_summary(final_domain, float(config["tls_timeout"])),
-            )
-        )
-        dns_info, rdap_info, tls_info = await asyncio.gather(dns_task, rdap_task, tls_task, return_exceptions=True)
 
-        if isinstance(dns_info, dict):
-            result["resolved_ips"] = dns_info.get("resolved_ips", [])
-            result["dns_answer_count"] = int(dns_info.get("dns_answer_count", 0) or 0)
-            if result["resolved_ips"]:
-                geoip = _lookup_geoip(result["resolved_ips"][0])
-                result["asn"] = geoip.get("asn")
-                result["asn_org"] = str(geoip.get("asn_org") or "")
-                result["country"] = str(geoip.get("country") or "")
-        if isinstance(rdap_info, dict):
-            creation_date = rdap_info.get("creation_date")
-            result["rdap_creation_date"] = creation_date
-            result["rdap_age_days"] = _age_days_from_creation(creation_date)
-        if isinstance(tls_info, dict):
-            result["cert_cn"] = str(tls_info.get("cert_cn") or "")
-            result["cert_san"] = list(tls_info.get("cert_san") or [])
-            result["cert_issuer"] = str(tls_info.get("cert_issuer") or "")
+    rdap_task = asyncio.create_task(
+        _run_with_optional_semaphore(
+            concurrency_controls.rdap_semaphore,
+            lambda: lookup_rdap(
+                final_domain,
+                client=client,
+                timeout=float(config["rdap_timeout"]),
+            ),
+        )
+    )
+    tls_task = asyncio.create_task(
+        _run_with_optional_semaphore(
+            concurrency_controls.tls_semaphore,
+            lambda: _fetch_tls_summary(final_domain, float(config["tls_timeout"])),
+        )
+    )
+    gather_items = [item for item in [dns_task, rdap_task, tls_task] if item is not None]
+    gathered = await asyncio.gather(*gather_items, return_exceptions=True)
+    index = 0
+    dns_info = None
+    if dns_task is not None:
+        dns_info = gathered[index]
+        index += 1
+    rdap_info = gathered[index]
+    tls_info = gathered[index + 1]
 
+    if isinstance(dns_info, dict):
+        enriched["resolved_ips"] = dns_info.get("resolved_ips", [])
+        enriched["dns_answer_count"] = int(dns_info.get("dns_answer_count", 0) or 0)
+        if enriched["resolved_ips"]:
+            geoip = lookup_geoip_summary(enriched["resolved_ips"][0])
+            enriched["asn"] = geoip.get("asn")
+            enriched["asn_org"] = str(geoip.get("asn_org") or "")
+            enriched["country"] = str(geoip.get("country") or "")
+    if isinstance(rdap_info, dict):
+        creation_date = rdap_info.get("creation_date")
+        enriched["rdap_creation_date"] = creation_date
+        enriched["rdap_age_days"] = _age_days_from_creation(creation_date)
+    if isinstance(tls_info, dict):
+        enriched["cert_cn"] = str(tls_info.get("cert_cn") or "")
+        enriched["cert_san"] = list(tls_info.get("cert_san") or [])
+        enriched["cert_issuer"] = str(tls_info.get("cert_issuer") or "")
+
+    return enriched
+
+
+async def analyze_stage1_url(
+    url: str,
+    client: httpx.AsyncClient,
+    entity_context: dict[str, dict[str, Any]] | None = None,
+    ordered_entities: tuple[str, ...] | None = None,
+    config: dict[str, Any] | None = None,
+    concurrency_controls: Stage1ConcurrencyControls | None = None,
+    dns_prefetch: dict[str, Any] | None = None,
+    fetch_limiter=None,
+    per_host_limiter=None,
+) -> dict[str, Any]:
+    config = config or STAGE1_HTTP_CONFIG
+    concurrency_controls = concurrency_controls or Stage1ConcurrencyControls()
+    if entity_context is None or ordered_entities is None:
+        entity_context, ordered_entities = get_stage1_entity_context()
+    fetch_payload = await fetch_stage1_http_artifacts(
+        url,
+        client,
+        config=config,
+        concurrency_controls=concurrency_controls,
+        fetch_limiter=fetch_limiter,
+        per_host_limiter=per_host_limiter,
+    )
+    result = dict(fetch_payload.get("result") or _default_stage1_result(url))
+    html_bytes = fetch_payload.get("html_bytes") or b""
+    response_encoding = fetch_payload.get("response_encoding")
+    normalized_url = result["normalized_url"]
+    if html_bytes:
+        parsed = parse_stage1_html_payload(
+            html_bytes,
+            charset=response_encoding,
+            final_url=result.get("final_landing_url") or normalized_url,
+            max_html_bytes=int(config["max_html_bytes"]),
+        )
+        result.update(parsed)
     scored = score_stage1_http_signals(
         result,
         entity_context=entity_context,
@@ -1090,6 +1236,22 @@ async def analyze_stage1_url(
         config=config,
     )
     result.update(scored)
+    if should_enrich_stage1_result(result, config=config):
+        result = await enrich_stage1_result(
+            result,
+            client,
+            config=config,
+            concurrency_controls=concurrency_controls,
+            dns_prefetch=dns_prefetch,
+        )
+        result.update(
+            score_stage1_http_signals(
+                result,
+                entity_context=entity_context,
+                ordered_entities=ordered_entities,
+                config=config,
+            )
+        )
     if not result["stage1_reasons"] and result["fetch_status"] == "failed":
         result["stage1_reasons"] = "stage1_fetch_failed"
         result["escalate_reason"] = "stage1_fetch_failed"

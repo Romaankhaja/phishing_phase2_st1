@@ -58,6 +58,23 @@ STAGE1_HTTP_CONFIG = {
     "dns_concurrency": 200,
     "rdap_concurrency": 10,
     "tls_concurrency": 32,
+    "stage1_enable_tiered_fast_path": True,
+    "stage1_fetch_concurrency_start": 200,
+    "stage1_fetch_concurrency_max": 400,
+    "stage1_http_connection_limit": 400,
+    "stage1_http_keepalive_limit": 200,
+    "stage1_per_host_limit": 4,
+    "stage1_parse_workers": 4,
+    "stage1_enrich_dns_concurrency": 200,
+    "stage1_enrich_rdap_concurrency": 10,
+    "stage1_enrich_tls_concurrency": 32,
+    "stage1_fetch_queue_max": 8000,
+    "stage1_parse_queue_max": 4000,
+    "stage1_score_queue_max": 4000,
+    "stage1_enrich_queue_max": 4000,
+    "stage1_result_queue_max": 4000,
+    "stage1_progress_log_interval_seconds": 10,
+    "stage1_target_urls_per_sec": 500,
     "connect_timeout": 3.0,
     "head_timeout": 3.0,
     "get_timeout": 5.0,
@@ -71,6 +88,22 @@ STAGE1_HTTP_CONFIG = {
     "credential_min": 18,
     "low_band_min": 20,
     "hard_trigger_brand_min": 10,
+}
+
+HASH_STAGE_CONFIG = {
+    "hash_worker_nodes_start": 12,
+    "hash_worker_nodes_max": 16,
+    "hash_pages_per_node": 8,
+    "hash_active_pages_start": 96,
+    "hash_active_pages_max": 128,
+    "hash_render_queue_max": 20000,
+    "hash_result_queue_max": 8000,
+    "hash_aux_workers": 96,
+    "hash_aux_http_limit": 128,
+    "hash_aux_ssl_limit": 64,
+    "hash_per_host_limit": 4,
+    "hash_progress_log_interval_seconds": 10,
+    "hash_target_urls_per_sec": 40,
 }
 
 STAGE3_RECALL_RESCUE_CONFIG = {
@@ -93,6 +126,15 @@ RELIABILITY_CONFIG = {
 
 def resolve_stage1_http_config(overrides: dict | None = None) -> dict:
     config = dict(STAGE1_HTTP_CONFIG)
+    for key, value in (overrides or {}).items():
+        if value is None:
+            continue
+        config[key] = value
+    return config
+
+
+def resolve_hash_stage_config(overrides: dict | None = None) -> dict:
+    config = dict(HASH_STAGE_CONFIG)
     for key, value in (overrides or {}).items():
         if value is None:
             continue
