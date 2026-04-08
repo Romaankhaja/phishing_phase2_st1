@@ -78,6 +78,7 @@ RUN_MANIFEST_COLUMNS = (
     "fatal_error_message",
     "metadata_json",
     "checkpoint_dir",
+    "checkpoints_csv",
     "url_result_events_csv",
     "stage_events_csv",
 )
@@ -113,10 +114,8 @@ TERMINAL_PIPELINE_STATUSES = {
     "filtered_lexical_miss",
     "stage1_failed",
     "stage1_failed_fallback_dns",
-    "dns_rejected",
     "hash_failed",
     "not_registered_domain",
-    "parked_or_placeholder",
     "review_only",
     "pre_hash_filtered",
     "failed",
@@ -236,6 +235,7 @@ def default_run_result(
 class RunContext:
     run_id: str
     output_dir: str
+    checkpoints_csv: str
     checkpoint_dir: str
     run_results_csv: str
     stage_events_csv: str
@@ -246,8 +246,8 @@ class RunContext:
     worker_heartbeats_csv: str
     stall_threshold_seconds: int = 180
     watchdog_warning_seconds: int = 60
-    append_flush_interval_seconds: int = 2
-    append_flush_row_interval: int = 1000
+    append_flush_interval_seconds: int = 5
+    append_flush_row_interval: int = 2000
     snapshot_flush_interval_seconds: int = 30
     snapshot_flush_row_interval: int = 5000
     stage0_progress_log_interval_seconds: int = 10
@@ -264,8 +264,8 @@ def build_run_context(
     run_id: str | None = None,
     stall_threshold_seconds: int = 180,
     watchdog_warning_seconds: int = 60,
-    append_flush_interval_seconds: int = 2,
-    append_flush_row_interval: int = 1000,
+    append_flush_interval_seconds: int = 5,
+    append_flush_row_interval: int = 2000,
     snapshot_flush_interval_seconds: int = 30,
     snapshot_flush_row_interval: int = 5000,
     stage0_progress_log_interval_seconds: int = 10,
@@ -274,20 +274,20 @@ def build_run_context(
     metadata: dict[str, Any] | None = None,
 ) -> RunContext:
     resolved_run_id = str(run_id or datetime.now(timezone.utc).strftime("run_%Y%m%dT%H%M%SZ"))
-    checkpoint_dir = os.path.join(output_dir, "checkpoints", resolved_run_id)
-    os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
+    checkpoints_csv = os.path.join(output_dir, "checkpoints.csv")
     return RunContext(
         run_id=resolved_run_id,
         output_dir=output_dir,
-        checkpoint_dir=checkpoint_dir,
+        checkpoints_csv=checkpoints_csv,
+        checkpoint_dir="",
         run_results_csv=os.path.join(output_dir, "pipeline_run_results.csv"),
         stage_events_csv=os.path.join(output_dir, "pipeline_stage_events.csv"),
         run_manifest_csv=os.path.join(output_dir, "run_manifest.csv"),
-        checkpoint_run_manifest_csv=os.path.join(checkpoint_dir, "run_manifest.csv"),
-        url_result_events_csv=os.path.join(checkpoint_dir, "url_result_events.csv"),
-        checkpoint_stage_events_csv=os.path.join(checkpoint_dir, "stage_events.csv"),
-        worker_heartbeats_csv=os.path.join(checkpoint_dir, "worker_heartbeats.csv"),
+        checkpoint_run_manifest_csv=os.path.join(output_dir, "run_manifest.csv"),
+        url_result_events_csv=checkpoints_csv,
+        checkpoint_stage_events_csv=os.path.join(output_dir, "pipeline_stage_events.csv"),
+        worker_heartbeats_csv="",
         stall_threshold_seconds=max(30, int(stall_threshold_seconds)),
         watchdog_warning_seconds=max(15, int(watchdog_warning_seconds)),
         append_flush_interval_seconds=max(1, int(append_flush_interval_seconds)),
@@ -369,6 +369,7 @@ class CheckpointStore:
         self._lock = threading.RLock()
         self._url_results: dict[str, dict[str, Any]] = {}
         self._worker_heartbeats: dict[tuple[str, str], dict[str, Any]] = {}
+        self._stage_events: list[dict[str, Any]] = []
         self._manifest: dict[str, Any] = {
             "run_id": self.context.run_id,
             "status": "running",
@@ -379,9 +380,10 @@ class CheckpointStore:
             "fatal_error_type": "",
             "fatal_error_message": "",
             "metadata_json": dict(self.context.metadata),
-            "checkpoint_dir": self.context.checkpoint_dir,
-            "url_result_events_csv": self.context.url_result_events_csv,
-            "stage_events_csv": self.context.checkpoint_stage_events_csv,
+            "checkpoint_dir": "",
+            "checkpoints_csv": self.context.checkpoints_csv,
+            "url_result_events_csv": self.context.checkpoints_csv,
+            "stage_events_csv": self.context.stage_events_csv,
         }
         self._pending_result_events: list[dict[str, Any]] = []
         self._pending_stage_events: list[dict[str, Any]] = []
@@ -397,39 +399,40 @@ class CheckpointStore:
 
     def _load_existing_state(self) -> None:
         with self._lock:
-            if os.path.exists(self.context.checkpoint_run_manifest_csv):
+            if self.context.run_manifest_csv and os.path.exists(self.context.run_manifest_csv):
                 try:
-                    with open(self.context.checkpoint_run_manifest_csv, newline="", encoding="utf-8") as fh:
+                    with open(self.context.run_manifest_csv, newline="", encoding="utf-8") as fh:
                         rows = list(csv.DictReader(fh))
                     if rows:
                         manifest = dict(rows[-1])
                         manifest["metadata_json"] = _parse_json_field(manifest.get("metadata_json"), {})
                         self._manifest.update(manifest)
                 except Exception:
-                    logger.exception("Failed to load existing checkpoint manifest CSV")
+                    logger.exception("Failed to load existing run manifest CSV")
 
-            if os.path.exists(self.context.url_result_events_csv):
+            if self.context.checkpoints_csv and os.path.exists(self.context.checkpoints_csv):
                 try:
-                    with open(self.context.url_result_events_csv, newline="", encoding="utf-8") as fh:
+                    with open(self.context.checkpoints_csv, newline="", encoding="utf-8") as fh:
                         for row in csv.DictReader(fh):
                             normalized = _coerce_int_fields(row, RUN_RESULT_INT_FIELDS)
+                            if str(normalized.get("run_id", "") or "") != self.context.run_id:
+                                continue
                             record_key = str(normalized.get("record_key", "") or "")
                             if record_key:
                                 self._url_results[record_key] = normalized
                 except Exception:
-                    logger.exception("Failed to load checkpoint URL result events CSV")
+                    logger.exception("Failed to load checkpoints CSV")
 
-            if os.path.exists(self.context.worker_heartbeats_csv):
+            if self.context.stage_events_csv and os.path.exists(self.context.stage_events_csv):
                 try:
-                    with open(self.context.worker_heartbeats_csv, newline="", encoding="utf-8") as fh:
+                    with open(self.context.stage_events_csv, newline="", encoding="utf-8") as fh:
                         for row in csv.DictReader(fh):
-                            item = dict(row)
-                            item["details_json"] = _parse_json_field(item.get("details_json"), {})
-                            key = (str(item.get("stage_name", "")), str(item.get("worker_id", "")))
-                            if key[0] and key[1]:
-                                self._worker_heartbeats[key] = item
+                            item = _coerce_int_fields(dict(row), STAGE_EVENT_INT_FIELDS)
+                            if str(item.get("run_id", "") or "") != self.context.run_id:
+                                continue
+                            self._stage_events.append(item)
                 except Exception:
-                    logger.exception("Failed to load checkpoint worker heartbeat CSV")
+                    logger.exception("Failed to load stage events CSV")
 
     def start_run(self, *, status: str = "running", metadata: dict[str, Any] | None = None) -> None:
         now = utc_now_iso()
@@ -441,9 +444,10 @@ class CheckpointStore:
                     "started_at": self._manifest.get("started_at") or self.context.started_at,
                     "updated_at": now,
                     "metadata_json": dict(metadata or self.context.metadata or {}),
-                    "checkpoint_dir": self.context.checkpoint_dir,
-                    "url_result_events_csv": self.context.url_result_events_csv,
-                    "stage_events_csv": self.context.checkpoint_stage_events_csv,
+                    "checkpoint_dir": "",
+                    "checkpoints_csv": self.context.checkpoints_csv,
+                    "url_result_events_csv": self.context.checkpoints_csv,
+                    "stage_events_csv": self.context.stage_events_csv,
                 }
             )
         self._write_manifest_files()
@@ -492,11 +496,11 @@ class CheckpointStore:
             "fatal_error_type": manifest.get("fatal_error_type", ""),
             "fatal_error_message": manifest.get("fatal_error_message", ""),
             "metadata_json": json.dumps(manifest.get("metadata_json") or {}, ensure_ascii=True, sort_keys=True),
-            "checkpoint_dir": manifest.get("checkpoint_dir", self.context.checkpoint_dir),
-            "url_result_events_csv": manifest.get("url_result_events_csv", self.context.url_result_events_csv),
-            "stage_events_csv": manifest.get("stage_events_csv", self.context.checkpoint_stage_events_csv),
+            "checkpoint_dir": "",
+            "checkpoints_csv": manifest.get("checkpoints_csv", self.context.checkpoints_csv),
+            "url_result_events_csv": manifest.get("url_result_events_csv", self.context.checkpoints_csv),
+            "stage_events_csv": manifest.get("stage_events_csv", self.context.stage_events_csv),
         }
-        _write_csv_atomic(self.context.checkpoint_run_manifest_csv, RUN_MANIFEST_COLUMNS, [manifest_row])
         _write_csv_atomic(self.context.run_manifest_csv, RUN_MANIFEST_COLUMNS, [manifest_row])
 
     def get_url_result(self, record_key: str) -> dict[str, Any] | None:
@@ -540,25 +544,25 @@ class CheckpointStore:
         source_workbook: str,
     ) -> dict[str, Any]:
         record_key = make_record_key(normalized_url, source_workbook)
-        existing = self.get_url_result(record_key)
-        if existing is not None:
-            return existing
-        return self.upsert_url_result(
-            default_run_result(
+        with self._lock:
+            existing = self._url_results.get(record_key)
+            if existing is not None:
+                return dict(existing)
+            created = default_run_result(
                 run_id=self.context.run_id,
                 raw_url=raw_url,
                 normalized_url=normalized_url,
                 source_workbook=source_workbook,
             )
-        )
+            self._url_results[record_key] = created
+            return dict(created)
 
     def append_stage_event(self, event: dict[str, Any]) -> None:
         normalized = _coerce_int_fields(dict(event), STAGE_EVENT_INT_FIELDS)
         with self._lock:
-            self._pending_stage_events.append(normalized)
-            self._pending_event_count += 1
-            self._append_dirty = True
+            self._stage_events.append(dict(normalized))
             self._dirty_snapshot_updates += 1
+            self._snapshot_dirty = True
         self.maybe_export()
 
     def update_worker_heartbeat(
@@ -579,14 +583,10 @@ class CheckpointStore:
                 "last_seen_at": utc_now_iso(),
                 "details_json": dict(details or {}),
             }
-            self._heartbeat_dirty = True
-        self.maybe_export()
 
     def clear_worker_heartbeat(self, *, stage_name: str, worker_id: str) -> None:
         with self._lock:
             self._worker_heartbeats.pop((stage_name, worker_id), None)
-            self._heartbeat_dirty = True
-        self.maybe_export()
 
     def list_worker_heartbeats(self, *, stage_name: str | None = None) -> list[dict[str, Any]]:
         with self._lock:
@@ -628,34 +628,19 @@ class CheckpointStore:
             if not force:
                 due_by_rows = self._pending_event_count >= self.context.append_flush_row_interval
                 due_by_time = (now - self._last_append_flush_monotonic) >= self.context.append_flush_interval_seconds
-                if not self._append_dirty and not self._heartbeat_dirty:
+                if not self._append_dirty:
                     return
                 if not due_by_rows and not due_by_time:
                     return
 
             result_rows = list(self._pending_result_events)
-            stage_rows = list(self._pending_stage_events)
-            heartbeat_rows = [
-                {
-                    **value,
-                    "details_json": json.dumps(value.get("details_json") or {}, ensure_ascii=True, sort_keys=True),
-                }
-                for _, value in sorted(self._worker_heartbeats.items())
-            ]
             self._pending_result_events.clear()
-            self._pending_stage_events.clear()
             self._pending_event_count = 0
             self._append_dirty = False
-            heartbeat_dirty = self._heartbeat_dirty
-            self._heartbeat_dirty = False
             self._last_append_flush_monotonic = now
 
         if result_rows:
-            _append_csv_rows(self.context.url_result_events_csv, RUN_RESULT_COLUMNS, result_rows)
-        if stage_rows:
-            _append_csv_rows(self.context.checkpoint_stage_events_csv, STAGE_EVENT_COLUMNS, stage_rows)
-        if heartbeat_dirty or force:
-            _write_csv_atomic(self.context.worker_heartbeats_csv, WORKER_HEARTBEAT_COLUMNS, heartbeat_rows)
+            _append_csv_rows(self.context.checkpoints_csv, RUN_RESULT_COLUMNS, result_rows)
 
     def maybe_export(self, *, force: bool = False) -> None:
         self.flush_appends(force=force)
@@ -684,12 +669,13 @@ class CheckpointStore:
                     ),
                 )
             ]
+            stage_rows = list(self._stage_events)
             self._snapshot_dirty = False
             self._dirty_snapshot_updates = 0
             self._last_snapshot_flush_monotonic = time.monotonic()
 
         _write_csv_atomic(self.context.run_results_csv, RUN_RESULT_COLUMNS, result_rows)
-        _copy_csv_atomic(self.context.checkpoint_stage_events_csv, self.context.stage_events_csv, STAGE_EVENT_COLUMNS)
+        _write_csv_atomic(self.context.stage_events_csv, STAGE_EVENT_COLUMNS, stage_rows)
         self._write_manifest_files()
 
     def close(self) -> None:
@@ -801,7 +787,7 @@ class ProgressTracker:
             self.completed += 1
             if str(final_status).startswith("failed") or final_status in {"classification_failed", "hash_failed", "stage1_failed"}:
                 self.failed += 1
-            if "skip" in str(final_status) or final_status in {"review_only", "filtered_lexical_miss", "dns_rejected"}:
+            if "skip" in str(final_status) or final_status in {"review_only", "filtered_lexical_miss"}:
                 self.skipped += 1
             self._last_progress_monotonic = time.monotonic()
 

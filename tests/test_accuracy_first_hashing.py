@@ -181,15 +181,15 @@ class AccuracyFirstPipelineTests(unittest.IsolatedAsyncioTestCase):
                     failed_fetch_review_min=0.90,
                 )
 
-            self.assertEqual(len(result), 0)
+            self.assertEqual(len(result), 1)
             final_df = pd.read_csv(final_output)
-            self.assertEqual(len(final_df), 0)
-            review_df = pd.read_csv(review_queue)
-            self.assertEqual(len(review_df), 1)
+            self.assertEqual(len(final_df), 1)
             self.assertEqual(
-                review_df.loc[0, "review_reason"],
-                "failed_fetch_strict_lexical_review",
+                final_df.loc[0, "Phishing/Suspected Domains (i.e. Class Label)"],
+                "Suspected",
             )
+            review_df = pd.read_csv(review_queue)
+            self.assertEqual(len(review_df), 0)
             try:
                 stage2_df = pd.read_csv(stage2_debug)
             except EmptyDataError:
@@ -199,12 +199,15 @@ class AccuracyFirstPipelineTests(unittest.IsolatedAsyncioTestCase):
             except EmptyDataError:
                 stage3_df = pd.DataFrame()
             self.assertEqual(len(stage2_df), 1)
-            self.assertEqual(stage2_df.loc[0, "model_feature_status"], "skipped_non_fetched_fetch_state")
+            self.assertEqual(
+                stage2_df.loc[0, "model_feature_status"],
+                "skipped_non_fetched_fetch_evidence_unavailable",
+            )
             self.assertEqual(len(stage3_df), 1)
-            self.assertEqual(stage3_df.loc[0, "classification"], "REVIEW_ONLY")
+            self.assertEqual(stage3_df.loc[0, "classification"], "Suspected")
             self.assertEqual(
                 stage3_df.loc[0, "classification_gate_reason"],
-                "failed_fetch_strict_lexical_review",
+                "strict_lexical_fetch_evidence_unavailable_suspected",
             )
 
 

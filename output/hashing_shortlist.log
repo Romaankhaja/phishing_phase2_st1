@@ -1,137 +1,33 @@
-2026-04-07 01:08:09,109 | INFO | Hashing shortlist (streaming) started | urls=666 | threshold=58.0 | domain_similarity_threshold=0.800 | high_confidence_threshold=78.00 | medium_confidence_threshold=68.00 | typo_top_k=10 | typo_min_score=0.750 | lexical_pass_min_score=0.850 | clip_margin_min=0.200 | dns_timeout=3.00 | dns_retries=0 | dns_max_workers=192
-2026-04-07 01:08:09,109 | INFO | Scoring weights | domain=30, screenshot=20, favicon=14, ssl_hash=12, html_hash=6, domain_hash=8, keywords=10
-2026-04-07 01:08:09,109 | INFO | Hash stage topology | dns_workers=192 | worker_nodes={start=4,max=6} | pages_per_node=4 | active_pages={start=16,max=24,floor=6} | queues={render=4000,result=2000} | aux={workers=24,http=64,ssl=24} | nav_timeout_ms=15000 | screenshot_timeout_ms=6000 | fetch_timeout_s=20.0 | gpu_batch=16 | per_host_limit=4 | adaptive_downshift_enabled=True
-2026-04-07 01:08:09,109 | INFO | Stage1 note | OCR/Screenshots/ImgProc/RDAP/WHOIS limits from phishing_pipeline.utils are not the active hashing-stage browser worker counts.
-2026-04-07 01:08:09,109 | INFO | Stage1 runtime thresholds | escalate_total=60 | brand_min=18 | credential_min=18 | low_band_min=20 | hard_trigger_brand_min=10 | passthroughs={stage1_suspected=False,dns_rejected_strict_lexical=False,fetch_failed_strict_lexical=False}
-2026-04-07 01:08:13,689 | INFO | DNS gate completed | processed=666/666 | rate=145.6 url/s | elapsed=4.6s | accepted=505 | rejected=161 | timeout=23 | workers=192
-2026-04-07 01:08:13,695 | INFO | DNS gate details | urls=666 | kept=505 | timeout=3.0s | retries=0 | workers=192 | resolved=505 timeout=23 resolver_error=6 no_records=106 dns_error=26 retry_success=0
-2026-04-07 01:08:13,702 | INFO | DNS gate kept 505/666 input URLs before lexical/stage1 at 3.0s timeout (retries=0, retry_success=0) | resolved=505 timeout=23 resolver_error=6 no_records=106 dns_error=26
-2026-04-07 01:08:13,702 | INFO | Hashing log file: c:\Users\SATWIK\Documents\Phishing\output\hashing_shortlist.log
-2026-04-07 01:08:15,536 | INFO | Stage0 lexical gate completed | processed=666/666 | rate=103.6 url/s | elapsed=6.4s | hits=390 | misses=276 | skipped=0 | workers=1
-2026-04-07 01:08:15,593 | INFO | Stage1 fast-path runtime | urls=216 | fetch_concurrency=96..192 | http_limit=192 | keepalive_limit=96 | per_host_limit=4 | dns_reuse=True
-2026-04-07 01:08:25,614 | INFO | Stage1 cheap HTTP progress | processed=208/216 | rate=20.8 url/s | elapsed=10.0s | eta=0.4s | active=8 | queue=8 | fetch_limit=96 | escalated=25 | failed=25 | fallback_dns=25 | fd=1401/n/a | event_loop_lag_ms=0.0 | timeout_ratio=0.000
-2026-04-07 01:08:28,508 | INFO | Stage1 cheap HTTP completed | processed=216/216 | rate=16.7 url/s | elapsed=12.9s | escalated=30 | failed=30 | fallback_dns=30 | final_fetch_limit=96
-2026-04-07 01:08:28,509 | INFO | Stage1 routing kept 319/505 DNS-accepted URLs before hashing | dns_accepted=505 | lexical_hits=390 | lexical_misses=276 | stage1_http_eligible=216 | non_escalated=186
-2026-04-07 01:08:28,509 | INFO | Stage1 RDAP summary | success=0 | 429=108 | retry_success=0 | retry_exhausted=108 | exception=0 | cache_hit=0 | inflight_wait=0 | cooldown_hit=5
-2026-04-07 01:08:47,127 | INFO | Hashing progress | processed=1/319 | render=3 | aux=0 | ok=0 | fail=1 | tout=0 | park=0 | match=0 | queues={render=316,aux=0,final=0} | nodes_alive=6 | active_pages=16 | finalized=0 | avg_finalize_batch=0.00 | urls_per_sec=0.05 | success_ratio=0.000 | timeout_ratio=0.000 | fd=2248/0 | ram=93.3% | target=12.0 | limiting_lane=render
-2026-04-07 01:08:57,015 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x00000228435ABD00>
+2026-04-08 21:36:43,016 | INFO | Hashing shortlist (streaming) started | urls=236 | threshold=58.0 | domain_similarity_threshold=0.800 | high_confidence_threshold=78.00 | medium_confidence_threshold=68.00 | typo_top_k=10 | typo_min_score=0.750 | lexical_pass_min_score=0.850 | clip_margin_min=0.200
+2026-04-08 21:36:43,016 | INFO | Scoring weights | domain=30, screenshot=20, favicon=14, ssl_hash=12, html_hash=6, domain_hash=8, keywords=10
+2026-04-08 21:36:43,016 | INFO | Hash stage topology | pages=16 | page_workers_per_shard=4 | shards=4 | http_limit=64 | nav_timeout_ms=15000 | screenshot_timeout_ms=6000 | fetch_timeout_s=20.0 | gpu_queue=32 | gpu_batch=16 | active_fetch_limit=16 | active_fetch_floor=6 | aux_net_limit=24 | adaptive_downshift_enabled=True
+2026-04-08 21:36:43,016 | INFO | Stage1 note | OCR/Screenshots/ImgProc/RDAP/WHOIS limits from phishing_pipeline.utils are not the active hashing-stage browser worker counts.
+2026-04-08 21:36:43,016 | INFO | Stage1 runtime thresholds | escalate_total=60 | brand_min=18 | credential_min=18 | low_band_min=20 | hard_trigger_brand_min=10 | policies={stage1_suspected_passthrough=False,fetch_failed_strict_lexical_passthrough=False}
+2026-04-08 21:36:43,018 | INFO | Hashing log file: C:\Users\SATWIK\Documents\Phishing\output\hashing_shortlist.log
+2026-04-08 21:36:43,989 | INFO | Stage0 lexical gate completed | processed=236/236 | rate=242.5 url/s | elapsed=1.0s | hits=26 | misses=210 | skipped=0 | workers=1
+2026-04-08 21:36:44,070 | INFO | Stage1 fast-path runtime | urls=210 | fetch_concurrency=96..192 | http_limit=192 | keepalive_limit=96 | per_host_limit=4 | dns_reuse=True
+2026-04-08 21:36:54,159 | INFO | Stage1 cheap HTTP progress | processed=188/210 | rate=18.6 url/s | elapsed=10.1s | eta=1.2s | active=22 | queue=22 | fetch_limit=96 | escalated=1 | failed=55 | failure_fallback=0 | fd=1372/n/a | event_loop_lag_ms=0.0 | timeout_ratio=0.000
+2026-04-08 21:36:57,469 | INFO | Stage1 cheap HTTP completed | processed=210/210 | rate=15.7 url/s | elapsed=13.4s | escalated=1 | failed=59 | failure_fallback=0 | final_fetch_limit=96
+2026-04-08 21:36:57,469 | INFO | Stage1 routing kept 27/236 URLs before hashing | stage0_lexical_hits=26 | stage1_http_rescued=1 | lexical_misses=210 | stage1_http_eligible=210 | non_escalated=209
+2026-04-08 21:36:57,469 | INFO | Stage1 RDAP summary | success=0 | 429=75 | retry_success=0 | retry_exhausted=75 | exception=0 | cache_hit=0 | inflight_wait=0 | cooldown_hit=0
+2026-04-08 21:37:08,731 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x0000012C67DC86A0>
   _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
 
-2026-04-07 01:08:58,745 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x0000022843F8DC60>
+2026-04-08 21:37:08,879 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x0000012C67DCA1A0>
   _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
 
-2026-04-07 01:09:02,379 | INFO | Hashing progress | processed=40/319 | render=41 | aux=25 | ok=25 | fail=6 | tout=7 | park=2 | match=5 | queues={render=278,aux=0,final=0} | nodes_alive=6 | active_pages=16 | finalized=25 | avg_finalize_batch=1.32 | urls_per_sec=1.18 | success_ratio=0.625 | timeout_ratio=0.175 | fd=6431/0 | ram=94.4% | target=12.0 | limiting_lane=render
-2026-04-07 01:09:02,645 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000002284482E3E0>
+2026-04-08 21:37:12,688 | INFO | Hashing progress | processed=25/27 | ok=7 | fail=18 | tout=0 | match=24 | gpu_batches=7 | gpu_items=7 | gpu_queue=0 | active_fetch_limit=16 | avg_gpu_batch=1.00 | urls_per_sec=1.64 | success_ratio=0.280 | timeout_ratio=0.000
+2026-04-08 21:37:17,320 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x0000012C67E42E60>
   _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
 
-2026-04-07 01:09:04,916 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x0000022844493AC0>
-  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
-
-2026-04-07 01:09:05,704 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x0000022843AB33A0>
-  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
-
-2026-04-07 01:09:08,510 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x0000022843BC52A0>
-  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
-
-2026-04-07 01:09:09,607 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000002284565A3E0>
-  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
-
-2026-04-07 01:09:15,128 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x00000228444328C0>
-  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
-
-2026-04-07 01:09:17,654 | INFO | Hashing progress | processed=78/319 | render=83 | aux=49 | ok=49 | fail=12 | tout=15 | park=2 | match=8 | queues={render=236,aux=0,final=0} | nodes_alive=6 | active_pages=16 | finalized=49 | avg_finalize_batch=1.32 | urls_per_sec=1.59 | success_ratio=0.628 | timeout_ratio=0.192 | fd=9485/0 | ram=94.1% | target=12.0 | limiting_lane=render
-2026-04-07 01:09:18,637 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x00000228429A4BE0>
-  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
-
-2026-04-07 01:09:19,624 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x00000228438D88E0>
-  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
-
-2026-04-07 01:09:26,466 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x0000022822E0EB60>
-  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
-
-2026-04-07 01:09:28,428 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x0000022846CF0340>
-  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
-
-2026-04-07 01:09:28,751 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x0000022846DBDA80>
-  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
-
-2026-04-07 01:09:31,095 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x00000228371418A0>
-  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
-
-2026-04-07 01:09:33,254 | INFO | Hashing progress | processed=136/319 | render=139 | aux=90 | ok=90 | fail=20 | tout=21 | park=5 | match=14 | queues={render=182,aux=0,final=0} | nodes_alive=6 | active_pages=16 | finalized=90 | avg_finalize_batch=1.25 | urls_per_sec=2.10 | success_ratio=0.662 | timeout_ratio=0.154 | fd=11068/0 | ram=95.7% | target=12.0 | limiting_lane=render
-2026-04-07 01:09:34,510 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x00000228433FC640>
-  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
-
-2026-04-07 01:09:35,733 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x0000022846BBCA00>
-  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
-
-2026-04-07 01:09:38,121 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x0000022846CF2200>
-  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
-
-2026-04-07 01:09:45,730 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x0000022843FFE7A0>
-  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
-
-2026-04-07 01:09:46,380 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x00000228433B2200>
-  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
-
-2026-04-07 01:09:48,668 | INFO | Hashing progress | processed=188/319 | render=188 | aux=129 | ok=129 | fail=26 | tout=28 | park=5 | match=17 | queues={render=131,aux=0,final=0} | nodes_alive=6 | active_pages=16 | finalized=129 | avg_finalize_batch=1.24 | urls_per_sec=2.35 | success_ratio=0.686 | timeout_ratio=0.149 | fd=16204/0 | ram=93.7% | target=12.0 | limiting_lane=render
-2026-04-07 01:09:57,104 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x0000022843D09060>
-  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
-
-2026-04-07 01:09:58,787 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x0000022846CF04C0>
-  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
-
-2026-04-07 01:10:00,887 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x0000022847A84280>
-  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
-
-2026-04-07 01:10:01,894 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x0000022847A4FBE0>
-  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
-
-2026-04-07 01:10:03,827 | INFO | Hashing progress | processed=234/319 | render=238 | aux=152 | ok=152 | fail=36 | tout=39 | park=7 | match=21 | queues={render=84,aux=0,final=0} | nodes_alive=6 | active_pages=16 | finalized=152 | avg_finalize_batch=1.23 | urls_per_sec=2.46 | success_ratio=0.650 | timeout_ratio=0.167 | fd=10215/0 | ram=95.2% | target=12.0 | limiting_lane=render
-2026-04-07 01:10:05,515 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000002284740E620>
-  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
-
-2026-04-07 01:10:05,818 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x0000022847A84D60>
-  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
-
-2026-04-07 01:10:08,182 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x0000022848B6C220>
-  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
-
-2026-04-07 01:10:14,225 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x00000228475E4940>
-  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
-
-2026-04-07 01:10:19,374 | INFO | Hashing progress | processed=271/319 | render=275 | aux=172 | ok=172 | fail=46 | tout=46 | park=7 | match=23 | queues={render=52,aux=0,final=0} | nodes_alive=6 | active_pages=16 | finalized=172 | avg_finalize_batch=1.24 | urls_per_sec=2.45 | success_ratio=0.635 | timeout_ratio=0.170 | fd=8688/0 | ram=98.8% | target=12.0 | limiting_lane=render
-2026-04-07 01:10:22,019 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x0000022848B6FA60>
-  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
-
-2026-04-07 01:10:22,798 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x0000022848B6EF20>
-  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
-
-2026-04-07 01:10:24,657 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x0000022846D3EE60>
-  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
-
-2026-04-07 01:10:29,700 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x0000022848A837C0>
-  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
-
-2026-04-07 01:10:34,834 | INFO | Hashing progress | processed=297/319 | render=298 | aux=181 | ok=181 | fail=55 | tout=52 | park=9 | match=23 | queues={render=22,aux=0,final=0} | nodes_alive=6 | active_pages=16 | finalized=181 | avg_finalize_batch=1.24 | urls_per_sec=2.35 | success_ratio=0.609 | timeout_ratio=0.175 | fd=9855/0 | ram=97.4% | target=12.0 | limiting_lane=render
-2026-04-07 01:10:41,957 | WARNING | C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\sslproto.py:320: ResourceWarning: unclosed transport <asyncio.sslproto._SSLProtocolTransport object at 0x000002284186D660>
-  _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
-
-2026-04-07 01:10:50,052 | INFO | Hashing progress | processed=315/319 | render=316 | aux=181 | ok=181 | fail=58 | tout=67 | park=9 | match=23 | queues={render=3,aux=0,final=0} | nodes_alive=3 | active_pages=16 | finalized=181 | avg_finalize_batch=1.24 | urls_per_sec=2.23 | success_ratio=0.575 | timeout_ratio=0.213 | fd=9949/0 | ram=87.4% | target=12.0 | limiting_lane=render
-2026-04-07 01:11:05,211 | INFO | Hashing progress | processed=318/319 | render=319 | aux=181 | ok=181 | fail=58 | tout=70 | park=9 | match=23 | queues={render=0,aux=1,final=0} | nodes_alive=0 | active_pages=16 | finalized=181 | avg_finalize_batch=1.24 | urls_per_sec=2.03 | success_ratio=0.569 | timeout_ratio=0.220 | fd=9906/0 | ram=87.3% | target=12.0 | limiting_lane=aux
-2026-04-07 01:11:20,415 | INFO | Hashing progress | processed=318/319 | render=319 | aux=181 | ok=181 | fail=58 | tout=70 | park=9 | match=23 | queues={render=0,aux=1,final=0} | nodes_alive=0 | active_pages=16 | finalized=181 | avg_finalize_batch=1.24 | urls_per_sec=1.85 | success_ratio=0.569 | timeout_ratio=0.220 | fd=9906/0 | ram=84.7% | target=12.0 | limiting_lane=aux
-2026-04-07 01:11:35,602 | INFO | Hashing progress | processed=318/319 | render=319 | aux=181 | ok=181 | fail=58 | tout=70 | park=9 | match=23 | queues={render=0,aux=1,final=0} | nodes_alive=0 | active_pages=16 | finalized=181 | avg_finalize_batch=1.24 | urls_per_sec=1.70 | success_ratio=0.569 | timeout_ratio=0.220 | fd=9906/0 | ram=88.2% | target=12.0 | limiting_lane=aux
-2026-04-07 01:11:50,886 | INFO | Hashing progress | processed=318/319 | render=319 | aux=181 | ok=181 | fail=58 | tout=70 | park=9 | match=23 | queues={render=0,aux=1,final=0} | nodes_alive=0 | active_pages=16 | finalized=181 | avg_finalize_batch=1.24 | urls_per_sec=1.57 | success_ratio=0.569 | timeout_ratio=0.220 | fd=9906/0 | ram=87.7% | target=12.0 | limiting_lane=aux
-2026-04-07 01:12:02,310 | WARNING | Watchdog warning | stage=hash | stalled_for=70.4s | processed=318/319 | failed=0 | skipped=0 | queue_depth=1 | active={'processed': 318, 'render_queue_depth': 0, 'aux_queue_depth': 1, 'finalize_queue_depth': 0, 'active_fetch_limit': 16, 'render_active': 0, 'aux_active': 1, 'worker_nodes_alive': 0}
-2026-04-07 01:12:06,148 | INFO | Hashing progress | processed=318/319 | render=319 | aux=181 | ok=181 | fail=58 | tout=70 | park=9 | match=23 | queues={render=0,aux=1,final=0} | nodes_alive=0 | active_pages=16 | finalized=181 | avg_finalize_batch=1.24 | urls_per_sec=1.46 | success_ratio=0.569 | timeout_ratio=0.220 | fd=9906/0 | ram=87.5% | target=12.0 | limiting_lane=aux
-2026-04-07 01:12:17,325 | WARNING | Watchdog warning | stage=hash | stalled_for=85.4s | processed=318/319 | failed=0 | skipped=0 | queue_depth=1 | active={'processed': 318, 'render_queue_depth': 0, 'aux_queue_depth': 1, 'finalize_queue_depth': 0, 'active_fetch_limit': 16, 'render_active': 0, 'aux_active': 1, 'worker_nodes_alive': 0}
-2026-04-07 01:12:21,378 | INFO | Hashing progress | processed=318/319 | render=319 | aux=181 | ok=181 | fail=58 | tout=70 | park=9 | match=23 | queues={render=0,aux=1,final=0} | nodes_alive=0 | active_pages=16 | finalized=181 | avg_finalize_batch=1.24 | urls_per_sec=1.37 | success_ratio=0.569 | timeout_ratio=0.220 | fd=9906/0 | ram=87.3% | target=12.0 | limiting_lane=aux
-2026-04-07 01:12:25,978 | INFO | Hashing shortlist completed | passed_dns_gate=505 | processed=319 | hashed_success=182 | fetch_failed=58 | fetch_timed_out=70 | fetch_parked=9 | final_matches=23 | gpu_batches=147 | gpu_items=182 | avg_gpu_batch=1.2 | urls_per_sec=1.34 | threshold=58.0 | elapsed=237.5s
-2026-04-07 01:12:25,983 | INFO | Anchor summary (shortlisted) | typo_anchor=7 | hash_anchor=1 | clip_anchor=0 | shortlisted=23
-2026-04-07 01:12:26,004 | INFO | Typo similarity summary (shortlisted) | min=0.1818 | avg=0.6649 | p95=0.8562 | max=0.8571 | typo_min_score=0.7500
-2026-04-07 01:12:26,175 | INFO | Stage1 methods summary | rows=666 | lexical_hits=390 | hard_triggers=0 | password_pages=1 | login_forms=6 | action_mismatches=1 | deep_candidates=420 | dns_accepted=319 | deep_attempted=319 | top_escalate_reasons=lexical_hit:390, stage1_low_suspicion:170, route_to_dns_after_stage1_failure:30, stage1_suspected_non_escalated:16
-2026-04-07 01:12:26,175 | INFO | Stage1 methods CSV written to c:\Users\SATWIK\Documents\Phishing\output\stage1_methods_debug.csv
-2026-04-07 01:12:26,175 | INFO | Stage1 deep-analysis candidates CSV written to c:\Users\SATWIK\Documents\Phishing\output\stage1_deep_analysis_candidates.csv
-2026-04-07 01:12:26,352 | INFO | Stage1 review queue written to c:\Users\SATWIK\Documents\Phishing\output\hash_review_queue.csv with 186 rows
-2026-04-07 01:12:26,378 | INFO | Stage1 debug CSV written to output\stage1_lexical_debug.csv with 666 rows
-2026-04-07 01:12:26,406 | INFO | Excluded URL audit written to c:\Users\SATWIK\Documents\Phishing\output\hashing_shortlist_excluded_urls.csv with 484 rows
+2026-04-08 21:37:23,790 | INFO | Hashing shortlist completed | processed=27 | hashed_success=7 | fetch_failed=20 | fetch_timed_out=0 | final_matches=26 | gpu_batches=7 | gpu_items=7 | avg_gpu_batch=1.0 | urls_per_sec=1.03 | threshold=58.0 | elapsed=26.3s
+2026-04-08 21:37:23,791 | INFO | Anchor summary (shortlisted) | typo_anchor=10 | hash_anchor=0 | clip_anchor=0 | shortlisted=26
+2026-04-08 21:37:23,799 | INFO | Typo similarity summary (shortlisted) | min=0.2500 | avg=0.7001 | p95=0.9413 | max=0.9712 | typo_min_score=0.7500
+2026-04-08 21:37:23,808 | INFO | Stage2 hash exports written to C:\Users\SATWIK\Documents\Phishing\output\hash_folder (2 files)
+2026-04-08 21:37:23,832 | INFO | Stage1 methods summary | rows=236 | lexical_hits=26 | hard_triggers=1 | password_pages=1 | login_forms=4 | action_mismatches=4 | deep_candidates=27 | dns_accepted=27 | deep_attempted=27 | top_escalate_reasons=stage1_low_suspicion:140, stage1_fetch_failed:59, lexical_hit:26, stage1_suspected_non_escalated:10, hard_trigger_hit:1
+2026-04-08 21:37:23,832 | INFO | Stage1 methods CSV written to C:\Users\SATWIK\Documents\Phishing\output\stage1_methods_debug.csv
+2026-04-08 21:37:23,833 | INFO | Stage1 deep-analysis candidates CSV written to C:\Users\SATWIK\Documents\Phishing\output\stage1_deep_analysis_candidates.csv
+2026-04-08 21:37:23,878 | INFO | Stage1 review queue written to C:\Users\SATWIK\Documents\Phishing\output\hash_review_queue.csv with 10 rows
+2026-04-08 21:37:23,885 | INFO | Stage1 debug CSV written to output\stage1_lexical_debug.csv with 236 rows
+2026-04-08 21:37:23,900 | INFO | Excluded URL audit written to C:\Users\SATWIK\Documents\Phishing\output\hashing_shortlist_excluded_urls.csv with 210 rows
+2026-04-08 21:37:23,900 | INFO | Stage1 routing summary | review_queue_rows=10

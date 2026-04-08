@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1320" viewBox="0 0 1800 1320" role="img" aria-labelledby="title desc">
   <title id="title">Current phishing pipeline flow</title>
-  <desc id="desc">Diagram of the current pipeline stages from input URLs through DNS gate, lexical admission, fetch and scoring, OCR/TVC and enrichment, final classification, and submission outputs.</desc>
+  <desc id="desc">Diagram of the current pipeline stages from input URLs through lexical admission, fetch and scoring, OCR/TVC and enrichment, final classification, and submission outputs.</desc>
   <defs>
     <style>
       .bg { fill: #f5f1e8; }
@@ -63,7 +63,7 @@
   <text class="body" x="1387" y="314">Admit strict lexical or hash-backed rows.</text>
 
   <rect class="debug" x="382" y="348" width="250" height="42"/>
-  <text class="legend" x="405" y="375">`dns_gate_audit.csv` + DNS rejected debug</text>
+  <text class="legend" x="405" y="375">`stage1_lexical_debug.csv` + shortlist routing debug</text>
 
   <rect class="debug" x="1012" y="348" width="298" height="42"/>
   <text class="legend" x="1035" y="375">`fetch_failed_lexical_hits.csv` for admitted fetch failures</text>

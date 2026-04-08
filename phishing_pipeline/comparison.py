@@ -26,6 +26,7 @@ import math
 import os
 import time
 import torch
+from datetime import datetime, timezone
 import logging as _logging
 import warnings as _warnings
 import unicodedata
@@ -35,7 +36,7 @@ try:
     import resource as _resource
 except Exception:
     _resource = None
-from .config import HASH_STAGE_CONFIG, STAGE1_HTTP_CONFIG, resolve_hash_stage_config, resolve_stage1_http_config
+from .config import HASH_EXPORT_DIR, STAGE1_HTTP_CONFIG, resolve_stage1_http_config
 from .similarity_hashing import (
     SIMHASH_BITS,
     best_similarity_against_set,
@@ -93,6 +94,37 @@ _GENERIC_SERVICE_TOKENS = {
     "account",
     "service",
     "bank",
+}
+_GENERIC_ENTITY_NAME_TOKENS = {
+    "authority",
+    "board",
+    "centre",
+    "center",
+    "commission",
+    "committee",
+    "corporation",
+    "council",
+    "department",
+    "directorate",
+    "government",
+    "india",
+    "indian",
+    "limited",
+    "ltd",
+    "ministry",
+    "mission",
+    "national",
+    "office",
+    "official",
+    "online",
+    "portal",
+    "private",
+    "public",
+    "service",
+    "services",
+    "state",
+    "states",
+    "union",
 }
 # Parallelism tuning (auto-tuned from system resources)
 import multiprocessing as _mp
@@ -175,34 +207,21 @@ _CPU_COUNT, _RAM_GB, _VRAM_GB = _probe_runtime_resources()
 _SERVER_CLASS = _CPU_COUNT >= 32 and _RAM_GB >= 96
 _H100_SERVER_PROFILE = _SERVER_CLASS and _VRAM_GB >= 40
 
-_hash_stage_defaults = resolve_hash_stage_config(HASH_STAGE_CONFIG)
+_default_max_pages = 24
+_default_page_concurrency = 4
 
-_default_pages_per_node = int(_hash_stage_defaults.get("hash_pages_per_node", 4) or 4)
-_default_nodes_start = int(_hash_stage_defaults.get("hash_worker_nodes_start", 4) or 4)
-_default_nodes_max = int(_hash_stage_defaults.get("hash_worker_nodes_max", _default_nodes_start) or _default_nodes_start)
-_default_active_pages_start = int(_hash_stage_defaults.get("hash_active_pages_start", 24) or 24)
-_default_active_pages_max = int(_hash_stage_defaults.get("hash_active_pages_max", _default_active_pages_start) or _default_active_pages_start)
-
-HASH_PAGES_PER_NODE = _read_env_int_alias(
-    ("PHISHING_HASH_PAGES_PER_NODE", "PHISHING_HASH_PAGE_CONCURRENCY"),
-    _default_pages_per_node,
+MAX_CONCURRENT_PAGES = _read_env_int("PHISHING_HASH_PAGES", _default_max_pages)
+SCRAPER_PAGE_CONCURRENCY = min(
+    MAX_CONCURRENT_PAGES,
+    _read_env_int("PHISHING_HASH_PAGE_CONCURRENCY", _default_page_concurrency),
 )
-HASH_WORKER_NODES_START = _read_env_int("PHISHING_HASH_WORKER_NODES_START", _default_nodes_start)
-HASH_WORKER_NODES_MAX = max(
-    HASH_WORKER_NODES_START,
-    _read_env_int("PHISHING_HASH_WORKER_NODES_MAX", _default_nodes_max),
-)
-HASH_ACTIVE_PAGES_START = _read_env_int_alias(
-    ("PHISHING_HASH_ACTIVE_PAGES_START", "PHISHING_HASH_PAGES"),
-    _default_active_pages_start,
-)
-HASH_ACTIVE_PAGES_MAX = max(
-    HASH_ACTIVE_PAGES_START,
-    _read_env_int("PHISHING_HASH_ACTIVE_PAGES_MAX", _default_active_pages_max),
-)
-if HASH_WORKER_NODES_MAX * HASH_PAGES_PER_NODE < HASH_ACTIVE_PAGES_MAX:
-    HASH_WORKER_NODES_MAX = max(1, math.ceil(HASH_ACTIVE_PAGES_MAX / HASH_PAGES_PER_NODE))
-HASH_RENDER_WORKER_COUNT = max(HASH_ACTIVE_PAGES_MAX, HASH_WORKER_NODES_MAX * HASH_PAGES_PER_NODE)
+BROWSER_SHARDS = max(1, math.ceil(MAX_CONCURRENT_PAGES / SCRAPER_PAGE_CONCURRENCY))
+HASH_PAGES_PER_NODE = SCRAPER_PAGE_CONCURRENCY
+HASH_WORKER_NODES_START = BROWSER_SHARDS
+HASH_WORKER_NODES_MAX = BROWSER_SHARDS
+HASH_ACTIVE_PAGES_START = MAX_CONCURRENT_PAGES
+HASH_ACTIVE_PAGES_MAX = MAX_CONCURRENT_PAGES
+HASH_RENDER_WORKER_COUNT = BROWSER_SHARDS * SCRAPER_PAGE_CONCURRENCY
 _default_nav_timeout_ms = 15000
 _default_screenshot_timeout_ms = 6000
 _default_fetch_timeout_s = 20.0
@@ -211,55 +230,52 @@ SCRAPER_SCREENSHOT_TIMEOUT_MS = _read_env_int("PHISHING_HASH_SCREENSHOT_TIMEOUT_
 SCRAPER_FETCH_TIMEOUT_S = _read_env_float("PHISHING_HASH_FETCH_TIMEOUT_S", _default_fetch_timeout_s, minimum=1.0)
 HASH_RESULT_QUEUE_MAX = _read_env_int(
     "PHISHING_HASH_RESULT_QUEUE_MAX",
-    int(_hash_stage_defaults.get("hash_result_queue_max", HASH_RENDER_WORKER_COUNT * 4) or (HASH_RENDER_WORKER_COUNT * 4)),
+    HASH_RENDER_WORKER_COUNT * 4,
 )
 GPU_QUEUE_MAXSIZE = _read_env_int(
     "PHISHING_GPU_QUEUE_MAXSIZE",
-    HASH_RESULT_QUEUE_MAX,
+    BROWSER_SHARDS * SCRAPER_PAGE_CONCURRENCY * (4 if _SERVER_CLASS else 2),
 )
 GPU_MAX_WAIT_MS = _read_env_int("PHISHING_GPU_MAX_WAIT_MS", 120 if _H100_SERVER_PROFILE else (40 if _SERVER_CLASS else 50))
-_default_http_limit = int(_hash_stage_defaults.get("hash_aux_http_limit", 96) or 96)
-HASH_AUX_HTTP_LIMIT = _read_env_int_alias(("PHISHING_HASH_AUX_HTTP_LIMIT", "PHISHING_HASH_HTTP_LIMIT"), _default_http_limit)
+_default_http_limit = 96
+_AIOHTTP_CONNECTOR_LIMIT = _read_env_int("PHISHING_HASH_HTTP_LIMIT", _default_http_limit)
+HASH_AUX_HTTP_LIMIT = _AIOHTTP_CONNECTOR_LIMIT
 ADAPTIVE_FETCH_DOWNSHIFT_ENABLED = _read_env_bool("PHISHING_HASH_ADAPTIVE_DOWNSHIFT", True)
-ACTIVE_FETCH_LIMIT_INITIAL = HASH_ACTIVE_PAGES_START
-ACTIVE_FETCH_LIMIT_MAX = HASH_ACTIVE_PAGES_MAX
+ACTIVE_FETCH_LIMIT_INITIAL = MAX_CONCURRENT_PAGES
+ACTIVE_FETCH_LIMIT_MAX = MAX_CONCURRENT_PAGES
 ACTIVE_FETCH_LIMIT_FLOOR = min(
-    ACTIVE_FETCH_LIMIT_INITIAL,
+    MAX_CONCURRENT_PAGES,
     _read_env_int(
         "PHISHING_HASH_ACTIVE_PAGES_FLOOR",
-        max(8, ACTIVE_FETCH_LIMIT_INITIAL // 2),
+        8,
     ),
 )
-ACTIVE_FETCH_DOWNSHIFT_STEP = max(1, min(HASH_PAGES_PER_NODE, 8))
-ACTIVE_FETCH_UPSHIFT_STEP = max(1, min(HASH_PAGES_PER_NODE, 8))
+ACTIVE_FETCH_DOWNSHIFT_STEP = 8 if _H100_SERVER_PROFILE else max(1, MAX_CONCURRENT_PAGES // 4)
+ACTIVE_FETCH_UPSHIFT_STEP = ACTIVE_FETCH_DOWNSHIFT_STEP
 HASH_RAMP_INTERVAL_SECONDS = 15.0
 HASH_RENDER_QUEUE_MAX = _read_env_int(
     "PHISHING_HASH_RENDER_QUEUE_MAX",
-    int(_hash_stage_defaults.get("hash_render_queue_max", HASH_RENDER_WORKER_COUNT * 128) or (HASH_RENDER_WORKER_COUNT * 128)),
+    HASH_RENDER_WORKER_COUNT * 128,
 )
-_default_aux_net_limit = int(_hash_stage_defaults.get("hash_aux_workers", 48) or 48)
-AUX_NET_CONCURRENCY_LIMIT = _read_env_int_alias(("PHISHING_HASH_AUX_WORKERS", "PHISHING_HASH_AUX_NET_LIMIT"), _default_aux_net_limit)
+_default_aux_net_limit = 48
+AUX_NET_CONCURRENCY_LIMIT = _read_env_int("PHISHING_HASH_AUX_NET_LIMIT", _default_aux_net_limit)
 HASH_AUX_SSL_LIMIT = _read_env_int(
     "PHISHING_HASH_AUX_SSL_LIMIT",
-    int(_hash_stage_defaults.get("hash_aux_ssl_limit", 64) or 64),
+    64,
 )
 HASH_PER_HOST_LIMIT = _read_env_int(
     "PHISHING_HASH_PER_HOST_LIMIT",
-    int(_hash_stage_defaults.get("hash_per_host_limit", 4) or 4),
+    4,
 )
 HASH_PROGRESS_LOG_INTERVAL_SECONDS = _read_env_int(
     "PHISHING_HASH_PROGRESS_LOG_INTERVAL_SECONDS",
-    int(_hash_stage_defaults.get("hash_progress_log_interval_seconds", 10) or 10),
+    10,
 )
 HASH_TARGET_URLS_PER_SEC = _read_env_float_alias(
     ("PHISHING_HASH_TARGET_URLS_PER_SEC",),
-    float(_hash_stage_defaults.get("hash_target_urls_per_sec", 40.0) or 40.0),
+    float(MAX_CONCURRENT_PAGES),
     minimum=0.0,
 )
-MAX_CONCURRENT_PAGES = ACTIVE_FETCH_LIMIT_MAX
-SCRAPER_PAGE_CONCURRENCY = HASH_PAGES_PER_NODE
-BROWSER_SHARDS = HASH_WORKER_NODES_MAX
-_AIOHTTP_CONNECTOR_LIMIT = HASH_AUX_HTTP_LIMIT
 ADAPTIVE_FETCH_MIN_PROCESSED = 500
 ADAPTIVE_FETCH_PRESSURE_WINDOWS = 2
 GPU_QUEUE_BACKLOG_THRESHOLD = max(4, GPU_QUEUE_MAXSIZE // 4)
@@ -285,23 +301,19 @@ def _probe_gpu_batch_size() -> int:
 GPU_MAX_BATCH_SIZE = _read_env_int("PHISHING_GPU_BATCH_SIZE", _probe_gpu_batch_size())
 
 _clip_logger.info(
-    "Hash shortlist parallelism: worker_nodes_start=%d, worker_nodes_max=%d, pages_per_node=%d, active_pages_start=%d, active_pages_max=%d, nav_timeout_ms=%d, screenshot_timeout_ms=%d, fetch_timeout_s=%.1f, gpu_batch=%d, result_queue=%d, aux_http_limit=%d, active_fetch_floor=%d, aux_workers=%d, aux_ssl_limit=%d, per_host_limit=%d, target_urls_per_sec=%.1f, adaptive_downshift=%s",
-    HASH_WORKER_NODES_START,
-    HASH_WORKER_NODES_MAX,
-    HASH_PAGES_PER_NODE,
-    ACTIVE_FETCH_LIMIT_INITIAL,
-    ACTIVE_FETCH_LIMIT_MAX,
+    "Hash shortlist parallelism: pages=%d, shard_workers=%d, shards=%d, nav_timeout_ms=%d, screenshot_timeout_ms=%d, fetch_timeout_s=%.1f, gpu_batch=%d, gpu_queue=%d, http_limit=%d, active_fetch_limit=%d, active_fetch_floor=%d, aux_net_limit=%d, adaptive_downshift=%s",
+    MAX_CONCURRENT_PAGES,
+    SCRAPER_PAGE_CONCURRENCY,
+    BROWSER_SHARDS,
     SCRAPER_NAV_TIMEOUT_MS,
     SCRAPER_SCREENSHOT_TIMEOUT_MS,
     SCRAPER_FETCH_TIMEOUT_S,
     GPU_MAX_BATCH_SIZE,
     GPU_QUEUE_MAXSIZE,
-    HASH_AUX_HTTP_LIMIT,
+    _AIOHTTP_CONNECTOR_LIMIT,
+    ACTIVE_FETCH_LIMIT_INITIAL,
     ACTIVE_FETCH_LIMIT_FLOOR,
     AUX_NET_CONCURRENCY_LIMIT,
-    HASH_AUX_SSL_LIMIT,
-    HASH_PER_HOST_LIMIT,
-    HASH_TARGET_URLS_PER_SEC,
     ADAPTIVE_FETCH_DOWNSHIFT_ENABLED,
 )
 
@@ -343,6 +355,60 @@ class _AdaptiveFetchLimiter:
 
     async def __aexit__(self, exc_type, exc, tb):
         await self.release()
+
+
+def _compute_stage1_downshift(
+    *,
+    current_limit: int,
+    floor_limit: int,
+    step: int,
+    processed_total: int,
+    window_processed: int,
+    window_failed: int,
+    window_timed_out: int,
+    gpu_queue_depth: int,
+    gpu_backlog_threshold: int,
+    consecutive_pressure_windows: int,
+) -> dict:
+    timeout_ratio = window_timed_out / max(1, window_processed)
+    failure_ratio = (window_failed + window_timed_out) / max(1, window_processed)
+    queue_clear = gpu_queue_depth <= gpu_backlog_threshold
+    over_threshold = (
+        processed_total >= ADAPTIVE_FETCH_MIN_PROCESSED
+        and window_processed > 0
+        and queue_clear
+        and (
+            timeout_ratio >= 0.35
+            or failure_ratio >= 0.70
+        )
+    )
+
+    if not over_threshold:
+        return {
+            "next_limit": current_limit,
+            "next_consecutive_pressure_windows": 0,
+            "should_downshift": False,
+            "timeout_ratio": timeout_ratio,
+            "failure_ratio": failure_ratio,
+        }
+
+    next_consecutive = consecutive_pressure_windows + 1
+    if next_consecutive < ADAPTIVE_FETCH_PRESSURE_WINDOWS or current_limit <= floor_limit:
+        return {
+            "next_limit": current_limit,
+            "next_consecutive_pressure_windows": next_consecutive,
+            "should_downshift": False,
+            "timeout_ratio": timeout_ratio,
+            "failure_ratio": failure_ratio,
+        }
+
+    return {
+        "next_limit": max(floor_limit, current_limit - step),
+        "next_consecutive_pressure_windows": 0,
+        "should_downshift": current_limit > floor_limit,
+        "timeout_ratio": timeout_ratio,
+        "failure_ratio": failure_ratio,
+    }
 
 
 def _compute_hash_fetch_adjustment(
@@ -725,12 +791,11 @@ DEFAULT_TYPO_MIN_SCORE = 0.75
 DEFAULT_LEXICAL_PASS_MIN_SCORE = 0.85
 DEFAULT_CLIP_MARGIN_MIN = 0.20
 DEFAULT_CLIP_STRONG_SIMILARITY = 0.97
+DEFAULT_CONTENT_SPOOF_STRONG_DIRECT_BRAND_MIN = 3
 DEFAULT_STAGE1_DEBUG_CSV = os.path.join(ROOT_DIR, "output", "stage1_lexical_debug.csv")
 STAGE1_METHODS_DEBUG_PATH = os.path.join(ROOT_DIR, "output", "stage1_methods_debug.csv")
 STAGE1_DEEP_ANALYSIS_CANDIDATES_PATH = os.path.join(ROOT_DIR, "output", "stage1_deep_analysis_candidates.csv")
 FETCH_FAILED_LEXICAL_HITS_PATH = os.path.join(ROOT_DIR, "output", "fetch_failed_lexical_hits.csv")
-DNS_REJECTED_LEXICAL_HITS_PATH = os.path.join(ROOT_DIR, "output", "dns_rejected_lexical_hits.csv")
-PARKED_PAGE_EXCLUSIONS_PATH = os.path.join(ROOT_DIR, "output", "parked_page_exclusions.csv")
 STAGE1_REVIEW_QUEUE_PATH = os.path.join(ROOT_DIR, "output", "hash_review_queue.csv")
 DEFAULT_SCORING_WEIGHTS = {
     "domain": 30.0,
@@ -923,7 +988,6 @@ def _resolve_scoring_config(
     lexical_pass_min_score: float = DEFAULT_LEXICAL_PASS_MIN_SCORE,
     clip_margin_min: float = DEFAULT_CLIP_MARGIN_MIN,
     keep_stage1_suspected: bool = False,
-    keep_dns_rejected_strict_lexical: bool = False,
     keep_fetch_failed_strict_lexical: bool = False,
     stage1_escalate_total_threshold=None,
     stage1_brand_min=None,
@@ -969,7 +1033,6 @@ def _resolve_scoring_config(
     if clip_margin_min < 0:
         raise ValueError("clip_margin_min must be non-negative")
     keep_stage1_suspected = bool(keep_stage1_suspected)
-    keep_dns_rejected_strict_lexical = bool(keep_dns_rejected_strict_lexical)
     keep_fetch_failed_strict_lexical = bool(keep_fetch_failed_strict_lexical)
 
     resolved_weights = dict(DEFAULT_SCORING_WEIGHTS)
@@ -1022,7 +1085,6 @@ def _resolve_scoring_config(
         "clip_margin_min": clip_margin_min,
         "clip_similarity_floor": DEFAULT_CLIP_STRONG_SIMILARITY,
         "keep_stage1_suspected": keep_stage1_suspected,
-        "keep_dns_rejected_strict_lexical": keep_dns_rejected_strict_lexical,
         "keep_fetch_failed_strict_lexical": keep_fetch_failed_strict_lexical,
         "stage1_http_config": stage1_http_config,
     }
@@ -1040,104 +1102,15 @@ def normalize_url(url):
     return url
 
 
-_PARKING_PROVIDER_HOSTS = {
-    "GoDaddy/Afternic": ("godaddy.com", "afternic.com"),
-    "Namecheap": ("namecheap.com", "namecheapparking.com"),
-    "Sedo": ("sedo.com", "sedoparking.com"),
-    "Dan": ("dan.com",),
-    "HugeDomains": ("hugedomains.com",),
-    "ParkingCrew": ("parkingcrew.net",),
-    "Bodis": ("bodis.com",),
-    "CashParking": ("cashparking.com",),
-    "DomainMarket": ("domainmarket.com",),
-    "Squadhelp/Atom": ("squadhelp.com",),
-    "DomainEasy": ("domaineasy.com",),
-    "Squarespace": ("squarespace.com",),
-    "ParkLogic": ("parklogic.com",),
-    "GenericParking": ("dns-parking.com", "registrar-servers.com"),
-}
-
-_PARKING_PROVIDER_TEXT_PATTERNS = {
-    "GoDaddy/Afternic": (
-        r"\bgodaddy\b",
-        r"\bafternic\b",
-    ),
-    "Namecheap": (
-        r"\bnamecheap\b",
-        r"\bnamecheap parking\b",
-    ),
-    "Sedo": (
-        r"\bsedo\b",
-        r"\bsedoparking\b",
-    ),
-    "Dan": (
-        r"\bdan\.com\b",
-        r"\blease to own\b",
-    ),
-    "HugeDomains": (
-        r"\bhugedomains\b",
-    ),
-    "ParkingCrew": (
-        r"\bparkingcrew\b",
-    ),
-    "Bodis": (
-        r"\bbodis\b",
-    ),
-    "CashParking": (
-        r"\bcashparking\b",
-    ),
-    "DomainMarket": (
-        r"\bdomainmarket\b",
-    ),
-    "Squadhelp/Atom": (
-        r"\bsquadhelp\b",
-        r"\batom premium domains\b",
-    ),
-    "DomainEasy": (
-        r"\bdomaineasy\b",
-        r"\bbuy domain\b",
-    ),
-    "Squarespace": (
-        r"\bsquarespace\b",
-        r"\bdomain not claimed\b",
-    ),
-    "ParkLogic": (
-        r"\bparklogic\b",
-    ),
-    "GenericParking": (
-        r"\bdns-parking\b",
-        r"\bregistrar-servers\b",
-    ),
-}
-
-_PARKING_STRONG_TEXT_PATTERNS = (
-    ("buy_this_domain", r"\bbuy this domain\b"),
-    ("buy_domain_path", r"\bbuy domain\b"),
-    ("get_this_domain", r"\bget this domain\b"),
-    ("domain_is_for_sale", r"\bthis domain(?: name)? is for sale\b"),
-    ("domain_for_sale", r"\bdomain for sale\b"),
-    ("domain_is_parked", r"\bthis domain is parked\b"),
-    ("parked_free_courtesy", r"\bparked free(?:,)? courtesy of\b"),
-    ("domain_owner_parking", r"\bthis webpage was generated by the domain owner using\b"),
-    ("inquire_about_domain", r"\binquire about this domain\b"),
-    ("lease_to_own", r"\blease to own\b"),
-    ("domain_not_claimed", r"\bdomain not claimed\b"),
-    ("domain_expired", r"\bthis domain has expired\b"),
-    ("renew_now", r"\brenew now\b"),
-)
-
-_PARKING_WEAK_TEXT_PATTERNS = (
-    ("make_an_offer", r"\bmake an offer\b"),
-    ("broker_service", r"\bbroker service\b"),
-    ("premium_domain", r"\bpremium domain\b"),
-    ("domain_marketplace", r"\bdomain marketplace\b"),
-    ("contact_domain_owner", r"\bcontact (?:the )?domain owner\b"),
-    ("available_for_purchase", r"\bavailable for purchase\b"),
-    ("available_for_acquisition", r"\bavailable for acquisition\b"),
-    ("dns_parking", r"\bdns-parking\b"),
-    ("registrar_servers", r"\bregistrar-servers\b"),
-    ("redirecting", r"\bredirecting\b"),
-)
+def _resolve_effective_headless_target(
+    normalized_url: str,
+    final_landing_url: str = "",
+    *,
+    original_domain: str = "",
+) -> tuple[str, str]:
+    effective_url = str(final_landing_url or normalized_url or "").strip()
+    effective_domain = (urlparse(effective_url).hostname or str(original_domain or "").strip()).strip().lower()
+    return effective_url, effective_domain
 
 
 def _collapse_text(text: str) -> str:
@@ -1147,141 +1120,6 @@ def _collapse_text(text: str) -> str:
 def _is_generic_service_token(token: str) -> bool:
     token = str(token or "").strip().lower()
     return bool(token) and (token in _GENERIC_DOMAIN_PARTS or token in _GENERIC_SERVICE_TOKENS)
-
-
-def _extract_host_from_url(raw_url: str) -> str:
-    text = str(raw_url or "").strip().lower()
-    if not text:
-        return ""
-    if not text.startswith(("http://", "https://")):
-        text = "https://" + text
-    return urlparse(text).netloc.lower()
-
-
-def _match_parking_provider_for_host(host: str) -> str:
-    host = str(host or "").strip().lower()
-    if not host:
-        return ""
-    for provider, fragments in _PARKING_PROVIDER_HOSTS.items():
-        for fragment in fragments:
-            if host == fragment or host.endswith(f".{fragment}"):
-                return provider
-    return ""
-
-
-def _match_parking_provider_in_text(search_text: str) -> str:
-    search_text = _collapse_text(search_text)
-    if not search_text:
-        return ""
-    for provider, patterns in _PARKING_PROVIDER_TEXT_PATTERNS.items():
-        for pattern in patterns:
-            if re.search(pattern, search_text):
-                return provider
-    return ""
-
-
-def detect_parked_page_signals(
-    original_url: str,
-    final_landing_url: str = "",
-    html_content: str = "",
-    title_text: str = "",
-    visible_text: str = "",
-) -> dict:
-    """
-    Identify registrar / marketplace parking pages with high precision.
-
-    The detector intentionally requires strong provider or text evidence so
-    regular content pages that mention registrars are not filtered.
-    """
-    original_host = _extract_host_from_url(original_url)
-    landing_url = str(final_landing_url or original_url or "").strip()
-    final_host = _extract_host_from_url(landing_url)
-    search_text = _collapse_text(
-        " ".join(
-            part
-            for part in [
-                title_text,
-                visible_text,
-                str(html_content or "")[:200000],
-            ]
-            if part
-        )
-    )
-
-    host_provider = _match_parking_provider_for_host(final_host)
-    text_provider = _match_parking_provider_in_text(search_text)
-    provider = host_provider or text_provider or ""
-
-    strong_hits = [
-        name
-        for name, pattern in _PARKING_STRONG_TEXT_PATTERNS
-        if re.search(pattern, search_text)
-    ]
-    weak_hits = [
-        name
-        for name, pattern in _PARKING_WEAK_TEXT_PATTERNS
-        if re.search(pattern, search_text)
-    ]
-    title_text_norm = _collapse_text(title_text)
-    visible_text_norm = _collapse_text(visible_text)
-    placeholder_redirect = (
-        "redirecting" in title_text_norm
-        and len(visible_text_norm) <= 24
-        and len(search_text) <= 64
-    )
-
-    if "/buy-domain/" in landing_url.lower():
-        return {
-            "is_parked": True,
-            "parking_provider": provider or "DomainEasy",
-            "parking_reason": "provider_buy_domain_redirect",
-            "final_landing_url": landing_url,
-            "matched_signals": [landing_url],
-        }
-
-    if host_provider and final_host and final_host != original_host:
-        return {
-            "is_parked": True,
-            "parking_provider": host_provider,
-            "parking_reason": "provider_host_redirect",
-            "final_landing_url": landing_url,
-            "matched_signals": [f"host:{final_host}"],
-        }
-
-    if provider and (strong_hits or weak_hits):
-        return {
-            "is_parked": True,
-            "parking_provider": provider,
-            "parking_reason": "provider_branded_parking_template",
-            "final_landing_url": landing_url,
-            "matched_signals": strong_hits + weak_hits,
-        }
-
-    if placeholder_redirect:
-        return {
-            "is_parked": True,
-            "parking_provider": provider or "GenericParking",
-            "parking_reason": "placeholder_redirect_page",
-            "final_landing_url": landing_url,
-            "matched_signals": ["redirecting_blank_page"],
-        }
-
-    if len(strong_hits) >= 2 or (strong_hits and weak_hits) or len(weak_hits) >= 3:
-        return {
-            "is_parked": True,
-            "parking_provider": provider or "GenericParking",
-            "parking_reason": "generic_parking_text_signals",
-            "final_landing_url": landing_url,
-            "matched_signals": strong_hits + weak_hits,
-        }
-
-    return {
-        "is_parked": False,
-        "parking_provider": "",
-        "parking_reason": "",
-        "final_landing_url": landing_url,
-        "matched_signals": [],
-    }
 
 
 def _configure_hashing_log(log_path: str = HASHING_LOG_PATH) -> str:
@@ -1294,7 +1132,6 @@ def _ensure_hashing_log(log_path: str = HASHING_LOG_PATH, reset: bool = False) -
     target_loggers = (
         _clip_logger,
         _logging.getLogger("py.warnings"),
-        _logging.getLogger("phishing_pipeline.dns_gate"),
     )
     for logger in target_loggers:
         for handler in list(logger.handlers):
@@ -1319,9 +1156,6 @@ def _ensure_hashing_log(log_path: str = HASHING_LOG_PATH, reset: bool = False) -
     warning_logger = _logging.getLogger("py.warnings")
     warning_logger.setLevel(_logging.WARNING)
     warning_logger.propagate = False
-    dns_gate_logger = _logging.getLogger("phishing_pipeline.dns_gate")
-    dns_gate_logger.setLevel(_logging.INFO)
-    dns_gate_logger.propagate = False
     _logging.captureWarnings(True)
     _warnings.simplefilter("default")
     _warnings.filterwarnings(
@@ -1336,7 +1170,6 @@ def _close_hashing_log() -> None:
     for logger in (
         _clip_logger,
         _logging.getLogger("py.warnings"),
-        _logging.getLogger("phishing_pipeline.dns_gate"),
     ):
         for handler in list(logger.handlers):
             if getattr(handler, "_hashing_run_log", False):
@@ -1512,17 +1345,204 @@ def _build_fetch_failure_payload(
     }
 
 
+_PARKED_PROVIDER_HOST_HINTS = {
+    "hugedomains": "HugeDomains",
+    "sedo": "Sedo",
+    "afternic": "Afternic",
+    "dan.com": "Dan",
+    "undeveloped": "Dan",
+    "bodis": "Bodis",
+    "parkingcrew": "ParkingCrew",
+    "smartname": "SmartName",
+    "above.com": "Above.com",
+}
+
+_PARKED_PROVIDER_TEXT_HINTS = {
+    "hugedomains": "HugeDomains",
+    "sedo": "Sedo",
+    "afternic": "Afternic",
+    "dan.com": "Dan",
+    "bodis": "Bodis",
+    "parkingcrew": "ParkingCrew",
+    "smartname": "SmartName",
+}
+
+_PARKED_SALE_TEXT_PATTERNS = (
+    "buy this domain",
+    "this domain is for sale",
+    "domain is for sale",
+    "purchase this domain",
+    "make an offer",
+    "inquire about this domain",
+    "domain may be for sale",
+    "own this domain",
+    "get this domain",
+)
+
+
+def _extract_candidate_host(url: str) -> str:
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    try:
+        return (urlparse(text).hostname or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def _detect_parked_sale_signal(
+    *,
+    final_landing_url: str = "",
+    title_text: str = "",
+    visible_text: str = "",
+) -> tuple[str, str]:
+    landing_host = _extract_candidate_host(final_landing_url)
+    full_text = " ".join(
+        part.strip().lower()
+        for part in (str(title_text or ""), str(visible_text or ""))
+        if str(part or "").strip()
+    )
+
+    for host_hint, provider_name in _PARKED_PROVIDER_HOST_HINTS.items():
+        if host_hint in landing_host:
+            return provider_name, "provider_hosted_parking_redirect"
+
+    for text_hint, provider_name in _PARKED_PROVIDER_TEXT_HINTS.items():
+        if text_hint in full_text:
+            return provider_name, "provider_branded_parking_template"
+
+    if any(pattern in full_text for pattern in _PARKED_SALE_TEXT_PATTERNS):
+        return "", "parking_or_sale_keywords"
+
+    return "", ""
+
+
+def _has_suspicious_fetch_network_state(
+    fetch_status: str,
+    *,
+    fetch_error_type: str = "",
+    fetch_error_detail: str = "",
+) -> bool:
+    status = str(fetch_status or "").strip().lower()
+    if status in {"failed", "timeout"}:
+        return True
+
+    detail = " ".join(
+        part.strip().lower()
+        for part in (str(fetch_error_type or ""), str(fetch_error_detail or ""))
+        if str(part or "").strip()
+    )
+    if not detail:
+        return False
+    suspicious_markers = (
+        "err_name_not_resolved",
+        "err_connection_refused",
+        "no_records",
+        "nxdomain",
+        "not_registered",
+        "not registered",
+        "dns",
+    )
+    return any(marker in detail for marker in suspicious_markers)
+
+
+def _has_stage1_signal_seed(stage1_analysis: dict | None) -> bool:
+    stage1_analysis = stage1_analysis or {}
+    if bool(stage1_analysis.get("candidate_entities")):
+        return True
+    if bool(stage1_analysis.get("hard_trigger_hit", False)):
+        return True
+    if any(
+        int(stage1_analysis.get(field, 0) or 0) > 0
+        for field in (
+            "brand_score",
+            "credential_score",
+            "infra_score",
+            "evasion_score",
+            "total_stage1_score",
+        )
+    ):
+        return True
+    return bool(str(stage1_analysis.get("parking_reason", "") or "").strip())
+
+
+def _has_high_risk_prefetch_lexical_seed(
+    prefetch_metrics: dict | None,
+    scoring_config: dict | None,
+) -> bool:
+    prefetch_metrics = prefetch_metrics or {}
+    scoring_config = scoring_config or _DEFAULT_SCORING_CONFIG
+    if bool(prefetch_metrics.get("fallback_rank_only", False)):
+        return False
+
+    strict_lexical_hit = bool(prefetch_metrics.get("strict_lexical_hit", False))
+    lexical_score_pass = bool(prefetch_metrics.get("lexical_score_pass", False))
+    old_fuzzy_hit = bool(prefetch_metrics.get("old_fuzzy_hit", False))
+    try:
+        best_lexical_score = float(prefetch_metrics.get("best_lexical_score", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        best_lexical_score = 0.0
+    try:
+        best_typo_similarity = float(prefetch_metrics.get("best_typo_similarity", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        best_typo_similarity = 0.0
+    typo_min_score = float(scoring_config.get("typo_min_score", _DEFAULT_SCORING_CONFIG["typo_min_score"]) or _DEFAULT_SCORING_CONFIG["typo_min_score"])
+    lexical_pass_min = float(scoring_config.get("lexical_pass_min_score", _DEFAULT_SCORING_CONFIG["lexical_pass_min_score"]) or _DEFAULT_SCORING_CONFIG["lexical_pass_min_score"])
+    lexical_rescue_floor = max(0.70, lexical_pass_min - 0.10)
+    typo_anchor = best_typo_similarity >= typo_min_score
+
+    return bool(
+        strict_lexical_hit
+        or lexical_score_pass
+        or old_fuzzy_hit
+        or (typo_anchor and best_lexical_score >= lexical_rescue_floor)
+    )
+
+
+def _should_rescue_stage1_failure_to_hashing(
+    prefetch_metrics: dict | None,
+    stage1_analysis: dict | None,
+    *,
+    scoring_config: dict | None,
+) -> bool:
+    stage1_analysis = stage1_analysis or {}
+    if not _has_suspicious_fetch_network_state(
+        str(stage1_analysis.get("fetch_status", "") or ""),
+        fetch_error_type=str(stage1_analysis.get("fetch_error_type", "") or ""),
+        fetch_error_detail=str(stage1_analysis.get("fetch_error_detail", "") or ""),
+    ):
+        return False
+    return bool(
+        _has_high_risk_prefetch_lexical_seed(prefetch_metrics, scoring_config)
+        or _has_stage1_signal_seed(stage1_analysis)
+    )
+
+
+def _should_retry_high_risk_hash_fetch(
+    prefetch_metrics: dict | None,
+    stage1_analysis: dict | None,
+    *,
+    scoring_config: dict | None,
+) -> bool:
+    return bool(
+        _has_high_risk_prefetch_lexical_seed(prefetch_metrics, scoring_config)
+        or _has_stage1_signal_seed(stage1_analysis)
+    )
+
+
 def _build_prefetch_decision_row(
     normalized_url: str,
     fetch_status: str,
     prefetch_metrics: dict,
     scoring_config: dict,
+    raw_url: str = "",
     final_landing_url: str = "",
-    parking_provider: str = "",
-    parking_reason: str = "",
+    screenshot_path: str = "",
     visual_status: str = "not_attempted",
     fetch_error_type: str = "",
     fetch_error_detail: str = "",
+    parking_provider: str = "",
+    parking_reason: str = "",
     stage1_analysis: dict | None = None,
 ) -> dict:
     strict_lexical_hit = bool(prefetch_metrics.get("strict_lexical_hit", False))
@@ -1532,16 +1552,25 @@ def _build_prefetch_decision_row(
     stage1_analysis = stage1_analysis or {}
 
     lexical_contribution = float(prefetch_metrics.get("best_lexical_score", 0.0)) * scoring_config["weights"]["domain"]
+    domain = (urlparse(normalized_url).hostname or "").strip().lower()
+    final_domain = (urlparse(final_landing_url).hostname or "").strip().lower() if final_landing_url else domain
     decision_row = {
+        "raw_url": str(raw_url or normalized_url),
         "normalized_url": normalized_url,
+        "hashed_at_utc": utc_now_iso(),
+        "target_url_sha256": sha256_text(normalized_url) if normalized_url else "",
+        "hash_mode": _hash_mode_label(),
+        "domain": domain,
+        "final_domain": final_domain,
         "fetch_status": fetch_status,
         "visual_status": str(visual_status or "not_attempted"),
         "fetch_error_type": str(fetch_error_type or ""),
         "fetch_error_detail": str(fetch_error_detail or ""),
         "final_landing_url": final_landing_url,
-        "parking_provider": parking_provider,
-        "parking_reason": parking_reason,
-        "placeholder_or_parking_reason": parking_reason,
+        "parking_provider": str(parking_provider or ""),
+        "parking_reason": str(parking_reason or ""),
+        "screenshot_path": str(screenshot_path or ""),
+        "placeholder_or_parking_reason": str(parking_reason or ""),
         "source_workbook": str(prefetch_metrics.get("source_workbook", "") or ""),
         "admitted": False,
         "old_fuzzy_hit": bool(prefetch_metrics.get("old_fuzzy_hit", False)),
@@ -1556,8 +1585,16 @@ def _build_prefetch_decision_row(
         "best_entity": prefetch_metrics.get("best_entity", ""),
         "best_matching_domain": prefetch_metrics.get("best_matching_domain", ""),
         "best_score": 0.0,
+        "score_margin": 0.0,
         "confidence_band": "Low",
         "lexical_score": round(float(prefetch_metrics.get("best_lexical_score", 0.0)), 4),
+        "review_reason": "",
+        "hash_anchor": False,
+        "favicon_hash_raw": "",
+        "ssl_hash_raw": "",
+        "html_hash_raw": "",
+        "page_hash_raw": "",
+        "domain_hash_raw": "",
         **_stage1_signal_defaults(),
         "clip_similarity": 0.0,
         "favicon_hash_similarity": 0.0,
@@ -1571,6 +1608,8 @@ def _build_prefetch_decision_row(
         "typo_similarity": round(float(prefetch_metrics.get("best_typo_similarity", 0.0)), 4),
         "generic_token_only_match": bool(prefetch_metrics.get("generic_token_only_match", False)),
         "direct_brand_evidence_count": 0,
+        "deceptive_host_embedding": False,
+        "content_spoof_strong": False,
         "clip_corroborated": False,
         "stage1_passthrough": False,
         "survival_path": "",
@@ -1578,6 +1617,10 @@ def _build_prefetch_decision_row(
         "domain_component": round(lexical_contribution, 4),
         "clip_component": 0.0,
         "hash_component": 0.0,
+        "signal_hit_favicon": False,
+        "signal_hit_ssl_hash": False,
+        "signal_hit_html_hash": False,
+        "signal_hit_domain_hash": False,
     }
     decision_row.update(
         {
@@ -1585,20 +1628,33 @@ def _build_prefetch_decision_row(
             for key in _STAGE1_SIGNAL_FIELD_DEFAULTS
         }
     )
-    if fetch_status == "parked":
-        decision_row["exclusion_stage"] = "hashing_shortlist"
-        decision_row["reason"] = "parking_or_placeholder_excluded"
     return decision_row
 
 
 def _build_prefetch_admitted_failure_match(
-    url: str,
-    fetch_status: str,
-    prefetch_metrics: dict,
+    decision_row: dict,
+    *,
     scoring_config: dict,
 ) -> dict | None:
-    del url, fetch_status, prefetch_metrics, scoring_config
-    return None
+    if not isinstance(decision_row, dict):
+        return None
+    lexical_survivor = bool(
+        decision_row.get("strict_lexical_hit", False)
+        or decision_row.get("lexical_score_pass", False)
+    )
+    if not lexical_survivor or bool(decision_row.get("fallback_rank_only", False)):
+        return None
+    if not _has_suspicious_fetch_network_state(
+        str(decision_row.get("fetch_status", "") or ""),
+        fetch_error_type=str(decision_row.get("fetch_error_type", "") or ""),
+        fetch_error_detail=str(decision_row.get("fetch_error_detail", "") or ""),
+    ):
+        return None
+    return _build_stage1_passthrough_holdout_row(
+        decision_row,
+        scoring_config,
+        passthrough_path_override="failed_fetch_strict_lexical_suspected",
+    )
 
 
 def _handle_stage1_fetch_payload(
@@ -1622,23 +1678,26 @@ def _handle_stage1_fetch_payload(
         fetch_status=fetch_status,
         prefetch_metrics=prefetch_metrics,
         scoring_config=scoring_config,
+        raw_url=str(payload.get("url", normalized_url) or normalized_url),
         final_landing_url=str(payload.get("final_landing_url", "") or ""),
-        parking_provider=str(payload.get("parking_provider", "") or ""),
-        parking_reason=str(payload.get("parking_reason", "") or ""),
+        screenshot_path=str(payload.get("screenshot_path", "") or ""),
         visual_status=str(payload.get("visual_status", "not_attempted") or "not_attempted"),
         fetch_error_type=str(payload.get("fetch_error_type", "") or ""),
         fetch_error_detail=str(payload.get("fetch_error_detail", "") or ""),
+        parking_provider=str(payload.get("parking_provider", "") or ""),
+        parking_reason=str(payload.get("parking_reason", "") or ""),
         stage1_analysis=stage1_analysis,
     )
     metric_key = "fetch_failed"
     if fetch_status == "timeout":
         metric_key = "fetch_timed_out"
-    elif fetch_status == "parked":
-        metric_key = "fetch_parked"
 
     return {
         "decision_row": decision_row,
-        "admitted_prefetch_match": None,
+        "admitted_prefetch_match": _build_prefetch_admitted_failure_match(
+            decision_row,
+            scoring_config=scoring_config,
+        ),
         "queue_payload": None,
         "metric_key": metric_key,
     }
@@ -1913,35 +1972,44 @@ def _build_lexical_stage1_state(prefetch_metrics: dict) -> dict:
 def _stage1_passthrough_path(row: dict, scoring_config: dict | None = None) -> str:
     scoring_config = scoring_config or _DEFAULT_SCORING_CONFIG
     reason = str(row.get("reason", "") or "").strip()
-    strict_lexical_hit = bool(row.get("strict_lexical_hit", False))
+    lexical_survivor = bool(
+        row.get("strict_lexical_hit", False)
+        or row.get("lexical_score_pass", False)
+    )
     if (
         reason == "stage1_suspected_non_escalated"
-        and bool(scoring_config.get("keep_stage1_suspected", False))
+        and (
+            lexical_survivor
+            or bool(scoring_config.get("keep_stage1_suspected", False))
+        )
     ):
         return "stage1_suspected_passthrough"
     if (
-        reason == "dns_rejected"
-        and strict_lexical_hit
-        and bool(scoring_config.get("keep_dns_rejected_strict_lexical", False))
-    ):
-        return "dns_rejected_strict_lexical_passthrough"
-    if (
         reason == "fetch_timeout_or_fetch_failed"
-        and strict_lexical_hit
-        and bool(scoring_config.get("keep_fetch_failed_strict_lexical", False))
+        and lexical_survivor
+        and (
+            _has_suspicious_fetch_network_state(
+                str(row.get("fetch_status", "") or ""),
+                fetch_error_type=str(row.get("fetch_error_type", "") or ""),
+                fetch_error_detail=str(row.get("fetch_error_detail", "") or ""),
+            )
+            or bool(scoring_config.get("keep_fetch_failed_strict_lexical", False))
+        )
     ):
-        return "fetch_failed_strict_lexical_passthrough"
+        return "failed_fetch_strict_lexical_suspected"
     return ""
 
 
-def _build_stage1_passthrough_holdout_row(stage1_row: dict, scoring_config: dict) -> dict:
-    passthrough_path = _stage1_passthrough_path(stage1_row, scoring_config)
+def _build_stage1_passthrough_holdout_row(
+    stage1_row: dict,
+    scoring_config: dict,
+    passthrough_path_override: str | None = None,
+) -> dict:
+    passthrough_path = str(passthrough_path_override or "") or _stage1_passthrough_path(stage1_row, scoring_config)
     if not passthrough_path:
         return {}
 
     passthrough_fetch_status = str(stage1_row.get("fetch_status", "") or "").strip().lower()
-    if passthrough_path == "dns_rejected_strict_lexical_passthrough":
-        passthrough_fetch_status = "dns_rejected"
 
     typo_similarity = float(stage1_row.get("typo_similarity", 0.0) or 0.0)
     stage1_direct_evidence = any(
@@ -2040,6 +2108,8 @@ def _build_stage1_passthrough_holdout_row(stage1_row: dict, scoring_config: dict
         "signal_hit_typo": bool(stage1_row.get("strict_lexical_hit", False)) and typo_similarity >= scoring_config["typo_min_score"],
         "generic_token_only_match": bool(stage1_row.get("generic_token_only_match", False)),
         "direct_brand_evidence_count": 1 if stage1_direct_evidence else 0,
+        "deceptive_host_embedding": False,
+        "content_spoof_strong": False,
         "clip_corroborated": False,
         "screenshot_path": "",
         "html_title_text": "",
@@ -2052,6 +2122,11 @@ _STAGE1_DEBUG_FIELDNAMES = [
     "input_url",
     "normalized_url",
     "source_workbook",
+    "raw_url",
+    "hashed_at_utc",
+    "target_url_sha256",
+    "hash_mode",
+    "domain",
     "dns_status",
     "dns_decision",
     "fetch_status",
@@ -2082,6 +2157,7 @@ _STAGE1_DEBUG_FIELDNAMES = [
     "best_entity",
     "best_matching_domain",
     "best_score",
+    "score_margin",
     "confidence_band",
     "lexical_score",
     "lexical_hit",
@@ -2114,11 +2190,25 @@ _STAGE1_DEBUG_FIELDNAMES = [
     "typo_similarity",
     "generic_token_only_match",
     "direct_brand_evidence_count",
+    "deceptive_host_embedding",
+    "content_spoof_strong",
     "clip_corroborated",
     "stage1_passthrough",
     "domain_component",
     "clip_component",
     "hash_component",
+    "hash_anchor",
+    "review_reason",
+    "screenshot_path",
+    "favicon_hash_raw",
+    "ssl_hash_raw",
+    "html_hash_raw",
+    "page_hash_raw",
+    "domain_hash_raw",
+    "signal_hit_favicon",
+    "signal_hit_ssl_hash",
+    "signal_hit_html_hash",
+    "signal_hit_domain_hash",
 ]
 
 
@@ -2146,6 +2236,9 @@ _STAGE1_METHOD_FIELDNAMES = [
     "form_action_mismatch",
     "csc_mention_count",
     "redirect_count",
+    "direct_brand_evidence_count",
+    "deceptive_host_embedding",
+    "content_spoof_strong",
     "final_domain",
     "favicon_domain",
     "html_bytes_read",
@@ -2204,6 +2297,9 @@ _EXCLUDED_AUDIT_FIELDNAMES = [
     "candidate_generation_reason",
     "best_matching_domain",
     "generic_token_only_match",
+    "direct_brand_evidence_count",
+    "deceptive_host_embedding",
+    "content_spoof_strong",
     "lexical_hit",
     "brand_score",
     "credential_score",
@@ -2307,6 +2403,8 @@ def _build_stage1_debug_rows(
             "typo_similarity": round(float(prefetch_row.get("best_typo_similarity", 0.0)), 4),
             "generic_token_only_match": bool(prefetch_row.get("generic_token_only_match", False)),
             "direct_brand_evidence_count": 0,
+            "deceptive_host_embedding": False,
+            "content_spoof_strong": False,
             "clip_corroborated": False,
             "stage1_passthrough": False,
             "domain_component": 0.0,
@@ -2345,18 +2443,6 @@ def _build_stage1_debug_rows(
             stage1_rows.append(stage_row)
             continue
 
-        if dns_decision and dns_decision != "accepted":
-            stage_row["exclusion_stage"] = "dns_gate"
-            stage_row["reason"] = "dns_rejected"
-            passthrough_path = _stage1_passthrough_path(stage_row, scoring_config)
-            if passthrough_path:
-                stage_row["stage1_passthrough"] = True
-                stage_row["survival_path"] = passthrough_path
-            else:
-                stage_row["drop_path"] = stage_row["reason"]
-            stage1_rows.append(stage_row)
-            continue
-
         if not bool(stage_row.get("escalate_to_hashing")):
             stage_row["dns_status"] = "skipped"
             stage_row["dns_decision"] = "skipped"
@@ -2392,8 +2478,6 @@ def _build_stage1_debug_rows(
             if not stage_row.get("reason"):
                 if stage_row.get("kept_for_review_only"):
                     stage_row["reason"] = stage_row.get("review_only_reason", "") or "stage1_review_only"
-                elif fetch_status == "parked":
-                    stage_row["reason"] = "parking_or_placeholder_excluded"
                 elif fetch_status in {"timeout", "failed"}:
                     stage_row["reason"] = "fetch_timeout_or_fetch_failed"
                 else:
@@ -2447,6 +2531,9 @@ def _build_excluded_url_rows(stage1_debug_rows):
                 "candidate_generation_reason": row.get("candidate_generation_reason", ""),
                 "best_matching_domain": row.get("best_matching_domain", ""),
                 "generic_token_only_match": row.get("generic_token_only_match", False),
+                "direct_brand_evidence_count": row.get("direct_brand_evidence_count", 0),
+                "deceptive_host_embedding": row.get("deceptive_host_embedding", False),
+                "content_spoof_strong": row.get("content_spoof_strong", False),
                 "lexical_hit": row.get("lexical_hit", False),
                 "brand_score": row.get("brand_score", 0),
                 "credential_score": row.get("credential_score", 0),
@@ -2460,6 +2547,9 @@ def _build_excluded_url_rows(stage1_debug_rows):
                 "form_action_mismatch": row.get("form_action_mismatch", False),
                 "csc_mention_count": row.get("csc_mention_count", 0),
                 "redirect_count": row.get("redirect_count", 0),
+                "direct_brand_evidence_count": row.get("direct_brand_evidence_count", 0),
+                "deceptive_host_embedding": row.get("deceptive_host_embedding", False),
+                "content_spoof_strong": row.get("content_spoof_strong", False),
                 "final_domain": row.get("final_domain", ""),
                 "favicon_domain": row.get("favicon_domain", ""),
                 "html_bytes_read": row.get("html_bytes_read", 0),
@@ -2469,6 +2559,234 @@ def _build_excluded_url_rows(stage1_debug_rows):
             }
         )
     return excluded_rows
+
+
+def _resolve_stage1_terminal_checkpoint_outcome(stage1_row: dict) -> tuple[str | None, str, str]:
+    reason = str(stage1_row.get("reason", "") or "").strip()
+    fetch_status = str(stage1_row.get("fetch_status", "") or "").strip().lower()
+    if bool(stage1_row.get("admitted")) or bool(stage1_row.get("stage1_passthrough")):
+        return "holdout_ready", "admitted", ""
+    if bool(stage1_row.get("kept_for_review_only")):
+        return (
+            "review_only",
+            "review_only",
+            str(stage1_row.get("review_only_reason", "") or "stage1_review_only"),
+        )
+    if fetch_status in {"failed", "timeout"}:
+        return "hash_failed", "fetch_failed", str(reason or "fetch_timeout_or_fetch_failed")
+    if str(stage1_row.get("exclusion_stage", "")).strip() in {"stage1_http", "lexical_gate"}:
+        return "filtered_lexical_miss", "filtered", str(reason or "filtered_lexical_miss")
+    return None, "pending", ""
+
+
+_HASH_EXPORT_COLUMNS = (
+    "run_id",
+    "hashed_at_utc",
+    "source_workbook",
+    "export_workbook",
+    "raw_url",
+    "normalized_url",
+    "final_landing_url",
+    "domain",
+    "final_domain",
+    "hash_mode",
+    "fetch_status",
+    "visual_status",
+    "fetch_error_type",
+    "fetch_error_detail",
+    "parking_provider",
+    "parking_reason",
+    "screenshot_path",
+    "target_url_sha256",
+    "favicon_hash_raw",
+    "ssl_hash_raw",
+    "html_hash_raw",
+    "page_hash_raw",
+    "domain_hash_raw",
+    "best_entity",
+    "best_matching_domain",
+    "hash_score",
+    "confidence_band",
+    "score_margin",
+    "lexical_score",
+    "direct_brand_evidence_count",
+    "deceptive_host_embedding",
+    "content_spoof_strong",
+    "favicon_hash_similarity",
+    "favicon_hash_distance",
+    "page_hash_similarity",
+    "page_hash_distance",
+    "domain_hash_similarity",
+    "domain_hash_distance",
+    "ssl_hash_similarity",
+    "ssl_hash_distance",
+    "signal_hit_favicon",
+    "signal_hit_ssl_hash",
+    "signal_hit_html_hash",
+    "signal_hit_domain_hash",
+    "hash_anchor",
+    "admission_path",
+    "review_reason",
+)
+
+
+def _hash_mode_label() -> str:
+    return "similarity" if bool(_entity_index.get("use_similarity_hashing", False)) else "exact"
+
+
+def _hash_export_timestamp_token(run_context: RunContext | None) -> str:
+    raw = str(getattr(run_context, "started_at", "") or utc_now_iso())
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    except Exception:
+        return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+
+def _safe_hash_export_workbook_stem(workbook_name: str) -> str:
+    base_name = os.path.basename(str(workbook_name or "").strip())
+    stem = os.path.splitext(base_name)[0].strip() or "unknown_source"
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-")
+    return safe_stem or "unknown_source"
+
+
+def _split_hash_export_workbooks(source_workbook: str) -> list[str]:
+    workbooks = []
+    seen = set()
+    for item in str(source_workbook or "").split("|"):
+        workbook = str(item or "").strip()
+        if not workbook:
+            continue
+        if workbook in seen:
+            continue
+        seen.add(workbook)
+        workbooks.append(workbook)
+    return workbooks or ["unknown_source"]
+
+
+def _coerce_hash_export_text(value) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    return "" if text.lower() in {"none", "nan"} else text
+
+
+def _coerce_hash_export_int(value, default: int = -1) -> int:
+    if value is None or value == "":
+        return int(default)
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _resolve_hash_export_final_domain(decision_row: dict) -> str:
+    for candidate in (
+        str(decision_row.get("final_domain", "") or "").strip(),
+        str(decision_row.get("domain", "") or "").strip(),
+    ):
+        if candidate:
+            return candidate.lower()
+    final_landing_url = str(decision_row.get("final_landing_url", "") or "").strip()
+    if final_landing_url:
+        host = (urlparse(final_landing_url).hostname or "").strip().lower()
+        if host:
+            return host
+    normalized_url = str(decision_row.get("normalized_url", "") or "").strip()
+    return (urlparse(normalized_url).hostname or "").strip().lower()
+
+
+def _build_stage2_hash_export_row(decision_row: dict, *, run_id: str, export_workbook: str) -> dict:
+    normalized_url = str(decision_row.get("normalized_url", "") or "").strip()
+    raw_url = str(decision_row.get("raw_url", "") or decision_row.get("url", "") or normalized_url).strip()
+    final_landing_url = str(decision_row.get("final_landing_url", "") or "").strip()
+    domain = str(decision_row.get("domain", "") or "").strip().lower()
+    if not domain and normalized_url:
+        domain = (urlparse(normalized_url).hostname or "").strip().lower()
+    final_domain = _resolve_hash_export_final_domain(decision_row)
+    return {
+        "run_id": run_id,
+        "hashed_at_utc": str(decision_row.get("hashed_at_utc", "") or utc_now_iso()),
+        "source_workbook": str(decision_row.get("source_workbook", "") or ""),
+        "export_workbook": export_workbook,
+        "raw_url": raw_url,
+        "normalized_url": normalized_url,
+        "final_landing_url": final_landing_url,
+        "domain": domain,
+        "final_domain": final_domain,
+        "hash_mode": str(decision_row.get("hash_mode", "") or _hash_mode_label()),
+        "fetch_status": str(decision_row.get("fetch_status", "") or ""),
+        "visual_status": str(decision_row.get("visual_status", "") or ""),
+        "fetch_error_type": str(decision_row.get("fetch_error_type", "") or ""),
+        "fetch_error_detail": str(decision_row.get("fetch_error_detail", "") or ""),
+        "parking_provider": str(decision_row.get("parking_provider", "") or ""),
+        "parking_reason": str(decision_row.get("parking_reason", "") or ""),
+        "screenshot_path": str(decision_row.get("screenshot_path", "") or ""),
+        "target_url_sha256": str(decision_row.get("target_url_sha256", "") or (sha256_text(normalized_url) if normalized_url else "")),
+        "favicon_hash_raw": _coerce_hash_export_text(decision_row.get("favicon_hash_raw", "")),
+        "ssl_hash_raw": _coerce_hash_export_text(decision_row.get("ssl_hash_raw", "")),
+        "html_hash_raw": _coerce_hash_export_text(decision_row.get("html_hash_raw", "")),
+        "page_hash_raw": _coerce_hash_export_text(decision_row.get("page_hash_raw", "")),
+        "domain_hash_raw": _coerce_hash_export_text(decision_row.get("domain_hash_raw", "")),
+        "best_entity": str(decision_row.get("best_entity", "") or ""),
+        "best_matching_domain": str(decision_row.get("best_matching_domain", "") or ""),
+        "hash_score": round(float(decision_row.get("best_score", decision_row.get("hash_score", 0.0)) or 0.0), 4),
+        "confidence_band": str(decision_row.get("confidence_band", "") or ""),
+        "score_margin": round(float(decision_row.get("score_margin", 0.0) or 0.0), 4),
+        "lexical_score": round(float(decision_row.get("lexical_score", 0.0) or 0.0), 4),
+        "direct_brand_evidence_count": _coerce_hash_export_int(decision_row.get("direct_brand_evidence_count", 0), default=0),
+        "deceptive_host_embedding": bool(decision_row.get("deceptive_host_embedding", False)),
+        "content_spoof_strong": bool(decision_row.get("content_spoof_strong", False)),
+        "favicon_hash_similarity": round(float(decision_row.get("favicon_hash_similarity", 0.0) or 0.0), 4),
+        "favicon_hash_distance": _coerce_hash_export_int(decision_row.get("favicon_hash_distance", -1), default=-1),
+        "page_hash_similarity": round(float(decision_row.get("page_hash_similarity", 0.0) or 0.0), 4),
+        "page_hash_distance": _coerce_hash_export_int(decision_row.get("page_hash_distance", -1), default=-1),
+        "domain_hash_similarity": round(float(decision_row.get("domain_hash_similarity", 0.0) or 0.0), 4),
+        "domain_hash_distance": _coerce_hash_export_int(decision_row.get("domain_hash_distance", -1), default=-1),
+        "ssl_hash_similarity": round(float(decision_row.get("ssl_hash_similarity", 0.0) or 0.0), 4),
+        "ssl_hash_distance": _coerce_hash_export_int(decision_row.get("ssl_hash_distance", -1), default=-1),
+        "signal_hit_favicon": bool(decision_row.get("signal_hit_favicon", False)),
+        "signal_hit_ssl_hash": bool(decision_row.get("signal_hit_ssl_hash", False)),
+        "signal_hit_html_hash": bool(decision_row.get("signal_hit_html_hash", False)),
+        "signal_hit_domain_hash": bool(decision_row.get("signal_hit_domain_hash", False)),
+        "hash_anchor": bool(decision_row.get("hash_anchor", False)),
+        "admission_path": str(decision_row.get("admission_path", "") or ""),
+        "review_reason": str(decision_row.get("review_reason", "") or decision_row.get("review_only_reason", "") or ""),
+    }
+
+
+def _write_stage2_hash_exports(decision_rows: list[dict], *, run_context: RunContext | None) -> list[str]:
+    if not decision_rows:
+        return []
+    output_dir = os.path.join(getattr(run_context, "output_dir", "") or os.path.dirname(HASH_EXPORT_DIR), "hash_folder")
+    os.makedirs(output_dir, exist_ok=True)
+    run_id = str(getattr(run_context, "run_id", "") or "")
+    timestamp_token = _hash_export_timestamp_token(run_context)
+    grouped_rows: dict[str, list[dict]] = {}
+    for decision_row in decision_rows:
+        source_workbook = str(decision_row.get("source_workbook", "") or "")
+        for export_workbook in _split_hash_export_workbooks(source_workbook):
+            grouped_rows.setdefault(export_workbook, []).append(
+                _build_stage2_hash_export_row(
+                    decision_row,
+                    run_id=run_id,
+                    export_workbook=export_workbook,
+                )
+            )
+    written_paths = []
+    for export_workbook, workbook_rows in grouped_rows.items():
+        output_path = os.path.join(
+            output_dir,
+            f"{_safe_hash_export_workbook_stem(export_workbook)}__stage2_hashes__{timestamp_token}.csv",
+        )
+        temp_path = f"{output_path}.tmp"
+        with open(temp_path, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=list(_HASH_EXPORT_COLUMNS), extrasaction="ignore")
+            writer.writeheader()
+            for row in workbook_rows:
+                writer.writerow({column: row.get(column, "") for column in _HASH_EXPORT_COLUMNS})
+        os.replace(temp_path, output_path)
+        written_paths.append(output_path)
+    return written_paths
 
 
 def _build_stage1_review_queue_rows(stage1_debug_rows, scoring_config: dict | None = None):
@@ -2511,6 +2829,8 @@ def _build_stage1_review_queue_rows(stage1_debug_rows, scoring_config: dict | No
                 "placeholder_or_parking_reason": row.get("placeholder_or_parking_reason", ""),
                 "generic_token_only_match": bool(row.get("generic_token_only_match", False)),
                 "direct_brand_evidence_count": int(row.get("direct_brand_evidence_count", 0) or 0),
+                "deceptive_host_embedding": bool(row.get("deceptive_host_embedding", False)),
+                "content_spoof_strong": bool(row.get("content_spoof_strong", False)),
                 "clip_corroborated": bool(row.get("clip_corroborated", False)),
                 "lexical_hit": bool(row.get("lexical_hit", False)),
                 "brand_score": int(row.get("brand_score", 0) or 0),
@@ -2539,7 +2859,7 @@ def _build_stage1_review_queue_rows(stage1_debug_rows, scoring_config: dict | No
 def _write_stage1_debug_csv(stage1_rows, output_path: str = DEFAULT_STAGE1_DEBUG_CSV) -> str:
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=_STAGE1_DEBUG_FIELDNAMES)
+        writer = csv.DictWriter(fh, fieldnames=_STAGE1_DEBUG_FIELDNAMES, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(stage1_rows)
     return output_path
@@ -2580,6 +2900,9 @@ def _build_stage1_method_rows(stage1_rows):
                 "form_action_mismatch": row.get("form_action_mismatch", False),
                 "csc_mention_count": row.get("csc_mention_count", 0),
                 "redirect_count": row.get("redirect_count", 0),
+                "direct_brand_evidence_count": row.get("direct_brand_evidence_count", 0),
+                "deceptive_host_embedding": row.get("deceptive_host_embedding", False),
+                "content_spoof_strong": row.get("content_spoof_strong", False),
                 "final_domain": row.get("final_domain", ""),
                 "favicon_domain": row.get("favicon_domain", ""),
                 "html_bytes_read": row.get("html_bytes_read", 0),
@@ -2615,7 +2938,7 @@ def _build_stage1_method_rows(stage1_rows):
 def _write_stage1_method_rows_csv(method_rows, output_path: str) -> str:
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=_STAGE1_METHOD_FIELDNAMES)
+        writer = csv.DictWriter(fh, fieldnames=_STAGE1_METHOD_FIELDNAMES, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(method_rows)
     return output_path
@@ -2729,7 +3052,7 @@ def _write_stage1_subset_csv(stage1_rows, output_path: str, predicate) -> str:
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     subset_rows = [row for row in stage1_rows if predicate(row)]
     with open(output_path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=_STAGE1_DEBUG_FIELDNAMES)
+        writer = csv.DictWriter(fh, fieldnames=_STAGE1_DEBUG_FIELDNAMES, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(subset_rows)
     return output_path
@@ -2913,6 +3236,68 @@ def _normalized_primary_for_similarity(value: str) -> str:
     return _domain_label_skeleton(ext.domain)
 
 
+def _canonical_host(value: str) -> str:
+    text = str(value or "").strip().lower().strip(".")
+    if not text:
+        return ""
+    parsed = urlparse(text if "://" in text else f"https://{text}")
+    return (parsed.hostname or text).strip().lower().strip(".")
+
+
+def _registered_domain(value: str) -> str:
+    host = _canonical_host(value)
+    if not host:
+        return ""
+    ext = tldextract.extract(host)
+    if ext.domain and ext.suffix:
+        return f"{ext.domain}.{ext.suffix}".lower()
+    if ext.domain:
+        return ext.domain.lower()
+    if ext.suffix:
+        return ext.suffix.lower()
+    return host
+
+
+def _host_embedding_signature(value: str) -> str:
+    host = _canonical_host(value)
+    if not host:
+        return ""
+    registered = _registered_domain(host)
+    if not registered:
+        return host
+    labels = [label for label in registered.split(".") if label]
+    if labels and any(not _is_generic_service_token(label) for label in labels):
+        return registered
+    return host
+
+
+def _has_deceptive_host_embedding(final_domain: str, legitimate_domain: str) -> bool:
+    final_host = _canonical_host(final_domain)
+    legit_host = _canonical_host(legitimate_domain)
+    if not final_host or not legit_host:
+        return False
+
+    final_registered = _registered_domain(final_host)
+    legit_registered = _registered_domain(legit_host)
+    if not final_registered or not legit_registered:
+        return False
+    if final_registered == legit_registered:
+        return False
+
+    signature = _host_embedding_signature(legitimate_domain)
+    signature_labels = [label for label in signature.split(".") if label]
+    final_labels = [label for label in final_host.split(".") if label]
+    if not signature_labels or len(signature_labels) >= len(final_labels):
+        return False
+
+    max_start = len(final_labels) - len(signature_labels)
+    for start in range(max_start + 1):
+        stop = start + len(signature_labels)
+        if final_labels[start:stop] == signature_labels and stop < len(final_labels):
+            return True
+    return False
+
+
 def _extract_brand_tokens(value: str) -> set[str]:
     host = _normalized_host_for_similarity(value)
     if not host:
@@ -2937,6 +3322,22 @@ def _extract_page_brand_tokens(value: str) -> set[str]:
         token
         for token in re.split(r"[^a-z0-9]+", text)
         if token and len(token) > 2 and not _is_generic_service_token(token)
+    }
+
+
+def _extract_entity_name_tokens(value: str) -> set[str]:
+    text = _collapse_text(value)
+    if not text:
+        return set()
+    return {
+        token
+        for token in re.split(r"[^a-z0-9]+", text)
+        if (
+            token
+            and len(token) > 2
+            and token not in _GENERIC_ENTITY_NAME_TOKENS
+            and not _is_generic_service_token(token)
+        )
     }
 
 
@@ -3405,7 +3806,25 @@ async def _fetch_url_payload(
     prefetch_metrics = prefetch_metrics or _compute_prefetch_lexical_state(url, scoring_config)
     stage1_analysis = stage1_analysis or {}
 
-    async def _single_attempt():
+    attempt_configs = [
+        {
+            "wait_until": "domcontentloaded",
+            "post_wait_ms": 0,
+        }
+    ]
+    if _should_retry_high_risk_hash_fetch(
+        prefetch_metrics,
+        stage1_analysis,
+        scoring_config=scoring_config,
+    ):
+        attempt_configs.append(
+            {
+                "wait_until": "commit",
+                "post_wait_ms": 1000,
+            }
+        )
+
+    async def _single_attempt(*, wait_until: str, post_wait_ms: int):
         async with semaphore:
             async with active_fetch_limiter:
                 page = await browser_context.new_page()
@@ -3415,13 +3834,21 @@ async def _fetch_url_payload(
                         page.goto(
                             url,
                             timeout=SCRAPER_NAV_TIMEOUT_MS,
-                            wait_until="domcontentloaded",
+                            wait_until=wait_until,
                         )
                     )
                     await current_op
+                    if post_wait_ms > 0:
+                        current_op = asyncio.create_task(page.wait_for_timeout(post_wait_ms))
+                        await current_op
                     current_op = asyncio.create_task(page.content())
                     html_content = await current_op
                     final_landing_url = page.url
+                    _, effective_domain = _resolve_effective_headless_target(
+                        url,
+                        final_landing_url,
+                        original_domain=domain,
+                    )
                     soup = BeautifulSoup(html_content, "html.parser")
                     title_text = soup.title.get_text(" ", strip=True).lower() if soup.title else ""
                     visible_text = " ".join(
@@ -3429,27 +3856,11 @@ async def _fetch_url_payload(
                     ).lower()
                     words = set(visible_text.split())
                     visible_text_excerpt = visible_text[:500]
-                    parking_signals = detect_parked_page_signals(
-                        original_url=url,
+                    parking_provider, parking_reason = _detect_parked_sale_signal(
                         final_landing_url=final_landing_url,
-                        html_content=html_content,
                         title_text=title_text,
                         visible_text=visible_text,
                     )
-                    if parking_signals["is_parked"]:
-                        return {
-                            "url": url,
-                            "normalized_url": url,
-                            "source_workbook": prefetch_metrics.get("source_workbook", ""),
-                            "fetch_status": "parked",
-                            "visual_status": "not_attempted",
-                            "fetch_error_type": "",
-                            "fetch_error_detail": "",
-                            "final_landing_url": parking_signals["final_landing_url"],
-                            "parking_provider": parking_signals["parking_provider"],
-                            "parking_reason": parking_signals["parking_reason"],
-                        }
-
                     screenshot_bytes = None
                     fetch_status = "fetched"
                     visual_status = "available"
@@ -3486,11 +3897,15 @@ async def _fetch_url_payload(
                         except Exception:
                             screenshot_path = ""
 
-                    domain_hash = compute_domain_simhash(domain) if _USE_SIMILARITY_HASHING else sha256_text(domain)
+                    domain_hash = (
+                        compute_domain_simhash(effective_domain)
+                        if _USE_SIMILARITY_HASHING
+                        else sha256_text(effective_domain)
+                    )
                     html_hash = None if _USE_SIMILARITY_HASHING else sha256_text(html_content)
                     page_hash = compute_image_phash(screenshot_bytes) if (_USE_SIMILARITY_HASHING and screenshot_bytes) else None
-                    fav_task = favicon_hash_async(domain, session=aio_session)
-                    ssl_task = get_ssl_hash_async(domain)
+                    fav_task = favicon_hash_async(effective_domain, session=aio_session)
+                    ssl_task = get_ssl_hash_async(effective_domain)
                     fav_hash, ssl_hash = await asyncio.gather(fav_task, ssl_task)
 
                     n_entities = len(_entity_index["names"])
@@ -3642,7 +4057,7 @@ async def _fetch_url_payload(
                         entity_domains = _entity_index["domains"][i]
                         if entity_domains:
                             domain_sim = max(
-                                domain_similarity(domain, d) for d in entity_domains
+                                domain_similarity(effective_domain, d) for d in entity_domains
                             )
                             combined_lexical = max(
                                 float(lexical_scores[i]),
@@ -3690,8 +4105,8 @@ async def _fetch_url_payload(
                         "fetch_error_type": fetch_error_type,
                         "fetch_error_detail": fetch_error_detail,
                         "final_landing_url": final_landing_url,
-                        "parking_provider": "",
-                        "parking_reason": "",
+                        "parking_provider": parking_provider,
+                        "parking_reason": parking_reason,
                         "screenshot_path": screenshot_path,
                         "html_title_text": title_text,
                         "visible_text_excerpt": visible_text_excerpt,
@@ -3738,6 +4153,7 @@ async def _fetch_url_payload(
                             key: stage1_analysis.get(key, _STAGE1_SIGNAL_FIELD_DEFAULTS[key])
                             for key in _STAGE1_SIGNAL_FIELD_DEFAULTS
                         },
+                        "final_domain": effective_domain,
                     }
                 finally:
                     if current_op is not None and not current_op.done():
@@ -3747,12 +4163,21 @@ async def _fetch_url_payload(
                     with suppress(Exception):
                         if not page.is_closed():
                             await page.close()
-    for attempt_index in range(1):
+
+    for attempt_index, attempt_config in enumerate(attempt_configs, start=1):
         try:
-            return await asyncio.wait_for(_single_attempt(), timeout=SCRAPER_FETCH_TIMEOUT_S)
+            return await asyncio.wait_for(
+                _single_attempt(
+                    wait_until=str(attempt_config.get("wait_until", "domcontentloaded") or "domcontentloaded"),
+                    post_wait_ms=int(attempt_config.get("post_wait_ms", 0) or 0),
+                ),
+                timeout=SCRAPER_FETCH_TIMEOUT_S,
+            )
         except Exception as exc:
             error_type, error_detail, retryable = _classify_fetch_exception(exc, stage="navigation")
             fetch_status = "timeout" if error_type.endswith("_timeout") else "failed"
+            if attempt_index < len(attempt_configs) and (retryable or fetch_status == "timeout"):
+                continue
             return _build_fetch_failure_payload(
                 url=url,
                 normalized_url=url,
@@ -3776,13 +4201,32 @@ async def _render_hash_payload_on_page(
     active_fetch_limiter,
     host_limiter,
     prefetch_metrics=None,
+    stage1_analysis=None,
 ):
     url = normalize_url(url)
     parsed = urlparse(url)
     domain = parsed.netloc.lower()
     prefetch_metrics = prefetch_metrics or {}
+    stage1_analysis = stage1_analysis or {}
+    attempt_configs = [
+        {
+            "wait_until": "domcontentloaded",
+            "post_wait_ms": 0,
+        }
+    ]
+    if _should_retry_high_risk_hash_fetch(
+        prefetch_metrics,
+        stage1_analysis,
+        scoring_config=_DEFAULT_SCORING_CONFIG,
+    ):
+        attempt_configs.append(
+            {
+                "wait_until": "commit",
+                "post_wait_ms": 1000,
+            }
+        )
 
-    async def _single_attempt():
+    async def _single_attempt(*, wait_until: str, post_wait_ms: int):
         current_op = None
         host_gate = await host_limiter.acquire(domain) if host_limiter is not None else None
         try:
@@ -3791,13 +4235,21 @@ async def _render_hash_payload_on_page(
                     page.goto(
                         url,
                         timeout=SCRAPER_NAV_TIMEOUT_MS,
-                        wait_until="domcontentloaded",
+                        wait_until=wait_until,
                     )
                 )
                 await current_op
+                if post_wait_ms > 0:
+                    current_op = asyncio.create_task(page.wait_for_timeout(post_wait_ms))
+                    await current_op
                 current_op = asyncio.create_task(page.content())
                 html_content = await current_op
                 final_landing_url = page.url
+                _, effective_domain = _resolve_effective_headless_target(
+                    url,
+                    final_landing_url,
+                    original_domain=domain,
+                )
                 soup = BeautifulSoup(html_content, "html.parser")
                 title_text = soup.title.get_text(" ", strip=True).lower() if soup.title else ""
                 visible_text = " ".join(
@@ -3805,30 +4257,11 @@ async def _render_hash_payload_on_page(
                 ).lower()
                 words = set(visible_text.split())
                 visible_text_excerpt = visible_text[:500]
-                parking_signals = detect_parked_page_signals(
-                    original_url=url,
+                parking_provider, parking_reason = _detect_parked_sale_signal(
                     final_landing_url=final_landing_url,
-                    html_content=html_content,
                     title_text=title_text,
                     visible_text=visible_text,
                 )
-                if parking_signals["is_parked"]:
-                    return {
-                        "url": url,
-                        "normalized_url": url,
-                        "source_workbook": prefetch_metrics.get("source_workbook", ""),
-                        "domain": domain,
-                        "fetch_status": "parked",
-                        "visual_status": "not_attempted",
-                        "fetch_error_type": "",
-                        "fetch_error_detail": "",
-                        "final_landing_url": parking_signals["final_landing_url"],
-                        "parking_provider": parking_signals["parking_provider"],
-                        "parking_reason": parking_signals["parking_reason"],
-                        "html_title_text": title_text,
-                        "visible_text_excerpt": visible_text_excerpt,
-                    }
-
                 screenshot_bytes = None
                 fetch_status = "fetched"
                 visual_status = "available"
@@ -3870,13 +4303,14 @@ async def _render_hash_payload_on_page(
                     "normalized_url": url,
                     "source_workbook": prefetch_metrics.get("source_workbook", ""),
                     "domain": domain,
+                    "final_domain": effective_domain,
                     "fetch_status": fetch_status,
                     "visual_status": visual_status,
                     "fetch_error_type": fetch_error_type,
                     "fetch_error_detail": fetch_error_detail,
                     "final_landing_url": final_landing_url,
-                    "parking_provider": "",
-                    "parking_reason": "",
+                    "parking_provider": parking_provider,
+                    "parking_reason": parking_reason,
                     "screenshot_path": screenshot_path,
                     "html_title_text": title_text,
                     "visible_text_excerpt": visible_text_excerpt,
@@ -3884,7 +4318,11 @@ async def _render_hash_payload_on_page(
                     "html_content": html_content,
                     "visible_text_words": words,
                     "page_hash": compute_image_phash(screenshot_bytes) if (_USE_SIMILARITY_HASHING and screenshot_bytes) else None,
-                    "domain_hash": compute_domain_simhash(domain) if _USE_SIMILARITY_HASHING else sha256_text(domain),
+                    "domain_hash": (
+                        compute_domain_simhash(effective_domain)
+                        if _USE_SIMILARITY_HASHING
+                        else sha256_text(effective_domain)
+                    ),
                     "html_hash": None if _USE_SIMILARITY_HASHING else sha256_text(html_content),
                 }
         finally:
@@ -3895,18 +4333,27 @@ async def _render_hash_payload_on_page(
             if host_gate is not None:
                 host_gate.release()
 
-    try:
-        return await asyncio.wait_for(_single_attempt(), timeout=SCRAPER_FETCH_TIMEOUT_S)
-    except Exception as exc:
-        error_type, error_detail, _ = _classify_fetch_exception(exc, stage="navigation")
-        fetch_status = "timeout" if error_type.endswith("_timeout") else "failed"
-        return _build_fetch_failure_payload(
-            url=url,
-            normalized_url=url,
-            fetch_status=fetch_status,
-            error_type=error_type,
-            error_detail=error_detail,
-        )
+    for attempt_index, attempt_config in enumerate(attempt_configs, start=1):
+        try:
+            return await asyncio.wait_for(
+                _single_attempt(
+                    wait_until=str(attempt_config.get("wait_until", "domcontentloaded") or "domcontentloaded"),
+                    post_wait_ms=int(attempt_config.get("post_wait_ms", 0) or 0),
+                ),
+                timeout=SCRAPER_FETCH_TIMEOUT_S,
+            )
+        except Exception as exc:
+            error_type, error_detail, retryable = _classify_fetch_exception(exc, stage="navigation")
+            fetch_status = "timeout" if error_type.endswith("_timeout") else "failed"
+            if attempt_index < len(attempt_configs) and (retryable or fetch_status == "timeout"):
+                continue
+            return _build_fetch_failure_payload(
+                url=url,
+                normalized_url=url,
+                fetch_status=fetch_status,
+                error_type=error_type,
+                error_detail=error_detail,
+            )
 
 
 async def _enrich_render_payload_for_hashing(
@@ -3921,13 +4368,18 @@ async def _enrich_render_payload_for_hashing(
     prefetch_metrics = prefetch_metrics or {}
     stage1_analysis = stage1_analysis or {}
     domain = str(payload.get("domain", "") or "").strip().lower()
+    _, effective_domain = _resolve_effective_headless_target(
+        str(payload.get("normalized_url", payload.get("url", "")) or ""),
+        str(payload.get("final_landing_url", "") or ""),
+        original_domain=domain,
+    )
     html_content = str(payload.get("html_content", "") or "")
     words = set(payload.get("visible_text_words", set()) or set())
     resolved_weights = scoring_config["weights"]
     domain_similarity_floor = scoring_config["domain_similarity_threshold"]
 
-    fav_task = favicon_hash_async(domain, session=aio_session)
-    ssl_task = get_ssl_hash_async(domain)
+    fav_task = favicon_hash_async(effective_domain, session=aio_session)
+    ssl_task = get_ssl_hash_async(effective_domain)
     fav_hash, ssl_hash = await asyncio.gather(fav_task, ssl_task)
 
     n_entities = len(_entity_index["names"])
@@ -4069,7 +4521,7 @@ async def _enrich_render_payload_for_hashing(
             continue
         entity_domains = _entity_index["domains"][i]
         if entity_domains:
-            domain_sim = max(domain_similarity(domain, d) for d in entity_domains)
+            domain_sim = max(domain_similarity(effective_domain, d) for d in entity_domains)
             combined_lexical = max(
                 float(lexical_scores[i]),
                 domain_sim if domain_sim >= domain_similarity_floor else 0.0,
@@ -4111,6 +4563,8 @@ async def _enrich_render_payload_for_hashing(
         "normalized_url": payload.get("normalized_url", payload["url"]),
         "source_workbook": payload.get("source_workbook", ""),
         "domain": domain,
+        "final_domain": str(payload.get("final_domain", "") or effective_domain),
+        "hash_mode": _hash_mode_label(),
         "fetch_status": payload.get("fetch_status", "fetched"),
         "visual_status": payload.get("visual_status", "available"),
         "fetch_error_type": payload.get("fetch_error_type", ""),
@@ -4119,6 +4573,11 @@ async def _enrich_render_payload_for_hashing(
         "parking_provider": payload.get("parking_provider", ""),
         "parking_reason": payload.get("parking_reason", ""),
         "screenshot_path": payload.get("screenshot_path", ""),
+        "favicon_hash_raw": fav_hash if fav_hash is not None else "",
+        "ssl_hash_raw": ssl_hash if ssl_hash is not None else "",
+        "html_hash_raw": html_hash if not use_similarity_hashing and html_hash is not None else "",
+        "page_hash_raw": page_hash if use_similarity_hashing and page_hash is not None else "",
+        "domain_hash_raw": domain_hash if domain_hash is not None else "",
         "html_title_text": payload.get("html_title_text", ""),
         "visible_text_excerpt": payload.get("visible_text_excerpt", ""),
         "screenshot_bytes": payload.get("screenshot_bytes"),
@@ -4228,17 +4687,14 @@ async def _run_browser_shard(
                     scoring_config=scoring_config,
                     stage1_analysis=stage1_analysis,
                 )
-                if payload_outcome["decision_row"] is not None:
-                    decision_rows.append(payload_outcome["decision_row"])
-                admitted_prefetch_match = payload_outcome["admitted_prefetch_match"]
-                if admitted_prefetch_match is not None:
-                    metrics["final_matches_above_threshold"] += 1
-                    prefetch_admitted_failures.append(admitted_prefetch_match)
-                queue_payload = payload_outcome["queue_payload"]
+                queue_payload = _commit_legacy_shard_fetch_outcome(
+                    payload_outcome,
+                    metrics=metrics,
+                    decision_rows=decision_rows,
+                    prefetch_admitted_failures=prefetch_admitted_failures,
+                )
                 if queue_payload is not None:
                     await asyncio.wait_for(gpu_queue.put(queue_payload), timeout=5.0)
-                metrics[payload_outcome["metric_key"]] += 1
-                metrics["processed"] += 1
             except Exception as exc:
                 normalized_url = normalize_url(url)
                 prefetch_metrics = prefetch_metrics_map.get(normalized_url)
@@ -4263,14 +4719,12 @@ async def _run_browser_shard(
                     scoring_config=scoring_config,
                     stage1_analysis=stage1_analysis,
                 )
-                if payload_outcome["decision_row"] is not None:
-                    decision_rows.append(payload_outcome["decision_row"])
-                admitted_prefetch_match = payload_outcome["admitted_prefetch_match"]
-                if admitted_prefetch_match is not None:
-                    metrics["final_matches_above_threshold"] += 1
-                    prefetch_admitted_failures.append(admitted_prefetch_match)
-                metrics["fetch_failed"] += 1
-                metrics["processed"] += 1
+                _commit_legacy_shard_fetch_outcome(
+                    payload_outcome,
+                    metrics=metrics,
+                    decision_rows=decision_rows,
+                    prefetch_admitted_failures=prefetch_admitted_failures,
+                )
                 _clip_logger.warning(
                     "Shard %d error on %s: %s: %s",
                     shard_id, url, exc.__class__.__name__,
@@ -4303,6 +4757,9 @@ def _classify_stage1_admission(
     lexical_score_pass: bool,
     hash_anchor: bool,
     clip_anchor: bool,
+    weak_direct_evidence: bool = False,
+    network_corroborated: bool = False,
+    parked_sale_signal: bool = False,
 ) -> dict:
     admission_paths = []
     if best_score >= threshold:
@@ -4311,9 +4768,16 @@ def _classify_stage1_admission(
         admission_paths.append("hash_bypass_hit")
     if clip_anchor:
         admission_paths.append("clip_anchor")
+    lexical_survivor = bool(strict_lexical_hit or lexical_score_pass)
+    if lexical_survivor and weak_direct_evidence:
+        admission_paths.append("weak_direct_evidence")
+    if lexical_survivor and network_corroborated:
+        admission_paths.append("network_corroboration")
+    if lexical_survivor and parked_sale_signal:
+        admission_paths.append("parked_sale_signal")
 
     admitted_to_holdout = bool(admission_paths)
-    kept_for_review_only = bool(not admitted_to_holdout and (strict_lexical_hit or lexical_score_pass))
+    kept_for_review_only = bool(not admitted_to_holdout and lexical_survivor)
     review_only_reason = ""
     if kept_for_review_only:
         review_only_reason = (
@@ -4426,6 +4890,8 @@ def _build_shortlist_output_row(match: dict, scoring_config: dict) -> dict:
         "clip_anchor": bool(match.get("clip_anchor", False)),
         "generic_token_only_match": bool(match.get("generic_token_only_match", False)),
         "direct_brand_evidence_count": int(match.get("direct_brand_evidence_count", 0) or 0),
+        "deceptive_host_embedding": bool(match.get("deceptive_host_embedding", False)),
+        "content_spoof_strong": bool(match.get("content_spoof_strong", False)),
         "clip_corroborated": bool(match.get("clip_corroborated", False)),
         "signal_hit_screenshot": bool(match["signal_hit_screenshot"]),
         "signal_hit_typo": bool(match.get("signal_hit_typo", False)),
@@ -4452,17 +4918,26 @@ def _count_shortlist_aligned_page_brand_evidence(best_idx: int, payload: dict) -
             if part
         )
     )
-    if not page_tokens or best_idx < 0:
+    redirect_tokens = set()
+    for value in (
+        str(payload.get("final_landing_url", "") or ""),
+        str(payload.get("final_domain", "") or ""),
+    ):
+        redirect_tokens |= _extract_brand_tokens(value)
+    surface_tokens = page_tokens | redirect_tokens
+    if not surface_tokens or best_idx < 0:
         return 0
     entity_tokens = {
         token
         for token in _entity_index["brand_tokens"][best_idx]
         if token and not _is_generic_service_token(token)
     }
+    if len(_entity_index["names"]) > best_idx:
+        entity_tokens |= _extract_entity_name_tokens(_entity_index["names"][best_idx])
     keyword_tokens = set()
     for keyword in _entity_index["kw_sets"][best_idx]:
         keyword_tokens |= _extract_page_brand_tokens(keyword)
-    aligned_tokens = page_tokens & (entity_tokens | keyword_tokens)
+    aligned_tokens = surface_tokens & (entity_tokens | keyword_tokens)
     return len(aligned_tokens)
 
 
@@ -4510,6 +4985,13 @@ def _finalize_scored_hash_payload(
     best_lexical_score = float(payload["lexical_scores"][best_idx])
     best_jw_score = float(payload["jw_scores"][best_idx])
     best_token_score = float(payload["token_scores"][best_idx])
+    best_matching_domains = list(payload.get("best_matching_domains", []))
+    best_matching_domain = str(best_matching_domains[best_idx] or "") if len(best_matching_domains) > best_idx else ""
+    final_domain = str(
+        payload.get("final_domain", "")
+        or (urlparse(str(payload.get("final_landing_url", "") or "")).hostname or str(payload.get("domain", "") or ""))
+    ).strip().lower()
+    deceptive_host_embedding = _has_deceptive_host_embedding(final_domain, best_matching_domain)
     lexical_rule_hit = bool(payload["lexical_rule_hit"][best_idx])
     brand_token_hit = bool(payload["brand_token_hit"][best_idx])
     generic_token_only_match = bool(payload.get("generic_token_only_hit", np.zeros(n_entities, dtype=bool))[best_idx])
@@ -4559,6 +5041,33 @@ def _finalize_scored_hash_payload(
     if generic_token_only_match:
         strict_lexical_hit = False
         lexical_score_pass = False
+    content_spoof_strong = bool(
+        strict_lexical_hit
+        and deceptive_host_embedding
+        and direct_brand_evidence_count >= DEFAULT_CONTENT_SPOOF_STRONG_DIRECT_BRAND_MIN
+    )
+    stage1_http_suspicious = any(
+        (
+            int(payload.get("brand_score", 0) or 0) > 0,
+            int(payload.get("credential_score", 0) or 0) > 0,
+            int(payload.get("infra_score", 0) or 0) > 0,
+            int(payload.get("evasion_score", 0) or 0) > 0,
+            bool(payload.get("hard_trigger_hit", False)),
+        )
+    )
+    parked_sale_signal = bool(str(payload.get("parking_reason", "") or "").strip())
+    weak_direct_evidence = bool(
+        stage1_http_suspicious
+        or direct_brand_evidence_count > 0
+        or bool(payload["keyword_hit"][best_idx])
+        or bool(payload["domain_hit"][best_idx])
+        or favicon_hit
+        or ssl_hash_hit
+        or html_hash_hit
+        or domain_hash_hit
+        or deceptive_host_embedding
+        or content_spoof_strong
+    )
     evidence_tier = (
         "strong_evidence"
         if lexical_rule_hit and hash_anchor
@@ -4585,6 +5094,9 @@ def _finalize_scored_hash_payload(
         lexical_score_pass=lexical_score_pass,
         hash_anchor=hash_anchor,
         clip_anchor=clip_anchor,
+        weak_direct_evidence=weak_direct_evidence,
+        network_corroborated=True,
+        parked_sale_signal=parked_sale_signal,
     )
     admitted_to_holdout = bool(admission_decision["admitted_to_holdout"])
     kept_for_review_only = bool(admission_decision["kept_for_review_only"])
@@ -4594,7 +5106,13 @@ def _finalize_scored_hash_payload(
 
     decision_rows.append(
         {
+            "raw_url": payload["url"],
             "normalized_url": payload.get("normalized_url", payload["url"]),
+            "hashed_at_utc": utc_now_iso(),
+            "target_url_sha256": sha256_text(payload.get("normalized_url", payload["url"])) if payload.get("normalized_url", payload["url"]) else "",
+            "hash_mode": _hash_mode_label(),
+            "domain": payload.get("domain", ""),
+            "final_domain": final_domain,
             "source_workbook": payload.get("source_workbook", ""),
             "fetch_status": payload.get("fetch_status", "fetched"),
             "visual_status": payload.get("visual_status", "not_attempted"),
@@ -4603,6 +5121,7 @@ def _finalize_scored_hash_payload(
             "final_landing_url": payload.get("final_landing_url", ""),
             "parking_provider": payload.get("parking_provider", ""),
             "parking_reason": payload.get("parking_reason", ""),
+            "screenshot_path": payload.get("screenshot_path", ""),
             "placeholder_or_parking_reason": payload.get("parking_reason", ""),
             "admitted": admitted_to_holdout,
             "admitted_to_holdout": admitted_to_holdout,
@@ -4618,8 +5137,9 @@ def _finalize_scored_hash_payload(
             "admission_path": "|".join(dict.fromkeys(admission_paths)),
             "candidate_generation_reason": candidate_generation_reason,
             "best_entity": best_entity,
-            "best_matching_domain": payload.get("best_matching_domains", [""] * n_entities)[best_idx],
+            "best_matching_domain": best_matching_domain,
             "best_score": round(best_score, 4),
+            "score_margin": round(score_margin, 4),
             "confidence_band": confidence_band,
             "lexical_score": round(best_lexical_score, 4),
             **{
@@ -4630,6 +5150,8 @@ def _finalize_scored_hash_payload(
             "typo_similarity": round(best_typo_similarity, 4),
             "generic_token_only_match": generic_token_only_match,
             "direct_brand_evidence_count": direct_brand_evidence_count,
+            "deceptive_host_embedding": deceptive_host_embedding,
+            "content_spoof_strong": content_spoof_strong,
             "favicon_hash_similarity": round(favicon_hash_similarity, 4),
             "favicon_hash_distance": favicon_hash_distance,
             "page_hash_similarity": round(page_hash_similarity, 4),
@@ -4638,6 +5160,16 @@ def _finalize_scored_hash_payload(
             "domain_hash_distance": domain_hash_distance,
             "ssl_hash_similarity": round(ssl_hash_similarity, 4),
             "ssl_hash_distance": ssl_hash_distance,
+            "signal_hit_favicon": bool(payload["favicon_hit"][best_idx]),
+            "signal_hit_ssl_hash": bool(payload["ssl_hash_hit"][best_idx]),
+            "signal_hit_html_hash": bool(payload["html_hash_hit"][best_idx]),
+            "signal_hit_domain_hash": bool(payload["domain_hash_hit"][best_idx]),
+            "hash_anchor": bool(hash_anchor),
+            "favicon_hash_raw": _coerce_hash_export_text(payload.get("favicon_hash_raw", "")),
+            "ssl_hash_raw": _coerce_hash_export_text(payload.get("ssl_hash_raw", "")),
+            "html_hash_raw": _coerce_hash_export_text(payload.get("html_hash_raw", "")),
+            "page_hash_raw": _coerce_hash_export_text(payload.get("page_hash_raw", "")),
+            "domain_hash_raw": _coerce_hash_export_text(payload.get("domain_hash_raw", "")),
             "clip_corroborated": clip_corroborated,
             "stage1_passthrough": False,
             "survival_path": "|".join(dict.fromkeys(admission_paths)) if admitted_to_holdout else (review_only_reason if kept_for_review_only else ""),
@@ -4645,6 +5177,7 @@ def _finalize_scored_hash_payload(
             "domain_component": round(lexical_contribution, 4),
             "clip_component": 0.0,
             "hash_component": round(hash_contribution, 4),
+            "review_reason": review_only_reason,
         }
     )
 
@@ -4705,6 +5238,8 @@ def _finalize_scored_hash_payload(
         "signal_hit_keywords": bool(payload["keyword_hit"][best_idx]),
         "generic_token_only_match": generic_token_only_match,
         "direct_brand_evidence_count": direct_brand_evidence_count,
+        "deceptive_host_embedding": deceptive_host_embedding,
+        "content_spoof_strong": content_spoof_strong,
         "favicon_hash_similarity": favicon_hash_similarity,
         "favicon_hash_distance": favicon_hash_distance,
         "page_hash_similarity": page_hash_similarity,
@@ -4728,7 +5263,7 @@ def _finalize_scored_hash_payload(
         review_results.append(review_record)
 
 
-async def _gpu_microbatch_scorer(gpu_queue, results, review_results, decision_rows, metrics, threshold, scoring_config, hash_progress):
+async def _gpu_microbatch_scorer(gpu_queue, results, review_results, decision_rows, metrics, threshold, scoring_config, hash_progress=None):
     """
     Queue scorer for browser-fetched payloads.
     CLIP runtime scoring is disabled; payloads are finalized with hash/domain signals only.
@@ -4771,7 +5306,8 @@ async def _gpu_microbatch_scorer(gpu_queue, results, review_results, decision_ro
             metrics["hashed_success"] += 1
             metrics["processed"] += 1
             metrics["finalized"] += 1
-            hash_progress.mark_completed(final_status="hashed_success")
+            if hash_progress is not None:
+                hash_progress.mark_completed(final_status="hashed_success")
 
     while True:
         loop = asyncio.get_running_loop()
@@ -4799,6 +5335,19 @@ async def _gpu_microbatch_scorer(gpu_queue, results, review_results, decision_ro
 
 def _build_progress_postfix(metrics):
     elapsed = max(float(metrics.get("stage_elapsed_s", 0.0)), 1e-6)
+    if str(metrics.get("hash_execution_mode", "")).strip().lower() == "legacy_shards":
+        return {
+            "proc": metrics.get("processed", 0),
+            "ok": metrics.get("hashed_success", 0),
+            "fail": metrics.get("fetch_failed", 0),
+            "tout": metrics.get("fetch_timed_out", 0),
+            "match": metrics.get("final_matches_above_threshold", 0),
+            "gpu_batches": metrics.get("gpu_batches_flushed", 0),
+            "gpu_items": metrics.get("gpu_items_scored", 0),
+            "gpu_queue": metrics.get("gpu_queue_depth", 0),
+            "active_fetch": metrics.get("active_fetch_limit", 0),
+            "urls_per_sec": round(metrics.get("processed", 0) / elapsed, 2),
+        }
     return {
         "proc": metrics.get("processed", 0),
         "render": metrics.get("render_completed", 0),
@@ -4806,12 +5355,13 @@ def _build_progress_postfix(metrics):
         "ok": metrics.get("hashed_success", 0),
         "fail": metrics.get("fetch_failed", 0),
         "tout": metrics.get("fetch_timed_out", 0),
-        "park": metrics.get("fetch_parked", 0),
         "match": metrics.get("final_matches_above_threshold", 0),
         "final_q": metrics.get("gpu_queue_depth", 0),
         "render_q": metrics.get("render_queue_depth", 0),
         "aux_q": metrics.get("aux_queue_depth", 0),
         "active": metrics.get("active_fetch_limit", 0),
+        "live": metrics.get("live_page_workers", 0),
+        "phase": metrics.get("phase", "running"),
         "urls_per_sec": round(metrics.get("processed", 0) / elapsed, 2),
     }
 
@@ -4822,10 +5372,32 @@ def _log_hashing_periodic_status(metrics, accepted_count):
         return
     timeout_ratio = metrics.get("fetch_timed_out", 0) / max(1, processed)
     success_ratio = metrics.get("hashed_success", 0) / max(1, processed)
+    if str(metrics.get("hash_execution_mode", "")).strip().lower() == "legacy_shards":
+        _clip_logger.info(
+            "Hashing progress | processed=%d/%d | ok=%d | fail=%d | tout=%d | match=%d | "
+            "gpu_batches=%d | gpu_items=%d | gpu_queue=%d | active_fetch_limit=%d | avg_gpu_batch=%.2f | "
+            "urls_per_sec=%.2f | success_ratio=%.3f | timeout_ratio=%.3f",
+            processed,
+            accepted_count,
+            metrics.get("hashed_success", 0),
+            metrics.get("fetch_failed", 0),
+            metrics.get("fetch_timed_out", 0),
+            metrics.get("final_matches_above_threshold", 0),
+            metrics.get("gpu_batches_flushed", 0),
+            metrics.get("gpu_items_scored", 0),
+            metrics.get("gpu_queue_depth", 0),
+            metrics.get("active_fetch_limit", 0),
+            metrics.get("avg_gpu_batch_size", 0.0),
+            processed / max(float(metrics.get("stage_elapsed_s", 0.0)), 1e-6),
+            success_ratio,
+            timeout_ratio,
+        )
+        return
     _clip_logger.info(
-        "Hashing progress | processed=%d/%d | render=%d | aux=%d | ok=%d | fail=%d | tout=%d | park=%d | match=%d | "
-        "queues={render=%d,aux=%d,final=%d} | nodes_alive=%d | active_pages=%d | finalized=%d | avg_finalize_batch=%.2f | "
-        "urls_per_sec=%.2f | success_ratio=%.3f | timeout_ratio=%.3f | fd=%d/%d | ram=%.1f%% | target=%.1f | limiting_lane=%s",
+        "Hashing progress | phase=%s | processed=%d/%d | render=%d | aux=%d | ok=%d | fail=%d | tout=%d | match=%d | "
+        "queues={render=%d,aux=%d,final=%d} | nodes_alive=%d | live_pages=%d | active_pages=%d | shutdown={expected=%d,drained=%d} | "
+        "finalized=%d | avg_finalize_batch=%.2f | urls_per_sec=%.2f | success_ratio=%.3f | timeout_ratio=%.3f | fd=%d/%d | ram=%.1f%% | target=%.1f | limiting_lane=%s",
+        metrics.get("phase", "running"),
         processed,
         accepted_count,
         metrics.get("render_completed", 0),
@@ -4833,13 +5405,15 @@ def _log_hashing_periodic_status(metrics, accepted_count):
         metrics.get("hashed_success", 0),
         metrics.get("fetch_failed", 0),
         metrics.get("fetch_timed_out", 0),
-        metrics.get("fetch_parked", 0),
         metrics.get("final_matches_above_threshold", 0),
         metrics.get("render_queue_depth", 0),
         metrics.get("aux_queue_depth", 0),
         metrics.get("gpu_queue_depth", 0),
         metrics.get("worker_nodes_alive", 0),
+        metrics.get("live_page_workers", 0),
         metrics.get("active_fetch_limit", 0),
+        metrics.get("shutdown_sentinels_expected", 0),
+        metrics.get("shutdown_sentinels_drained", 0),
         metrics.get("gpu_items_scored", 0),
         metrics.get("avg_gpu_batch_size", 0.0),
         processed / max(float(metrics.get("stage_elapsed_s", 0.0)), 1e-6),
@@ -4861,16 +5435,14 @@ def _log_hashing_metrics_summary(
     typo_min_score=None,
 ):
     _clip_logger.info(
-        "Hashing shortlist completed | passed_dns_gate=%d | processed=%d | "
-        "hashed_success=%d | fetch_failed=%d | fetch_timed_out=%d | fetch_parked=%d | "
+        "Hashing shortlist completed | processed=%d | "
+        "hashed_success=%d | fetch_failed=%d | fetch_timed_out=%d | "
         "final_matches=%d | gpu_batches=%d | gpu_items=%d | avg_gpu_batch=%.1f | urls_per_sec=%.2f | "
         "threshold=%s | elapsed=%.1fs",
-        metrics["passed_dns_gate"],
         metrics["processed"],
         metrics["hashed_success"],
         metrics["fetch_failed"],
         metrics["fetch_timed_out"],
-        metrics.get("fetch_parked", 0),
         metrics["final_matches_above_threshold"],
         metrics["gpu_batches_flushed"],
         metrics.get("gpu_items_scored", 0),
@@ -4934,6 +5506,88 @@ def _commit_terminal_hash_outcome(
     hash_progress.mark_completed(final_status=payload_outcome["metric_key"])
 
 
+def _commit_legacy_shard_fetch_outcome(
+    payload_outcome,
+    *,
+    metrics,
+    decision_rows,
+    prefetch_admitted_failures,
+):
+    if payload_outcome["decision_row"] is not None:
+        decision_rows.append(payload_outcome["decision_row"])
+    admitted_prefetch_match = payload_outcome["admitted_prefetch_match"]
+    if admitted_prefetch_match is not None:
+        metrics["final_matches_above_threshold"] += 1
+        prefetch_admitted_failures.append(admitted_prefetch_match)
+    if payload_outcome["queue_payload"] is None:
+        metrics[payload_outcome["metric_key"]] += 1
+        metrics["processed"] += 1
+        metrics["finalized"] += 1
+    return payload_outcome["queue_payload"]
+
+
+def _set_hash_worker_state(
+    worker_states,
+    worker_id,
+    *,
+    node_id,
+    page_worker_id,
+    phase,
+    current_url="",
+    consecutive_failures=0,
+):
+    worker_states[worker_id] = {
+        "node_id": int(node_id),
+        "page_worker_id": int(page_worker_id),
+        "phase": str(phase or ""),
+        "current_url": str(current_url or ""),
+        "consecutive_failures": int(max(0, consecutive_failures)),
+        "last_progress_monotonic": time.monotonic(),
+    }
+
+
+def _summarize_hash_worker_states(worker_states):
+    phase_counts = Counter()
+    stale_workers = {}
+    now = time.monotonic()
+    for worker_id, state in list(worker_states.items()):
+        phase = str(state.get("phase", "") or "unknown")
+        phase_counts[phase] += 1
+        age = max(0.0, now - float(state.get("last_progress_monotonic", now) or now))
+        if age >= 60.0:
+            stale_workers[worker_id] = {
+                "phase": phase,
+                "url": str(state.get("current_url", "") or ""),
+                "age_seconds": round(age, 1),
+                "node_id": int(state.get("node_id", -1) or -1),
+                "page_worker_id": int(state.get("page_worker_id", -1) or -1),
+            }
+    return {
+        "live_page_workers": len(worker_states),
+        "phase_counts": dict(phase_counts),
+        "stale_workers": stale_workers,
+    }
+
+
+def _desired_hash_worker_nodes(active_page_limit: int) -> int:
+    desired = int(math.ceil(max(1, active_page_limit) / max(1, HASH_PAGES_PER_NODE)))
+    desired = max(HASH_WORKER_NODES_START, desired)
+    return max(1, min(HASH_WORKER_NODES_MAX, desired))
+
+
+def _drain_asyncio_queue_nowait(queue) -> int:
+    drained = 0
+    while True:
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        else:
+            queue.task_done()
+            drained += 1
+    return drained
+
+
 async def _queue_hash_lane_item(queue, item, *, lane_name, metrics, active_fetch_limiter):
     while True:
         try:
@@ -4956,17 +5610,20 @@ async def _reset_hash_page(page, browser_context, *, recycle: bool):
     if page is not None and not page.is_closed():
         if recycle:
             with suppress(Exception):
-                await page.close()
+                await asyncio.wait_for(page.close(), timeout=3.0)
             page = None
         else:
             try:
-                await page.goto("about:blank", wait_until="domcontentloaded", timeout=3000)
+                await asyncio.wait_for(
+                    page.goto("about:blank", wait_until="domcontentloaded", timeout=3000),
+                    timeout=3.0,
+                )
             except Exception:
                 with suppress(Exception):
-                    await page.close()
+                    await asyncio.wait_for(page.close(), timeout=3.0)
                 page = None
     if page is None:
-        page = await browser_context.new_page()
+        page = await asyncio.wait_for(browser_context.new_page(), timeout=5.0)
     return page
 
 
@@ -4985,23 +5642,76 @@ async def _run_hash_browser_node(
     hash_progress,
     scoring_config,
     active_workers,
+    worker_states,
+    worker_tasks,
 ):
-    p = await async_playwright().start()
-    browser = await p.chromium.launch(headless=True)
-    ctx = await browser.new_context(ignore_https_errors=True, service_workers="block")
-    await ctx.route("**/*", _route_nonessential_requests)
-    ctx.set_default_navigation_timeout(SCRAPER_NAV_TIMEOUT_MS)
-    ctx.set_default_timeout(SCRAPER_SCREENSHOT_TIMEOUT_MS)
+    p = None
+    browser = None
+    ctx = None
+    try:
+        p = await async_playwright().start()
+        browser = await p.chromium.launch(headless=True)
+        ctx = await browser.new_context(ignore_https_errors=True, service_workers="block")
+        await ctx.route("**/*", _route_nonessential_requests)
+        ctx.set_default_navigation_timeout(SCRAPER_NAV_TIMEOUT_MS)
+        ctx.set_default_timeout(SCRAPER_SCREENSHOT_TIMEOUT_MS)
+    except Exception as exc:
+        _clip_logger.warning(
+            "Hash browser node %s startup failed: %s: %s",
+            node_id,
+            exc.__class__.__name__,
+            _compact_exception_message(exc),
+        )
+        for cleanup in (ctx.close if ctx is not None else None, browser.close if browser is not None else None, p.stop if p is not None else None):
+            if cleanup is None:
+                continue
+            with suppress(Exception):
+                await asyncio.wait_for(cleanup(), timeout=10.0)
+        return
 
     async def _page_worker(slot_id: int):
         worker_id = f"node-{node_id}:page-{slot_id}"
+        worker_tasks[worker_id] = asyncio.current_task()
+        _set_hash_worker_state(
+            worker_states,
+            worker_id,
+            node_id=node_id,
+            page_worker_id=slot_id,
+            phase="starting",
+        )
         page = None
         urls_since_recycle = 0
+        consecutive_failures = 0
         try:
             page = await _reset_hash_page(None, ctx, recycle=False)
+            _set_hash_worker_state(
+                worker_states,
+                worker_id,
+                node_id=node_id,
+                page_worker_id=slot_id,
+                phase="idle",
+                consecutive_failures=consecutive_failures,
+            )
             while True:
+                item_taken = False
+                raw_url = ""
+                normalized_url = ""
+                prefetch_metrics = {}
+                stage1_analysis = {}
+                recycle_page = False
+                cancel_requested = False
+                cancel_error = None
                 item = await render_queue.get()
+                item_taken = True
                 if item is None:
+                    _set_hash_worker_state(
+                        worker_states,
+                        worker_id,
+                        node_id=node_id,
+                        page_worker_id=slot_id,
+                        phase="shutdown",
+                        consecutive_failures=consecutive_failures,
+                    )
                     render_queue.task_done()
                     break
                 raw_url = str(item.get("url", "") or "")
@@ -5009,7 +5719,15 @@ async def _run_hash_browser_node(
                 prefetch_metrics = item.get("prefetch_metrics") or prefetch_metrics_map.get(normalized_url) or {}
                 stage1_analysis = item.get("stage1_analysis") or stage1_analysis_map.get(normalized_url, {}) or {}
                 active_workers[worker_id] = normalized_url
-                recycle_page = False
+                _set_hash_worker_state(
+                    worker_states,
+                    worker_id,
+                    node_id=node_id,
+                    page_worker_id=slot_id,
+                    phase="render",
+                    current_url=normalized_url,
+                    consecutive_failures=consecutive_failures,
+                )
                 try:
                     render_payload = await _render_hash_payload_on_page(
                         raw_url,
@@ -5017,6 +5735,7 @@ async def _run_hash_browser_node(
                         active_fetch_limiter,
                         host_limiter,
                         prefetch_metrics=prefetch_metrics,
+                        stage1_analysis=stage1_analysis,
                     )
                     metrics["render_completed"] += 1
                     if str(render_payload.get("fetch_status", "")).strip().lower() in {"fetched", "fetched_visual_missing"}:
@@ -5047,6 +5766,38 @@ async def _run_hash_browser_node(
                             hash_progress=hash_progress,
                         )
                         recycle_page = True
+                    consecutive_failures = 0
+                except asyncio.CancelledError as exc:
+                    cancel_requested = True
+                    cancel_error = exc
+                    if normalized_url:
+                        payload_outcome = _handle_stage1_fetch_payload(
+                            payload={
+                                "url": normalized_url or raw_url,
+                                "normalized_url": normalized_url or raw_url,
+                                "source_workbook": prefetch_metrics.get("source_workbook", ""),
+                                "fetch_status": "failed",
+                                "visual_status": "not_attempted",
+                                "fetch_error_type": "worker_stall",
+                                "fetch_error_detail": "hash render worker cancelled during stall recovery",
+                                "final_landing_url": "",
+                                "parking_provider": "",
+                                "parking_reason": "",
+                            },
+                            normalized_url=normalized_url or raw_url,
+                            prefetch_metrics=prefetch_metrics,
+                            scoring_config=scoring_config,
+                            stage1_analysis=stage1_analysis,
+                        )
+                        _commit_terminal_hash_outcome(
+                            payload_outcome,
+                            metrics=metrics,
+                            decision_rows=decision_rows,
+                            prefetch_admitted_failures=prefetch_admitted_failures,
+                            hash_progress=hash_progress,
+                        )
+                    consecutive_failures += 1
+                    raise
                 except Exception as exc:
                     payload_outcome = _handle_stage1_fetch_payload(
                         payload={
@@ -5081,35 +5832,90 @@ async def _run_hash_browser_node(
                         exc.__class__.__name__,
                         _compact_exception_message(exc),
                     )
+                    consecutive_failures += 1
                 finally:
                     active_workers.pop(worker_id, None)
-                    render_queue.task_done()
-                    urls_since_recycle += 1
-                    try:
-                        page = await _reset_hash_page(
-                            page,
-                            ctx,
-                            recycle=recycle_page or urls_since_recycle >= 50,
+                    if item_taken:
+                        render_queue.task_done()
+                    if not cancel_requested:
+                        _set_hash_worker_state(
+                            worker_states,
+                            worker_id,
+                            node_id=node_id,
+                            page_worker_id=slot_id,
+                            phase="reset",
+                            consecutive_failures=consecutive_failures,
                         )
-                        if recycle_page or urls_since_recycle >= 50:
-                            urls_since_recycle = 0
-                    except Exception:
-                        with suppress(Exception):
-                            if page is not None and not page.is_closed():
-                                await page.close()
-                        page = None
+                        try:
+                            urls_since_recycle += 1
+                            page = await _reset_hash_page(
+                                page,
+                                ctx,
+                                recycle=recycle_page or urls_since_recycle >= 50,
+                            )
+                            if recycle_page or urls_since_recycle >= 50:
+                                urls_since_recycle = 0
+                            _set_hash_worker_state(
+                                worker_states,
+                                worker_id,
+                                node_id=node_id,
+                                page_worker_id=slot_id,
+                                phase="idle",
+                                consecutive_failures=consecutive_failures,
+                            )
+                        except asyncio.CancelledError:
+                            cancel_requested = True
+                            if cancel_error is None:
+                                cancel_error = asyncio.CancelledError()
+                        except Exception as reset_exc:
+                            metrics["stuck_reset_recoveries"] = metrics.get("stuck_reset_recoveries", 0) + 1
+                            _clip_logger.warning(
+                                "Hash render worker %s reset error after %s: %s: %s",
+                                worker_id,
+                                normalized_url or raw_url,
+                                reset_exc.__class__.__name__,
+                                _compact_exception_message(reset_exc),
+                            )
+                            with suppress(Exception):
+                                if page is not None and not page.is_closed():
+                                    await asyncio.wait_for(page.close(), timeout=3.0)
+                            page = None
+                            try:
+                                page = await _reset_hash_page(None, ctx, recycle=False)
+                                urls_since_recycle = 0
+                                _set_hash_worker_state(
+                                    worker_states,
+                                    worker_id,
+                                    node_id=node_id,
+                                    page_worker_id=slot_id,
+                                    phase="idle",
+                                    consecutive_failures=consecutive_failures,
+                                )
+                            except Exception as restart_exc:
+                                _clip_logger.warning(
+                                    "Hash render worker %s page restart failed: %s: %s",
+                                    worker_id,
+                                    restart_exc.__class__.__name__,
+                                    _compact_exception_message(restart_exc),
+                                )
+                                break
+                if cancel_requested:
+                    raise cancel_error if cancel_error is not None else asyncio.CancelledError()
         finally:
+            worker_tasks.pop(worker_id, None)
+            worker_states.pop(worker_id, None)
+            active_workers.pop(worker_id, None)
             with suppress(Exception):
                 if page is not None and not page.is_closed():
-                    await page.close()
+                    await asyncio.wait_for(page.close(), timeout=3.0)
 
     workers = [asyncio.create_task(_page_worker(slot_id)) for slot_id in range(HASH_PAGES_PER_NODE)]
     try:
-        await asyncio.gather(*workers)
+        await asyncio.gather(*workers, return_exceptions=True)
     finally:
         for cleanup in (ctx.close, browser.close, p.stop):
             with suppress(Exception):
-                await cleanup()
+                await asyncio.wait_for(cleanup(), timeout=10.0)
 
 
 async def _run_hash_aux_worker(
@@ -5155,7 +5961,7 @@ async def _run_hash_aux_worker(
         except Exception as exc:
             payload_outcome = _handle_stage1_fetch_payload(
                 payload={
-                    "url": normalized_url,
+                    "url": render_payload.get("url", normalized_url),
                     "normalized_url": normalized_url,
                     "source_workbook": prefetch_metrics.get("source_workbook", ""),
                     "fetch_status": "failed",
@@ -5165,6 +5971,7 @@ async def _run_hash_aux_worker(
                     "final_landing_url": render_payload.get("final_landing_url", ""),
                     "parking_provider": render_payload.get("parking_provider", ""),
                     "parking_reason": render_payload.get("parking_reason", ""),
+                    "screenshot_path": render_payload.get("screenshot_path", ""),
                 },
                 normalized_url=normalized_url,
                 prefetch_metrics=prefetch_metrics,
@@ -5207,31 +6014,6 @@ class _Stage1PerHostLimiter:
                 self._semaphores[host_key] = semaphore
         async with semaphore:
             return await awaitable_factory()
-
-
-def _build_stage1_dns_prefetch_map(audit_rows: list[dict]) -> dict[str, dict]:
-    prefetch_map: dict[str, dict] = {}
-    for row in audit_rows or []:
-        if str(row.get("decision", "")).strip().lower() != "accepted":
-            continue
-        normalized_target = normalize_url(str(row.get("target_url", "")).strip())
-        if not normalized_target:
-            continue
-        resolved_ips_raw = row.get("resolved_ips", [])
-        if isinstance(resolved_ips_raw, str):
-            resolved_ips = [part.strip() for part in resolved_ips_raw.split(";") if part.strip()]
-        else:
-            resolved_ips = [str(part).strip() for part in (resolved_ips_raw or []) if str(part).strip()]
-        prefetch_map[normalized_target] = {
-            "resolved_ips": resolved_ips,
-            "dns_answer_count": int(row.get("dns_answer_count", len(resolved_ips)) or len(resolved_ips)),
-            "first_resolved_ip": str(row.get("first_resolved_ip", "") or (resolved_ips[0] if resolved_ips else "")),
-            "asn": row.get("asn"),
-            "asn_org": str(row.get("asn_org", "") or ""),
-            "country": str(row.get("country", "") or ""),
-            "dns_status": str(row.get("dns_status", "") or ""),
-        }
-    return prefetch_map
 
 
 def _stage1_fd_usage() -> tuple[int | None, int | None, float | None]:
@@ -5293,17 +6075,21 @@ def _build_stage1_failed_result(
 async def _analyze_stage1_http_candidates(
     urls: list[str],
     stage1_http_config: dict | None = None,
+    scoring_config: dict | None = None,
     run_context: RunContext | None = None,
     checkpoint_store: CheckpointStore | None = None,
     source_workbook_map: dict[str, str] | None = None,
     dns_prefetch_map: dict[str, dict] | None = None,
+    prefetch_metrics_map: dict[str, dict] | None = None,
 ) -> dict[str, dict]:
     if not urls:
         return {}
 
     stage1_http_config = dict(stage1_http_config or STAGE1_HTTP_CONFIG)
+    scoring_config = dict(scoring_config or _DEFAULT_SCORING_CONFIG)
     source_workbook_map = dict(source_workbook_map or {})
     dns_prefetch_map = dict(dns_prefetch_map or {})
+    prefetch_metrics_map = dict(prefetch_metrics_map or {})
     fetch_concurrency = max(
         1,
         int(stage1_http_config.get("stage1_fetch_concurrency_start", stage1_http_config.get("concurrency", 24))),
@@ -5434,7 +6220,7 @@ async def _analyze_stage1_http_candidates(
                             "limit": fetch_limiter.limit,
                             "esc": progress_metrics["escalated"],
                             "fail": progress_metrics["failed"],
-                            "dnsfb": progress_metrics["fallback_dns"],
+                            "failfb": progress_metrics["fallback_dns"],
                         },
                         refresh=False,
                     )
@@ -5451,7 +6237,7 @@ async def _analyze_stage1_http_candidates(
                     telemetry["fd_limit"] = fd_limit
                     telemetry["fd_ratio"] = fd_ratio
                     _clip_logger.info(
-                        "Stage1 cheap HTTP progress | processed=%d/%d | rate=%.1f url/s | elapsed=%.1fs | eta=%.1fs | active=%d | queue=%d | fetch_limit=%d | escalated=%d | failed=%d | fallback_dns=%d | fd=%s/%s | event_loop_lag_ms=%.1f | timeout_ratio=%.3f",
+                        "Stage1 cheap HTTP progress | processed=%d/%d | rate=%.1f url/s | elapsed=%.1fs | eta=%.1fs | active=%d | queue=%d | fetch_limit=%d | escalated=%d | failed=%d | failure_fallback=%d | fd=%s/%s | event_loop_lag_ms=%.1f | timeout_ratio=%.3f",
                         completed,
                         len(urls),
                         rate,
@@ -5584,12 +6370,18 @@ async def _analyze_stage1_http_candidates(
                         )
                     )
                     fallback_taken = ""
+                    prefetch_metrics = prefetch_metrics_map.get(normalized_url, {})
                     if (
                         str(analysis.get("fetch_status", "")).strip().lower() == "failed"
                         and run_context is not None
                         and run_context.stage1_failure_policy == "route_to_dns"
+                        and _should_rescue_stage1_failure_to_hashing(
+                            prefetch_metrics,
+                            analysis,
+                            scoring_config=scoring_config,
+                        )
                     ):
-                        fallback_taken = "route_to_dns_after_stage1_failure"
+                        fallback_taken = "targeted_stage1_failure_rescue"
                         analysis["fallback_taken"] = fallback_taken
                         analysis["escalate_to_hashing"] = True
                         analysis["escalate_reason"] = fallback_taken
@@ -5702,7 +6494,7 @@ async def _analyze_stage1_http_candidates(
                         "limit": fetch_limiter.limit,
                         "esc": progress_metrics["escalated"],
                         "fail": progress_metrics["failed"],
-                        "dnsfb": progress_metrics["fallback_dns"],
+                        "failfb": progress_metrics["fallback_dns"],
                     },
                     refresh=False,
                 )
@@ -5711,7 +6503,7 @@ async def _analyze_stage1_http_candidates(
 
     elapsed_s = max(0.001, time.perf_counter() - stage1_started_monotonic)
     _clip_logger.info(
-        "Stage1 cheap HTTP completed | processed=%d/%d | rate=%.1f url/s | elapsed=%.1fs | escalated=%d | failed=%d | fallback_dns=%d | final_fetch_limit=%d",
+        "Stage1 cheap HTTP completed | processed=%d/%d | rate=%.1f url/s | elapsed=%.1fs | escalated=%d | failed=%d | failure_fallback=%d | final_fetch_limit=%d",
         progress.completed,
         len(urls),
         progress.completed / elapsed_s,
@@ -5739,14 +6531,10 @@ async def run_hashing_shortlist_streaming(
     typo_min_score=DEFAULT_TYPO_MIN_SCORE,
     lexical_pass_min_score=DEFAULT_LEXICAL_PASS_MIN_SCORE,
     clip_margin_min=DEFAULT_CLIP_MARGIN_MIN,
-    dns_timeout=None,
-    dns_retries=None,
-    dns_max_workers=None,
     weights=None,
     shortlist_debug_csv: str | None = DEFAULT_STAGE1_DEBUG_CSV,
     url_sources: dict | None = None,
     keep_stage1_suspected: bool = False,
-    keep_dns_rejected_strict_lexical: bool = False,
     keep_fetch_failed_strict_lexical: bool = False,
     stage1_escalate_total_threshold=None,
     stage1_brand_min=None,
@@ -5780,7 +6568,6 @@ async def run_hashing_shortlist_streaming(
         lexical_pass_min_score=lexical_pass_min_score,
         clip_margin_min=clip_margin_min,
         keep_stage1_suspected=keep_stage1_suspected,
-        keep_dns_rejected_strict_lexical=keep_dns_rejected_strict_lexical,
         keep_fetch_failed_strict_lexical=keep_fetch_failed_strict_lexical,
         stage1_escalate_total_threshold=stage1_escalate_total_threshold,
         stage1_brand_min=stage1_brand_min,
@@ -5803,7 +6590,6 @@ async def run_hashing_shortlist_streaming(
     reset_rdap_state()
     original_count = len(input_urls)
     metrics = {
-        "passed_dns_gate": 0,
         "processed": 0,
         "render_completed": 0,
         "aux_completed": 0,
@@ -5811,7 +6597,6 @@ async def run_hashing_shortlist_streaming(
         "hashed_success": 0,
         "fetch_failed": 0,
         "fetch_timed_out": 0,
-        "fetch_parked": 0,
         "final_matches_above_threshold": 0,
         "gpu_batches_flushed": 0,
         "gpu_items_scored": 0,
@@ -5823,6 +6608,11 @@ async def run_hashing_shortlist_streaming(
         "active_fetch_limit": ACTIVE_FETCH_LIMIT_INITIAL,
         "worker_nodes_alive": 0,
         "node_restarts": 0,
+        "live_page_workers": 0,
+        "shutdown_sentinels_expected": 0,
+        "shutdown_sentinels_drained": 0,
+        "stuck_reset_recoveries": 0,
+        "phase": "running",
         "fd_count": 0,
         "fd_limit": 0,
         "fd_usage_ratio": 0.0,
@@ -5841,48 +6631,13 @@ async def run_hashing_shortlist_streaming(
     stage0_processed = 0
     stage0_started_monotonic = time.perf_counter()
     last_stage0_log_monotonic = stage0_started_monotonic
-    stage1_dns_eligible_miss_urls = []
-
-    from .dns_gate import (
-        DEFAULT_AUDIT_PATH as DEFAULT_DNS_AUDIT_PATH,
-        DEFAULT_DNS_TIMEOUT,
-        DEFAULT_DNS_RETRIES,
-        _resolve_dns_worker_count,
-        _gate_urls_for_hashing_async,
-        write_dns_gate_audit,
-    )
-    if dns_timeout is None:
-        dns_timeout_effective = float(DEFAULT_DNS_TIMEOUT)
-    else:
-        if not isinstance(dns_timeout, numbers.Real):
-            raise ValueError("dns_timeout must be numeric")
-        dns_timeout_effective = float(dns_timeout)
-        if dns_timeout_effective <= 0:
-            raise ValueError("dns_timeout must be > 0")
-
-    if dns_retries is None:
-        dns_retries_effective = int(DEFAULT_DNS_RETRIES)
-    else:
-        if not isinstance(dns_retries, numbers.Real):
-            raise ValueError("dns_retries must be numeric")
-        dns_retries_effective = int(dns_retries)
-        if dns_retries_effective < 0:
-            raise ValueError("dns_retries must be >= 0")
-
-    if dns_max_workers is None:
-        dns_max_workers_effective = None
-    else:
-        if not isinstance(dns_max_workers, numbers.Real):
-            raise ValueError("dns_max_workers must be numeric")
-        dns_max_workers_effective = int(dns_max_workers)
-        if dns_max_workers_effective <= 0:
-            raise ValueError("dns_max_workers must be > 0")
+    stage1_http_eligible_miss_urls = []
 
     _clip_logger.info(
         "Hashing shortlist (streaming) started | urls=%d | threshold=%s | "
         "domain_similarity_threshold=%.3f | high_confidence_threshold=%.2f | "
         "medium_confidence_threshold=%.2f | typo_top_k=%d | typo_min_score=%.3f | "
-        "lexical_pass_min_score=%.3f | clip_margin_min=%.3f | dns_timeout=%.2f | dns_retries=%d | dns_max_workers=%s",
+        "lexical_pass_min_score=%.3f | clip_margin_min=%.3f",
         original_count,
         threshold,
         scoring_config["domain_similarity_threshold"],
@@ -5892,97 +6647,42 @@ async def run_hashing_shortlist_streaming(
         scoring_config["typo_min_score"],
         scoring_config["lexical_pass_min_score"],
         scoring_config["clip_margin_min"],
-        dns_timeout_effective,
-        dns_retries_effective,
-        dns_max_workers_effective if dns_max_workers_effective is not None else "adaptive",
     )
     _clip_logger.info(
         "Scoring weights | %s",
         _format_weights_for_logging(resolved_weights),
     )
-    effective_dns_workers = _resolve_dns_worker_count(original_count, dns_max_workers_effective)
     _clip_logger.info(
-        "Hash stage topology | dns_workers=%d | worker_nodes={start=%d,max=%d} | pages_per_node=%d | "
-        "active_pages={start=%d,max=%d,floor=%d} | queues={render=%d,result=%d} | "
-        "aux={workers=%d,http=%d,ssl=%d} | nav_timeout_ms=%d | screenshot_timeout_ms=%d | "
-        "fetch_timeout_s=%.1f | gpu_batch=%d | per_host_limit=%d | adaptive_downshift_enabled=%s",
-        effective_dns_workers,
-        HASH_WORKER_NODES_START,
-        HASH_WORKER_NODES_MAX,
-        HASH_PAGES_PER_NODE,
-        ACTIVE_FETCH_LIMIT_INITIAL,
-        ACTIVE_FETCH_LIMIT_MAX,
-        ACTIVE_FETCH_LIMIT_FLOOR,
-        HASH_RENDER_QUEUE_MAX,
-        HASH_RESULT_QUEUE_MAX,
-        AUX_NET_CONCURRENCY_LIMIT,
-        HASH_AUX_HTTP_LIMIT,
-        HASH_AUX_SSL_LIMIT,
+        "Hash stage topology | pages=%d | page_workers_per_shard=%d | shards=%d | "
+        "http_limit=%d | nav_timeout_ms=%d | screenshot_timeout_ms=%d | fetch_timeout_s=%.1f | "
+        "gpu_queue=%d | gpu_batch=%d | active_fetch_limit=%d | active_fetch_floor=%d | "
+        "aux_net_limit=%d | adaptive_downshift_enabled=%s",
+        MAX_CONCURRENT_PAGES,
+        SCRAPER_PAGE_CONCURRENCY,
+        BROWSER_SHARDS,
+        _AIOHTTP_CONNECTOR_LIMIT,
         SCRAPER_NAV_TIMEOUT_MS,
         SCRAPER_SCREENSHOT_TIMEOUT_MS,
         SCRAPER_FETCH_TIMEOUT_S,
+        GPU_QUEUE_MAXSIZE,
         GPU_MAX_BATCH_SIZE,
-        HASH_PER_HOST_LIMIT,
+        ACTIVE_FETCH_LIMIT_INITIAL,
+        ACTIVE_FETCH_LIMIT_FLOOR,
+        AUX_NET_CONCURRENCY_LIMIT,
         ADAPTIVE_FETCH_DOWNSHIFT_ENABLED,
     )
     _clip_logger.info(
         "Stage1 note | OCR/Screenshots/ImgProc/RDAP/WHOIS limits from phishing_pipeline.utils are not the active hashing-stage browser worker counts."
     )
     _clip_logger.info(
-        "Stage1 runtime thresholds | escalate_total=%d | brand_min=%d | credential_min=%d | low_band_min=%d | hard_trigger_brand_min=%d | passthroughs={stage1_suspected=%s,dns_rejected_strict_lexical=%s,fetch_failed_strict_lexical=%s}",
+        "Stage1 runtime thresholds | escalate_total=%d | brand_min=%d | credential_min=%d | low_band_min=%d | hard_trigger_brand_min=%d | policies={stage1_suspected_passthrough=%s,fetch_failed_strict_lexical_passthrough=%s}",
         int(stage1_http_config.get("escalate_total_threshold", 0) or 0),
         int(stage1_http_config.get("brand_min", 0) or 0),
         int(stage1_http_config.get("credential_min", 0) or 0),
         int(stage1_http_config.get("low_band_min", 0) or 0),
         int(stage1_http_config.get("hard_trigger_brand_min", 0) or 0),
         scoring_config["keep_stage1_suspected"],
-        scoring_config["keep_dns_rejected_strict_lexical"],
         scoring_config["keep_fetch_failed_strict_lexical"],
-    )
-
-    dns_accepted_urls, audit_rows = await _gate_urls_for_hashing_async(
-        input_urls,
-        timeout=dns_timeout_effective,
-        max_workers=dns_max_workers_effective,
-        retries=dns_retries_effective,
-        source_workbook_map=source_workbook_map,
-        run_context=run_context,
-        checkpoint_store=checkpoint_store,
-        audit_output_path=DEFAULT_DNS_AUDIT_PATH,
-    )
-    for audit_row in audit_rows:
-        normalized_target = normalize_url(str(audit_row.get("target_url", "")).strip())
-        audit_row["source_workbook"] = source_workbook_map.get(normalized_target, "")
-    write_dns_gate_audit(audit_rows)
-    dns_accepted_normalized_urls = {
-        normalize_url(url)
-        for url in dns_accepted_urls
-        if normalize_url(url)
-    }
-    stage1_dns_prefetch_map = _build_stage1_dns_prefetch_map(audit_rows)
-    metrics["passed_dns_gate"] = len(dns_accepted_urls)
-    dns_status_counts = Counter(
-        str(row.get("dns_status", "")).strip()
-        for row in audit_rows
-    )
-    retry_success_count = sum(1 for row in audit_rows if row.get("retry_success"))
-    _clip_logger.info(
-        "DNS gate kept %d/%d input URLs before lexical/stage1 at %.1fs timeout (retries=%d, retry_success=%d) | "
-        "resolved=%d timeout=%d resolver_error=%d no_records=%d dns_error=%d",
-        len(dns_accepted_urls),
-        original_count,
-        dns_timeout_effective,
-        dns_retries_effective,
-        retry_success_count,
-        dns_status_counts.get("resolved", 0),
-        dns_status_counts.get("timeout", 0),
-        dns_status_counts.get("resolver_error", 0),
-        dns_status_counts.get("no_records", 0),
-        dns_status_counts.get("dns_error", 0),
-    )
-    print(
-        f"DNS gate kept {len(dns_accepted_urls)}/{original_count} input URLs "
-        f"(timeout={dns_timeout_effective:.1f}s, retries={dns_retries_effective})"
     )
     _clip_logger.info("Hashing log file: %s", log_path)
     print(f"Hashing log: {log_path}")
@@ -6003,7 +6703,6 @@ async def run_hashing_shortlist_streaming(
     for raw_url in input_urls:
         normalized_url = normalize_url(raw_url)
         source_workbook = source_workbook_map.get(normalized_url, "")
-        dns_gate_accepted = bool(normalized_url and normalized_url in dns_accepted_normalized_urls)
         if checkpoint_store is not None and run_context is not None and normalized_url:
             if make_record_key(normalized_url, source_workbook) in completed_record_keys:
                 stage0_skipped += 1
@@ -6019,8 +6718,7 @@ async def run_hashing_shortlist_streaming(
         if _passes_lexical_gate(prefetch_metrics):
             stage0_hits += 1
             stage1_analysis_map[normalized_url] = _build_lexical_stage1_state(prefetch_metrics)
-            if dns_gate_accepted:
-                lexical_candidate_urls.append(raw_url)
+            lexical_candidate_urls.append(raw_url)
             _upsert_shortlist_checkpoint(
                 run_context=run_context,
                 checkpoint_store=checkpoint_store,
@@ -6034,8 +6732,7 @@ async def run_hashing_shortlist_streaming(
         else:
             lexical_miss_urls.append(raw_url)
             stage0_misses += 1
-            if dns_gate_accepted:
-                stage1_dns_eligible_miss_urls.append(raw_url)
+            stage1_http_eligible_miss_urls.append(raw_url)
             _upsert_shortlist_checkpoint(
                 run_context=run_context,
                 checkpoint_store=checkpoint_store,
@@ -6100,16 +6797,17 @@ async def run_hashing_shortlist_streaming(
                 skipped_count,
             )
 
-    if stage1_dns_eligible_miss_urls:
+    if stage1_http_eligible_miss_urls:
         analyzed_lexical_misses = await _analyze_stage1_http_candidates(
-            stage1_dns_eligible_miss_urls,
+            stage1_http_eligible_miss_urls,
             stage1_http_config=stage1_http_config,
+            scoring_config=scoring_config,
             run_context=run_context,
             checkpoint_store=checkpoint_store,
             source_workbook_map=source_workbook_map,
-            dns_prefetch_map=stage1_dns_prefetch_map,
+            prefetch_metrics_map=prefetch_metrics_map,
         )
-        for raw_url in stage1_dns_eligible_miss_urls:
+        for raw_url in stage1_http_eligible_miss_urls:
             normalized_url = normalize_url(raw_url)
             analysis = dict(analyzed_lexical_misses.get(normalized_url, {}) or {})
             stage1_analysis_map[normalized_url] = {
@@ -6118,27 +6816,22 @@ async def run_hashing_shortlist_streaming(
             }
             if bool(stage1_analysis_map[normalized_url].get("escalate_to_hashing")):
                 lexical_candidate_urls.append(raw_url)
-            elif (
-                run_context is not None
-                and run_context.stage1_failure_policy == "route_to_dns"
-                and str(stage1_analysis_map[normalized_url].get("fetch_status", "")).strip().lower() == "failed"
-            ):
-                lexical_candidate_urls.append(raw_url)
 
     rdap_metrics = get_rdap_metrics_snapshot()
+    stage1_rescued_miss_count = max(0, len(lexical_candidate_urls) - stage0_hits)
 
     _clip_logger.info(
-        "Stage1 routing kept %d/%d DNS-accepted URLs before hashing | dns_accepted=%d | lexical_hits=%d | lexical_misses=%d | stage1_http_eligible=%d | non_escalated=%d",
+        "Stage1 routing kept %d/%d URLs before hashing | stage0_lexical_hits=%d | stage1_http_rescued=%d | lexical_misses=%d | stage1_http_eligible=%d | non_escalated=%d",
         len(lexical_candidate_urls),
-        max(len(dns_accepted_urls), 1),
-        len(dns_accepted_urls),
+        max(original_count, 1),
         stage0_hits,
+        stage1_rescued_miss_count,
         stage0_misses,
-        len(stage1_dns_eligible_miss_urls),
+        len(stage1_http_eligible_miss_urls),
         sum(
             1
             for normalized_url, row in stage1_analysis_map.items()
-            if normalized_url in dns_accepted_normalized_urls and not bool(row.get("escalate_to_hashing", False))
+            if not bool(row.get("escalate_to_hashing", False))
         ),
     )
     _clip_logger.info(
@@ -6153,7 +6846,8 @@ async def run_hashing_shortlist_streaming(
         int(rdap_metrics.get("cooldown_hit", 0) or 0),
     )
     print(
-        f"Stage1 routing kept {len(lexical_candidate_urls)}/{len(dns_accepted_urls)} DNS-accepted URLs"
+        f"Stage1 routing kept {len(lexical_candidate_urls)}/{original_count} URLs before hashing "
+        f"({stage0_hits} Stage0 lexical hits + {stage1_rescued_miss_count} Stage1 rescues)"
     )
 
     if not lexical_candidate_urls:
@@ -6186,24 +6880,15 @@ async def run_hashing_shortlist_streaming(
         excluded_path = _write_excluded_urls_audit(excluded_rows)
         _write_stage1_subset_csv(
             stage1_rows,
-            DNS_REJECTED_LEXICAL_HITS_PATH,
-            lambda row: row.get("reason") == "dns_rejected" and bool(row.get("strict_lexical_hit")),
-        )
-        _write_stage1_subset_csv(
-            stage1_rows,
             FETCH_FAILED_LEXICAL_HITS_PATH,
             lambda row: str(row.get("fetch_status", "")).strip().lower() in {"failed", "timeout"} and bool(row.get("strict_lexical_hit")),
-        )
-        _write_stage1_subset_csv(
-            stage1_rows,
-            PARKED_PAGE_EXCLUSIONS_PATH,
-            lambda row: row.get("reason") == "parking_or_placeholder_excluded",
         )
         _clip_logger.info(
             "Excluded URL audit written to %s with %d rows",
             excluded_path,
             len(excluded_rows),
         )
+        _clip_logger.info("Stage1 routing summary | review_queue_rows=%d", len(stage1_review_rows))
         _clip_logger.info(
             "Stage1 review queue written to %s with %d rows",
             STAGE1_REVIEW_QUEUE_PATH,
@@ -6212,7 +6897,7 @@ async def run_hashing_shortlist_streaming(
         print(f"Excluded URLs: {excluded_path} ({len(excluded_rows)} rows)")
         print(f"Stage1 methods: {methods_path}")
         print(f"Stage1 deep-analysis candidates: {deep_analysis_path}")
-        _clip_logger.info("No URLs escalated past Stage1 routing after DNS prefilter; skipping hashing.")
+        _clip_logger.info("No URLs escalated past Stage1 routing; skipping hashing.")
         _close_hashing_log()
         if not passthrough_rows:
             return _empty_shortlist_df()
@@ -6222,98 +6907,63 @@ async def run_hashing_shortlist_streaming(
 
     try:
         t0 = time.perf_counter()
-        render_queue = asyncio.Queue(maxsize=HASH_RENDER_QUEUE_MAX)
-        aux_queue = asyncio.Queue(maxsize=max(HASH_RESULT_QUEUE_MAX, HASH_AUX_HTTP_LIMIT))
+        url_queue = asyncio.Queue()
         gpu_queue = asyncio.Queue(maxsize=GPU_QUEUE_MAXSIZE)
         active_fetch_limiter = _AdaptiveFetchLimiter(ACTIVE_FETCH_LIMIT_INITIAL)
-        host_limiter = _PerHostLimiter(HASH_PER_HOST_LIMIT)
         results = []
         review_results = []
         prefetch_admitted_failures = []
         hash_progress = ProgressTracker(total=len(shortlisted_urls))
-        render_active_workers = {}
-        aux_active_workers = {}
         last_progress_log = t0
+        last_processed = 0
         last_window_processed = 0
         last_window_failed = 0
         last_window_timed_out = 0
         consecutive_pressure_windows = 0
-        consecutive_healthy_windows = 0
+        metrics["hash_execution_mode"] = "legacy_shards"
 
-        connector = aiohttp.TCPConnector(limit=HASH_AUX_HTTP_LIMIT, ttl_dns_cache=300) if _has_aiohttp else None
+        for raw_url in shortlisted_urls:
+            await url_queue.put(raw_url)
+        for _ in range(BROWSER_SHARDS * SCRAPER_PAGE_CONCURRENCY):
+            await url_queue.put(None)
+
+        connector = aiohttp.TCPConnector(limit=_AIOHTTP_CONNECTOR_LIMIT, ttl_dns_cache=300) if _has_aiohttp else None
         aio_session = aiohttp.ClientSession(connector=connector) if _has_aiohttp else None
-        aggregate_bar = None
-        render_bar = None
-        aux_bar = None
-        finalize_bar = None
+        progress_bar = None
         hash_watchdog = None
 
         try:
             from tqdm import tqdm
 
-            aggregate_bar = tqdm(total=len(shortlisted_urls), desc="Hashing shortlist", unit="url", leave=True, position=0, dynamic_ncols=True)
-            render_bar = tqdm(total=len(shortlisted_urls), desc="Hash render", unit="url", leave=False, position=1, dynamic_ncols=True)
-            aux_bar = tqdm(total=len(shortlisted_urls), desc="Hash aux", unit="url", leave=False, position=2, dynamic_ncols=True)
-            finalize_bar = tqdm(total=len(shortlisted_urls), desc="Hash finalize", unit="url", leave=False, position=3, dynamic_ncols=True)
+            progress_bar = tqdm(
+                total=len(shortlisted_urls),
+                desc="Hashing shortlist",
+                unit="url",
+                leave=True,
+            )
         except Exception:
             pass
 
         try:
             loop = asyncio.get_running_loop()
             _install_asyncio_exception_logging(loop)
-
-            async def _produce_render_inputs():
-                for raw_url in shortlisted_urls:
-                    normalized_url = normalize_url(raw_url)
-                    await render_queue.put(
-                        {
-                            "url": raw_url,
-                            "normalized_url": normalized_url,
-                            "prefetch_metrics": prefetch_metrics_map.get(normalized_url, {}),
-                            "stage1_analysis": stage1_analysis_map.get(normalized_url, {}),
-                        }
-                    )
-                for _ in range(HASH_WORKER_NODES_MAX * HASH_PAGES_PER_NODE):
-                    await render_queue.put(None)
-
-            producer_task = asyncio.create_task(_produce_render_inputs())
-            node_tasks = [
+            shard_tasks = [
                 asyncio.create_task(
-                    _run_hash_browser_node(
-                        node_id=node_id,
-                        render_queue=render_queue,
-                        aux_queue=aux_queue,
-                        metrics=metrics,
-                        decision_rows=decision_rows,
-                        prefetch_admitted_failures=prefetch_admitted_failures,
-                        prefetch_metrics_map=prefetch_metrics_map,
-                        stage1_analysis_map=stage1_analysis_map,
-                        active_fetch_limiter=active_fetch_limiter,
-                        host_limiter=host_limiter,
-                        hash_progress=hash_progress,
-                        scoring_config=scoring_config,
-                        active_workers=render_active_workers,
+                    _run_browser_shard(
+                        i,
+                        url_queue,
+                        gpu_queue,
+                        metrics,
+                        decision_rows,
+                        prefetch_metrics_map,
+                        stage1_analysis_map,
+                        prefetch_admitted_failures,
+                        active_fetch_limiter,
+                        aio_session,
+                        scoring_config,
                     )
                 )
-                for node_id in range(HASH_WORKER_NODES_MAX)
-            ]
-            aux_tasks = [
-                asyncio.create_task(
-                    _run_hash_aux_worker(
-                        worker_id=f"aux-{worker_id}",
-                        aux_queue=aux_queue,
-                        gpu_queue=gpu_queue,
-                        metrics=metrics,
-                        decision_rows=decision_rows,
-                        prefetch_admitted_failures=prefetch_admitted_failures,
-                        active_fetch_limiter=active_fetch_limiter,
-                        aio_session=aio_session,
-                        hash_progress=hash_progress,
-                        scoring_config=scoring_config,
-                        active_workers=aux_active_workers,
-                    )
-                )
-                for worker_id in range(AUX_NET_CONCURRENCY_LIMIT)
+                for i in range(BROWSER_SHARDS)
             ]
             scorer_task = asyncio.create_task(
                 _gpu_microbatch_scorer(
@@ -6324,142 +6974,118 @@ async def run_hashing_shortlist_streaming(
                     metrics,
                     threshold,
                     scoring_config,
-                    hash_progress,
+                    None,
                 )
             )
-
-            async def _drain_hash_pipeline():
-                await producer_task
-                await render_queue.join()
-                await asyncio.gather(*node_tasks)
-                for _ in aux_tasks:
-                    await aux_queue.put(None)
-                await aux_queue.join()
-                await asyncio.gather(*aux_tasks)
-                await gpu_queue.put(None)
-                await scorer_task
-
-            pipeline_task = asyncio.create_task(_drain_hash_pipeline())
             hash_watchdog = StageWatchdog(
                 stage_name="hash",
                 progress_tracker=hash_progress,
                 checkpoint_store=checkpoint_store,
                 warn_after_seconds=run_context.watchdog_warning_seconds if run_context is not None else 60,
                 stall_after_seconds=run_context.stall_threshold_seconds if run_context is not None else 180,
-                queue_size_getter=lambda: render_queue.qsize() + aux_queue.qsize() + gpu_queue.qsize(),
+                queue_size_getter=url_queue.qsize,
                 active_summary_getter=lambda: {
                     "processed": metrics.get("processed", 0),
-                    "render_queue_depth": render_queue.qsize(),
-                    "aux_queue_depth": aux_queue.qsize(),
-                    "finalize_queue_depth": gpu_queue.qsize(),
+                    "gpu_queue_depth": gpu_queue.qsize(),
                     "active_fetch_limit": active_fetch_limiter.limit,
-                    "render_active": len(render_active_workers),
-                    "aux_active": len(aux_active_workers),
-                    "worker_nodes_alive": sum(1 for task in node_tasks if not task.done()),
+                    "shards_done": sum(1 for task in shard_tasks if task.done()),
+                    "shards_total": len(shard_tasks),
                 },
                 logger_instance=_clip_logger,
             )
             hash_watchdog.start()
 
-            while not pipeline_task.done():
+            while not all(task.done() for task in shard_tasks):
                 await asyncio.sleep(0.5)
                 now = time.perf_counter()
-                metrics["stage_elapsed_s"] = now - t0
-                metrics["render_queue_depth"] = render_queue.qsize()
-                metrics["aux_queue_depth"] = aux_queue.qsize()
                 metrics["gpu_queue_depth"] = gpu_queue.qsize()
-                metrics["worker_nodes_alive"] = sum(1 for task in node_tasks if not task.done())
                 metrics["active_fetch_limit"] = active_fetch_limiter.limit
-                metrics.update(_get_hash_runtime_resource_snapshot())
-                metrics["limiting_lane"] = max(
-                    (
-                        ("render", metrics["render_queue_depth"]),
-                        ("aux", metrics["aux_queue_depth"]),
-                        ("finalize", metrics["gpu_queue_depth"]),
-                    ),
-                    key=lambda item: item[1],
-                )[0]
-
-                if aggregate_bar is not None:
-                    aggregate_bar.n = metrics["processed"]
-                    aggregate_bar.set_postfix(_build_progress_postfix(metrics), refresh=False)
-                    aggregate_bar.refresh()
-                if render_bar is not None:
-                    render_bar.n = metrics["render_completed"]
-                    render_bar.set_postfix({"act": len(render_active_workers), "q": metrics["render_queue_depth"], "pages": active_fetch_limiter.limit}, refresh=False)
-                    render_bar.refresh()
-                if aux_bar is not None:
-                    aux_bar.n = metrics["aux_completed"]
-                    aux_bar.set_postfix({"act": len(aux_active_workers), "q": metrics["aux_queue_depth"], "ssl": HASH_AUX_SSL_LIMIT}, refresh=False)
-                    aux_bar.refresh()
-                if finalize_bar is not None:
-                    finalize_bar.n = metrics["processed"]
-                    finalize_bar.set_postfix({"q": metrics["gpu_queue_depth"], "ok": metrics["hashed_success"], "fail": metrics["fetch_failed"]}, refresh=False)
-                    finalize_bar.refresh()
-
-                if run_context is not None and hash_progress.seconds_since_progress() >= run_context.stall_threshold_seconds:
-                    producer_task.cancel()
-                    for task in node_tasks + aux_tasks:
+                metrics["stage_elapsed_s"] = now - t0
+                current = metrics["processed"]
+                if progress_bar is not None and current > last_processed:
+                    progress_bar.update(current - last_processed)
+                    progress_bar.set_postfix(_build_progress_postfix(metrics), refresh=False)
+                    last_processed = current
+                    for _ in range(current - hash_progress.completed):
+                        hash_progress.mark_completed(final_status="hash_processed")
+                if (
+                    run_context is not None
+                    and hash_progress.seconds_since_progress() >= run_context.stall_threshold_seconds
+                ):
+                    for task in shard_tasks:
                         task.cancel()
                     scorer_task.cancel()
-                    await asyncio.gather(producer_task, *node_tasks, *aux_tasks, scorer_task, return_exceptions=True)
+                    await asyncio.gather(*shard_tasks, return_exceptions=True)
+                    await asyncio.gather(scorer_task, return_exceptions=True)
                     raise RuntimeError(
-                        f"Hashing worker-node pipeline stalled for >= {run_context.stall_threshold_seconds}s without progress"
+                        f"Hashing browser shard pool stalled for >= {run_context.stall_threshold_seconds}s without progress"
                     )
-
                 if now - last_progress_log >= HASH_RAMP_INTERVAL_SECONDS:
-                    current = metrics["processed"]
                     window_processed = current - last_window_processed
                     window_failed = metrics["fetch_failed"] - last_window_failed
                     window_timed_out = metrics["fetch_timed_out"] - last_window_timed_out
-                    adjustment = _compute_hash_fetch_adjustment(
-                        current_limit=active_fetch_limiter.limit,
-                        max_limit=ACTIVE_FETCH_LIMIT_MAX,
-                        floor_limit=ACTIVE_FETCH_LIMIT_FLOOR,
-                        step=ACTIVE_FETCH_UPSHIFT_STEP,
-                        processed_total=current,
-                        window_processed=window_processed,
-                        window_failed=window_failed,
-                        window_timed_out=window_timed_out,
-                        render_queue_depth=metrics["render_queue_depth"],
-                        aux_queue_depth=metrics["aux_queue_depth"],
-                        finalize_queue_depth=metrics["gpu_queue_depth"],
-                        result_queue_max=max(HASH_RENDER_QUEUE_MAX, HASH_RESULT_QUEUE_MAX, GPU_QUEUE_MAXSIZE),
-                        fd_usage_ratio=metrics["fd_usage_ratio"],
-                        ram_usage_ratio=metrics["ram_usage_ratio"],
-                        consecutive_pressure_windows=consecutive_pressure_windows,
-                        consecutive_healthy_windows=consecutive_healthy_windows,
-                    )
-                    consecutive_pressure_windows = adjustment["next_consecutive_pressure_windows"]
-                    consecutive_healthy_windows = adjustment["next_consecutive_healthy_windows"]
-                    if adjustment["next_limit"] != active_fetch_limiter.limit:
-                        previous_limit = active_fetch_limiter.limit
-                        await active_fetch_limiter.set_limit(adjustment["next_limit"])
-                        metrics["active_fetch_limit"] = active_fetch_limiter.limit
-                        _clip_logger.info(
-                            "Hash adaptive scaling | active_pages %d -> %d | timeout_ratio=%.3f | failure_ratio=%.3f | queue_pressure=%.3f",
-                            previous_limit,
-                            active_fetch_limiter.limit,
-                            adjustment["timeout_ratio"],
-                            adjustment["failure_ratio"],
-                            adjustment["queue_pressure_ratio"],
+                    if ADAPTIVE_FETCH_DOWNSHIFT_ENABLED:
+                        downshift = _compute_stage1_downshift(
+                            current_limit=active_fetch_limiter.limit,
+                            floor_limit=ACTIVE_FETCH_LIMIT_FLOOR,
+                            step=ACTIVE_FETCH_DOWNSHIFT_STEP,
+                            processed_total=current,
+                            window_processed=window_processed,
+                            window_failed=window_failed,
+                            window_timed_out=window_timed_out,
+                            gpu_queue_depth=metrics["gpu_queue_depth"],
+                            gpu_backlog_threshold=GPU_QUEUE_BACKLOG_THRESHOLD,
+                            consecutive_pressure_windows=consecutive_pressure_windows,
                         )
+                        consecutive_pressure_windows = downshift["next_consecutive_pressure_windows"]
+                        if downshift["should_downshift"] and downshift["next_limit"] < active_fetch_limiter.limit:
+                            previous_limit = active_fetch_limiter.limit
+                            await active_fetch_limiter.set_limit(downshift["next_limit"])
+                            metrics["active_fetch_limit"] = active_fetch_limiter.limit
+                            _clip_logger.info(
+                                "Hash adaptive downshift | active_fetch_limit %d -> %d | timeout_ratio=%.3f | success_ratio=%.3f",
+                                previous_limit,
+                                active_fetch_limiter.limit,
+                                downshift["timeout_ratio"],
+                                metrics["hashed_success"] / max(1, current),
+                            )
                     _log_hashing_periodic_status(metrics, len(shortlisted_urls))
                     last_window_processed = current
                     last_window_failed = metrics["fetch_failed"]
                     last_window_timed_out = metrics["fetch_timed_out"]
                     last_progress_log = now
 
-            await pipeline_task
+            await asyncio.gather(*shard_tasks)
+            current = metrics["processed"]
+            metrics["stage_elapsed_s"] = time.perf_counter() - t0
+            metrics["gpu_queue_depth"] = gpu_queue.qsize()
+            metrics["active_fetch_limit"] = active_fetch_limiter.limit
+            if progress_bar is not None and current > last_processed:
+                progress_bar.update(current - last_processed)
+                progress_bar.set_postfix(_build_progress_postfix(metrics), refresh=False)
+                last_processed = current
+                for _ in range(current - hash_progress.completed):
+                    hash_progress.mark_completed(final_status="hash_processed")
+            await gpu_queue.put(None)
+            await scorer_task
+            current = metrics["processed"]
+            metrics["stage_elapsed_s"] = time.perf_counter() - t0
+            metrics["gpu_queue_depth"] = 0
+            metrics["active_fetch_limit"] = active_fetch_limiter.limit
+            if progress_bar is not None and current > last_processed:
+                progress_bar.update(current - last_processed)
+                progress_bar.set_postfix(_build_progress_postfix(metrics), refresh=False)
+                last_processed = current
+                for _ in range(current - hash_progress.completed):
+                    hash_progress.mark_completed(final_status="hash_processed")
             if prefetch_admitted_failures:
                 results.extend(prefetch_admitted_failures)
         finally:
             if hash_watchdog is not None:
                 with suppress(Exception):
                     await hash_watchdog.stop()
-            for progress_bar in (aggregate_bar, render_bar, aux_bar, finalize_bar):
-                if progress_bar is not None:
-                    progress_bar.close()
+            if progress_bar is not None:
+                progress_bar.close()
             if aio_session is not None:
                 await aio_session.close()
 
@@ -6470,7 +7096,7 @@ async def run_hashing_shortlist_streaming(
             results=results,
             review_results=review_results,
             input_urls=input_urls,
-            audit_rows=audit_rows,
+            audit_rows=[],
             decision_rows=decision_rows,
             prefetch_metrics_map=prefetch_metrics_map,
             lexical_reject_urls=lexical_reject_urls,
@@ -6482,6 +7108,14 @@ async def run_hashing_shortlist_streaming(
             checkpoint_store=checkpoint_store,
         )
     except Exception:
+        with suppress(Exception):
+            written_paths = _write_stage2_hash_exports(decision_rows, run_context=run_context)
+            if written_paths:
+                _clip_logger.info(
+                    "Stage2 hash exports partially written to %s (%d files) after fatal error",
+                    os.path.join(getattr(run_context, "output_dir", "") or os.path.dirname(HASH_EXPORT_DIR), "hash_folder"),
+                    len(written_paths),
+                )
         _clip_logger.exception("Hashing shortlist (streaming) crashed.")
         raise
     finally:
@@ -6521,14 +7155,15 @@ def _finish_hashing_shortlist_output(
     )
     print(
         "Hashing metrics: "
-        f"passed_dns_gate={metrics['passed_dns_gate']} "
         f"processed={metrics['processed']} "
-        f"render={metrics.get('render_completed', 0)} "
-        f"aux={metrics.get('aux_completed', 0)} "
-        f"hashed_success={metrics['hashed_success']} "
+        + (
+            ""
+            if str(metrics.get("hash_execution_mode", "")).strip().lower() == "legacy_shards"
+            else f"render={metrics.get('render_completed', 0)} aux={metrics.get('aux_completed', 0)} "
+        )
+        + f"hashed_success={metrics['hashed_success']} "
         f"fetch_failed={metrics['fetch_failed']} "
         f"fetch_timed_out={metrics['fetch_timed_out']} "
-        f"fetch_parked={metrics['fetch_parked']} "
         f"gpu_batches_flushed={metrics['gpu_batches_flushed']} "
         f"gpu_items_scored={metrics['gpu_items_scored']} "
         f"avg_gpu_batch_size={metrics['avg_gpu_batch_size']:.1f} "
@@ -6542,8 +7177,22 @@ def _finish_hashing_shortlist_output(
         shortlisted_results=results,
         typo_min_score=scoring_config["typo_min_score"],
     )
+    hash_export_paths = _write_stage2_hash_exports(decision_rows, run_context=run_context)
+    if hash_export_paths:
+        _clip_logger.info(
+            "Stage2 hash exports written to %s (%d files)",
+            os.path.join(getattr(run_context, "output_dir", "") or os.path.dirname(HASH_EXPORT_DIR), "hash_folder"),
+            len(hash_export_paths),
+        )
 
-    rows = [_build_shortlist_output_row(match, scoring_config) for match in results]
+    rows = [
+        (
+            dict(match)
+            if "Cooresponding CSE" in match and "Identified Phishing/Suspected Domain Name" in match
+            else _build_shortlist_output_row(match, scoring_config)
+        )
+        for match in results
+    ]
     review_rows = []
     for match in review_results:
         review_row = _build_shortlist_output_row(match, scoring_config)
@@ -6570,6 +7219,20 @@ def _finish_hashing_shortlist_output(
         if row
     ]
     rows.extend(passthrough_rows)
+    if rows:
+        deduped_rows = []
+        seen_row_keys = set()
+        for row in rows:
+            row_key = (
+                str(row.get("Identified Phishing/Suspected Domain Name", "") or ""),
+                str(row.get("Cooresponding CSE", "") or ""),
+                str(row.get("Legitimate Domains", "") or ""),
+            )
+            if row_key in seen_row_keys:
+                continue
+            seen_row_keys.add(row_key)
+            deduped_rows.append(row)
+        rows = deduped_rows
     review_rows.extend(_build_stage1_review_queue_rows(stage1_rows, scoring_config=scoring_config))
     review_df = pd.DataFrame(review_rows)
     if not review_df.empty:
@@ -6598,18 +7261,8 @@ def _finish_hashing_shortlist_output(
         print(f"Stage1 debug: {debug_path} ({len(stage1_rows)} rows)")
     _write_stage1_subset_csv(
         stage1_rows,
-        DNS_REJECTED_LEXICAL_HITS_PATH,
-        lambda row: row.get("reason") == "dns_rejected" and bool(row.get("strict_lexical_hit")),
-    )
-    _write_stage1_subset_csv(
-        stage1_rows,
         FETCH_FAILED_LEXICAL_HITS_PATH,
         lambda row: str(row.get("fetch_status", "")).strip().lower() in {"failed", "timeout"} and bool(row.get("strict_lexical_hit")),
-    )
-    _write_stage1_subset_csv(
-        stage1_rows,
-        PARKED_PAGE_EXCLUSIONS_PATH,
-        lambda row: row.get("reason") == "parking_or_placeholder_excluded",
     )
     excluded_rows = _build_excluded_url_rows(stage1_rows)
     excluded_path = _write_excluded_urls_audit(excluded_rows)
@@ -6618,37 +7271,13 @@ def _finish_hashing_shortlist_output(
         excluded_path,
         len(excluded_rows),
     )
+    _clip_logger.info("Stage1 routing summary | review_queue_rows=%d", len(review_df))
     if checkpoint_store is not None and run_context is not None:
         for stage1_row in stage1_rows:
             raw_url = str(stage1_row.get("input_url", "") or "")
             normalized_url = str(stage1_row.get("normalized_url", "") or "")
             source_workbook = str(stage1_row.get("source_workbook", "") or "")
-            final_status = None
-            failure_reason = ""
-            hash_status = "pending"
-            if bool(stage1_row.get("admitted")) or str(stage1_row.get("survival_path", "") or "").strip():
-                final_status = "holdout_ready"
-                hash_status = "admitted"
-            elif str(stage1_row.get("reason", "") or "").strip() == "dns_rejected":
-                final_status = "dns_rejected"
-                hash_status = "dns_rejected"
-                failure_reason = "dns_rejected"
-            elif str(stage1_row.get("reason", "") or "").strip() == "parking_or_placeholder_excluded":
-                final_status = "parked_or_placeholder"
-                hash_status = "parked_or_placeholder"
-                failure_reason = "parking_or_placeholder_excluded"
-            elif bool(stage1_row.get("kept_for_review_only")):
-                final_status = "review_only"
-                hash_status = "review_only"
-                failure_reason = str(stage1_row.get("review_only_reason", "") or "stage1_review_only")
-            elif str(stage1_row.get("fetch_status", "")).strip().lower() in {"failed", "timeout"}:
-                final_status = "hash_failed"
-                hash_status = "fetch_failed"
-                failure_reason = str(stage1_row.get("reason", "") or "fetch_timeout_or_fetch_failed")
-            elif str(stage1_row.get("exclusion_stage", "")).strip() in {"stage1_http", "lexical_gate"}:
-                final_status = "filtered_lexical_miss"
-                hash_status = "filtered"
-                failure_reason = str(stage1_row.get("reason", "") or "filtered_lexical_miss")
+            final_status, hash_status, failure_reason = _resolve_stage1_terminal_checkpoint_outcome(stage1_row)
             _upsert_shortlist_checkpoint(
                 run_context=run_context,
                 checkpoint_store=checkpoint_store,
@@ -6696,14 +7325,10 @@ def run_hashing_shortlist(
     typo_min_score=DEFAULT_TYPO_MIN_SCORE,
     lexical_pass_min_score=DEFAULT_LEXICAL_PASS_MIN_SCORE,
     clip_margin_min=DEFAULT_CLIP_MARGIN_MIN,
-    dns_timeout=None,
-    dns_retries=None,
-    dns_max_workers=None,
     weights=None,
     shortlist_debug_csv: str | None = DEFAULT_STAGE1_DEBUG_CSV,
     url_sources: dict | None = None,
     keep_stage1_suspected: bool = False,
-    keep_dns_rejected_strict_lexical: bool = False,
     keep_fetch_failed_strict_lexical: bool = False,
     stage1_escalate_total_threshold=None,
     stage1_brand_min=None,
@@ -6723,14 +7348,10 @@ def run_hashing_shortlist(
             typo_min_score=typo_min_score,
             lexical_pass_min_score=lexical_pass_min_score,
             clip_margin_min=clip_margin_min,
-            dns_timeout=dns_timeout,
-            dns_retries=dns_retries,
-            dns_max_workers=dns_max_workers,
             weights=weights,
             shortlist_debug_csv=shortlist_debug_csv,
             url_sources=url_sources,
             keep_stage1_suspected=keep_stage1_suspected,
-            keep_dns_rejected_strict_lexical=keep_dns_rejected_strict_lexical,
             keep_fetch_failed_strict_lexical=keep_fetch_failed_strict_lexical,
             stage1_escalate_total_threshold=stage1_escalate_total_threshold,
             stage1_brand_min=stage1_brand_min,
@@ -6751,14 +7372,10 @@ async def run_hashing_shortlist_async(
     typo_min_score=DEFAULT_TYPO_MIN_SCORE,
     lexical_pass_min_score=DEFAULT_LEXICAL_PASS_MIN_SCORE,
     clip_margin_min=DEFAULT_CLIP_MARGIN_MIN,
-    dns_timeout=None,
-    dns_retries=None,
-    dns_max_workers=None,
     weights=None,
     shortlist_debug_csv: str | None = DEFAULT_STAGE1_DEBUG_CSV,
     url_sources: dict | None = None,
     keep_stage1_suspected: bool = False,
-    keep_dns_rejected_strict_lexical: bool = False,
     keep_fetch_failed_strict_lexical: bool = False,
     stage1_escalate_total_threshold=None,
     stage1_brand_min=None,
@@ -6781,14 +7398,10 @@ async def run_hashing_shortlist_async(
         typo_min_score=typo_min_score,
         lexical_pass_min_score=lexical_pass_min_score,
         clip_margin_min=clip_margin_min,
-        dns_timeout=dns_timeout,
-        dns_retries=dns_retries,
-        dns_max_workers=dns_max_workers,
         weights=weights,
         shortlist_debug_csv=shortlist_debug_csv,
         url_sources=url_sources,
         keep_stage1_suspected=keep_stage1_suspected,
-        keep_dns_rejected_strict_lexical=keep_dns_rejected_strict_lexical,
         keep_fetch_failed_strict_lexical=keep_fetch_failed_strict_lexical,
         stage1_escalate_total_threshold=stage1_escalate_total_threshold,
         stage1_brand_min=stage1_brand_min,

@@ -282,50 +282,7 @@ class Stage1HttpRoutingTests(unittest.TestCase):
         self.assertTrue(holdout_row["stage1_passthrough"])
         self.assertEqual(holdout_row["admission_path"], "stage1_suspected_passthrough")
 
-    def test_dns_rejected_strict_lexical_passthrough_marks_dns_fetch_status(self):
-        input_url = "https://csc-login-check.example"
-        normalized_url = comparison.normalize_url(input_url)
-        prefetch_metrics = _prefetch_metrics(
-            strict_lexical_hit=True,
-            lexical_score_pass=True,
-            best_lexical_score=0.97,
-            best_typo_similarity=0.91,
-            best_entity="CSC",
-            best_matching_domain="csc.gov.in",
-            candidate_generation_reason="brand_token_match|jw_primary",
-        )
-        scoring_config = comparison._resolve_scoring_config(
-            keep_dns_rejected_strict_lexical=True,
-        )
-
-        stage1_rows = comparison._build_stage1_debug_rows(
-            input_urls=[input_url],
-            audit_rows=[
-                {
-                    "target_url": input_url,
-                    "dns_status": "dns_error",
-                    "decision": "rejected",
-                }
-            ],
-            decision_rows=[],
-            prefetch_metrics_map={normalized_url: prefetch_metrics},
-            stage1_analysis_map={
-                normalized_url: comparison._build_lexical_stage1_state(prefetch_metrics)
-            },
-            scoring_config=scoring_config,
-        )
-
-        self.assertEqual(stage1_rows[0]["reason"], "dns_rejected")
-        self.assertTrue(stage1_rows[0]["stage1_passthrough"])
-        self.assertEqual(
-            stage1_rows[0]["survival_path"],
-            "dns_rejected_strict_lexical_passthrough",
-        )
-        holdout_row = comparison._build_stage1_passthrough_holdout_row(stage1_rows[0], scoring_config)
-        self.assertEqual(holdout_row["fetch_status"], "dns_rejected")
-        self.assertTrue(holdout_row["stage1_passthrough"])
-
-    def test_dns_rejected_without_stage1_analysis_still_marks_dns_gate_first(self):
+    def test_stage1_debug_rows_ignore_stale_audit_rejection(self):
         input_url = "https://dns-blocked.example"
         normalized_url = comparison.normalize_url(input_url)
 
@@ -343,10 +300,10 @@ class Stage1HttpRoutingTests(unittest.TestCase):
             stage1_analysis_map={},
         )
 
-        self.assertEqual(stage1_rows[0]["dns_status"], "no_records")
-        self.assertEqual(stage1_rows[0]["dns_decision"], "rejected")
-        self.assertEqual(stage1_rows[0]["exclusion_stage"], "dns_gate")
-        self.assertEqual(stage1_rows[0]["reason"], "dns_rejected")
+        self.assertEqual(stage1_rows[0]["dns_status"], "skipped")
+        self.assertEqual(stage1_rows[0]["dns_decision"], "skipped")
+        self.assertEqual(stage1_rows[0]["exclusion_stage"], "stage1_http")
+        self.assertEqual(stage1_rows[0]["reason"], "stage1_low_suspicion")
 
 
 if __name__ == "__main__":

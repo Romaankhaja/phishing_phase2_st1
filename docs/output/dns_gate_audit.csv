@@ -1,8 +1,0 @@
-target_url,hostname,resolved_ips,dns_status,decision,attempts,retry_count,retry_success,resolver_profile
-paarivahan.com,paarivahan.com,,dns_error,rejected,1,0,False,default
-axisupi.com,axisupi.com,162.255.119.13,resolved,accepted,1,0,False,default
-airtell.ai,airtell.ai,15.197.148.33;3.33.130.190,resolved,accepted,1,0,False,default
-sbireward.com,sbireward.com,,dns_error,rejected,1,0,False,default
-airtele.xyz,airtele.xyz,,dns_error,rejected,1,0,False,default
-airtel-merchants.club,airtel-merchants.club,,no_records,rejected,1,0,False,default
-uidaiaadhardownload.com,uidaiaadhardownload.com,147.79.69.226;2a02:4780:20:3f44:c774:534e:8294:2632;2a02:4780:3d:8330:26a1:5dd5:8f48:3f40;93.127.173.195,resolved,accepted,1,0,False,default

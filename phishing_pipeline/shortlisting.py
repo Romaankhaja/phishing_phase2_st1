@@ -103,6 +103,31 @@ def _discover_excel_files(folder_path: str) -> list[str]:
     return [f for f in files if not os.path.basename(f).startswith("~$")]
 
 
+def _looks_like_url_value(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text or " " in text:
+        return False
+    return bool(
+        re.match(
+            r"^(?:https?://)?(?:[a-z0-9-]+\.)+[a-z]{2,}(?:[/:?#].*)?$",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _safe_first_column_url_fallback(values: list[str]) -> bool:
+    normalized_values = [
+        str(value or "").strip()
+        for value in values
+        if str(value or "").strip().lower() not in {"url", "domain", "domain_name", "website"}
+    ]
+    if not normalized_values:
+        return False
+    url_like_count = sum(1 for value in normalized_values if _looks_like_url_value(value))
+    return url_like_count >= max(1, int(len(normalized_values) * 0.6))
+
+
 def load_url_records_from_excel_folder(folder_path, limit: int | None = None):
     logger.info(f"Reading Excel files from: {folder_path}")
     url_records: dict[str, dict] = {}
@@ -122,6 +147,7 @@ def load_url_records_from_excel_folder(folder_path, limit: int | None = None):
             header_df = pd.read_excel(f, nrows=0)
             possible_cols = ["Identified Phishing/Suspected Domain Name", "URL", "url", "Domain", "domain_name"]
             found_col = None
+            fallback_to_first_col = False
             for col in possible_cols:
                 if col in header_df.columns:
                     found_col = col
@@ -133,7 +159,7 @@ def load_url_records_from_excel_folder(folder_path, limit: int | None = None):
                         break
             if not found_col:
                 found_col = header_df.columns[0]
-                logger.warning(f"No known URL column in {f}. Using first column: {found_col}")
+                fallback_to_first_col = True
             remaining_limit = None
             if max_urls is not None:
                 remaining_limit = max_urls - len(url_records)
@@ -147,6 +173,13 @@ def load_url_records_from_excel_folder(folder_path, limit: int | None = None):
                 nrows=remaining_limit,
             )
             urls = df[found_col].dropna().astype(str)
+            if fallback_to_first_col:
+                sample_values = urls.head(5).tolist()
+                sample_looks_like_urls = _safe_first_column_url_fallback(sample_values)
+                if sample_looks_like_urls:
+                    logger.debug("No known URL column in %s. Using first column: %s", f, found_col)
+                else:
+                    logger.warning("No known URL column in %s. Using first column: %s", f, found_col)
             added_from_file = 0
             workbook_name = os.path.basename(f)
             for url in urls:

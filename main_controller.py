@@ -8,11 +8,18 @@ import os
 import argparse
 import asyncio
 import logging
+import warnings
 from typing import Any
 
 # Event loop policy on Windows
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    warnings.filterwarnings(
+        "ignore",
+        category=ResourceWarning,
+        message=r".*unclosed transport.*",
+        module=r"asyncio\.proactor_events",
+    )
 
     class _AsyncioPipeClosedNoiseFilter(logging.Filter):
         """Suppress known-noisy Windows proactor pipe-close warnings."""
@@ -102,7 +109,7 @@ def _pipeline_mode(value: str) -> str:
 
 def _stage_smoke_mode(value: str) -> str:
     normalized = str(value).strip().lower()
-    allowed = {"off", "dns", "fetch", "lexical", "score", "classify", "all"}
+    allowed = {"off", "fetch", "lexical", "score", "classify", "all"}
     if normalized not in allowed:
         raise argparse.ArgumentTypeError(f"stage smoke test must be one of {sorted(allowed)}")
     return normalized
@@ -181,27 +188,13 @@ def _resolve_runtime_profile_settings(
     profiles: dict[str, dict[str, Any]] = {
         "cpu-safe": {
             "env": {
-                "PHISHING_HASH_WORKER_NODES_START": 4,
-                "PHISHING_HASH_WORKER_NODES_MAX": 6,
-                "PHISHING_HASH_PAGES_PER_NODE": 4,
-                "PHISHING_HASH_ACTIVE_PAGES_START": 16,
-                "PHISHING_HASH_ACTIVE_PAGES_MAX": 24,
-                "PHISHING_HASH_RENDER_QUEUE_MAX": 4000,
-                "PHISHING_HASH_RESULT_QUEUE_MAX": 2000,
-                "PHISHING_HASH_AUX_WORKERS": 24,
-                "PHISHING_HASH_AUX_HTTP_LIMIT": 64,
-                "PHISHING_HASH_AUX_SSL_LIMIT": 24,
-                "PHISHING_HASH_PER_HOST_LIMIT": 4,
-                "PHISHING_HASH_PROGRESS_LOG_INTERVAL_SECONDS": 10,
-                "PHISHING_HASH_TARGET_URLS_PER_SEC": 12,
                 "PHISHING_HASH_PAGES": 16,
                 "PHISHING_HASH_PAGE_CONCURRENCY": 4,
                 "PHISHING_HASH_HTTP_LIMIT": 64,
                 "PHISHING_HASH_AUX_NET_LIMIT": 24,
                 "PHISHING_HASH_ACTIVE_PAGES_FLOOR": 6,
+                "PHISHING_HASH_PROGRESS_LOG_INTERVAL_SECONDS": 10,
                 "PHISHING_HASH_ADAPTIVE_DOWNSHIFT": "true",
-                "PHISHING_DNS_GATE_MIN_WORKERS": 96,
-                "PHISHING_DNS_GATE_MAX_WORKERS": 192,
             },
             "stage1_http": {
                 "concurrency": 96,
@@ -224,31 +217,16 @@ def _resolve_runtime_profile_settings(
                 "stage1_enrich_queue_max": 2000,
                 "stage1_result_queue_max": 2000,
             },
-            "dns_max_workers": 192,
         },
         "cpu-recall": {
             "env": {
-                "PHISHING_HASH_WORKER_NODES_START": 12,
-                "PHISHING_HASH_WORKER_NODES_MAX": 16,
-                "PHISHING_HASH_PAGES_PER_NODE": 8,
-                "PHISHING_HASH_ACTIVE_PAGES_START": 96,
-                "PHISHING_HASH_ACTIVE_PAGES_MAX": 128,
-                "PHISHING_HASH_RENDER_QUEUE_MAX": 20000,
-                "PHISHING_HASH_RESULT_QUEUE_MAX": 8000,
-                "PHISHING_HASH_AUX_WORKERS": 96,
-                "PHISHING_HASH_AUX_HTTP_LIMIT": 128,
-                "PHISHING_HASH_AUX_SSL_LIMIT": 64,
-                "PHISHING_HASH_PER_HOST_LIMIT": 4,
+                "PHISHING_HASH_PAGES": 20,
+                "PHISHING_HASH_PAGE_CONCURRENCY": 4,
+                "PHISHING_HASH_HTTP_LIMIT": 80,
+                "PHISHING_HASH_AUX_NET_LIMIT": 32,
+                "PHISHING_HASH_ACTIVE_PAGES_FLOOR": 8,
                 "PHISHING_HASH_PROGRESS_LOG_INTERVAL_SECONDS": 10,
-                "PHISHING_HASH_TARGET_URLS_PER_SEC": 40,
-                "PHISHING_HASH_PAGES": 96,
-                "PHISHING_HASH_PAGE_CONCURRENCY": 8,
-                "PHISHING_HASH_HTTP_LIMIT": 128,
-                "PHISHING_HASH_AUX_NET_LIMIT": 96,
-                "PHISHING_HASH_ACTIVE_PAGES_FLOOR": 64,
                 "PHISHING_HASH_ADAPTIVE_DOWNSHIFT": "true",
-                "PHISHING_DNS_GATE_MIN_WORKERS": 128,
-                "PHISHING_DNS_GATE_MAX_WORKERS": 256,
             },
             "stage1_http": {
                 "concurrency": 512,
@@ -271,31 +249,16 @@ def _resolve_runtime_profile_settings(
                 "stage1_enrich_queue_max": 4000,
                 "stage1_result_queue_max": 8000,
             },
-            "dns_max_workers": 256,
         },
         "cpu-fast": {
             "env": {
-                "PHISHING_HASH_WORKER_NODES_START": 6,
-                "PHISHING_HASH_WORKER_NODES_MAX": 8,
-                "PHISHING_HASH_PAGES_PER_NODE": 6,
-                "PHISHING_HASH_ACTIVE_PAGES_START": 24,
-                "PHISHING_HASH_ACTIVE_PAGES_MAX": 48,
-                "PHISHING_HASH_RENDER_QUEUE_MAX": 6000,
-                "PHISHING_HASH_RESULT_QUEUE_MAX": 3000,
-                "PHISHING_HASH_AUX_WORKERS": 40,
-                "PHISHING_HASH_AUX_HTTP_LIMIT": 96,
-                "PHISHING_HASH_AUX_SSL_LIMIT": 40,
-                "PHISHING_HASH_PER_HOST_LIMIT": 4,
-                "PHISHING_HASH_PROGRESS_LOG_INTERVAL_SECONDS": 10,
-                "PHISHING_HASH_TARGET_URLS_PER_SEC": 20,
                 "PHISHING_HASH_PAGES": 24,
-                "PHISHING_HASH_PAGE_CONCURRENCY": 6,
+                "PHISHING_HASH_PAGE_CONCURRENCY": 4,
                 "PHISHING_HASH_HTTP_LIMIT": 96,
                 "PHISHING_HASH_AUX_NET_LIMIT": 40,
-                "PHISHING_HASH_ACTIVE_PAGES_FLOOR": 12,
+                "PHISHING_HASH_ACTIVE_PAGES_FLOOR": 8,
+                "PHISHING_HASH_PROGRESS_LOG_INTERVAL_SECONDS": 10,
                 "PHISHING_HASH_ADAPTIVE_DOWNSHIFT": "true",
-                "PHISHING_DNS_GATE_MIN_WORKERS": 128,
-                "PHISHING_DNS_GATE_MAX_WORKERS": 256,
             },
             "stage1_http": {
                 "concurrency": 144,
@@ -318,7 +281,6 @@ def _resolve_runtime_profile_settings(
                 "stage1_enrich_queue_max": 3000,
                 "stage1_result_queue_max": 3000,
             },
-            "dns_max_workers": 256,
         },
     }
     selected = profiles[resolved_profile]
@@ -329,7 +291,6 @@ def _resolve_runtime_profile_settings(
         "resource_info": resource_info,
         "env": dict(selected["env"]),
         "stage1_http": dict(selected["stage1_http"]),
-        "dns_max_workers": selected["dns_max_workers"],
     }
 
 
@@ -476,12 +437,6 @@ async def main():
                         help="Minimum lexical score allowed to pass Stage 1 admission even below hash threshold (default=0.85)")
     parser.add_argument("--clip-margin-min", type=_non_negative_float, default=0.20,
                         help="Deprecated compatibility no-op. CLIP routing is disabled.")
-    parser.add_argument("--dns-timeout", type=_non_negative_float, default=3.0,
-                        help="DNS gate timeout in seconds (default=3.0)")
-    parser.add_argument("--dns-retries", type=_non_negative_int, default=0,
-                        help="DNS gate retry count for timeout/resolver errors (default=0; runtime clamps to single-attempt)")
-    parser.add_argument("--dns-max-workers", type=_positive_int, default=None,
-                        help="Optional fixed DNS gate worker count (default=adaptive)")
     parser.add_argument("--stage1-escalate-total-threshold", type=_non_negative_int, default=None,
                         help="Override Stage1 HTTP escalate_total_threshold (default=config)")
     parser.add_argument("--stage1-brand-min", type=_non_negative_int, default=None,
@@ -494,8 +449,6 @@ async def main():
                         help="Override Stage1 HTTP hard_trigger_brand_min (default=config)")
     parser.add_argument("--keep-stage1-suspected", action="store_true",
                         help="Keep Stage1 suspected_non_escalated rows as weak holdout candidates")
-    parser.add_argument("--keep-dns-rejected-strict-lexical", action="store_true",
-                        help="Keep strict-lexical DNS rejected rows as weak holdout candidates")
     parser.add_argument("--keep-fetch-failed-strict-lexical", action="store_true",
                         help="Keep strict-lexical fetch failed/timeout rows as weak holdout candidates")
     parser.add_argument("--failed-fetch-suspected-min", type=_probability_float, default=None,
@@ -519,7 +472,7 @@ async def main():
     parser.add_argument("--shortlist-debug-csv", type=str, default=os.path.join("output", "stage1_lexical_debug.csv"),
                         help="Path for Stage 1 lexical/debug CSV (default=output/stage1_lexical_debug.csv)")
     parser.add_argument("--stage-smoke-test", type=_stage_smoke_mode, default="off",
-                        help="Optional partial-run mode: off, dns, fetch, lexical, score, classify, all (default=off)")
+                        help="Optional partial-run mode: off, fetch, lexical, score, classify, all (default=off)")
     parser.add_argument("--runtime-profile", type=_runtime_profile, default="auto",
                         help="Concurrency-only runtime preset. 'auto' is the default; 'default' is an alias for 'auto'.")
     parser.add_argument("--run-id", type=str, default=None,
@@ -554,7 +507,11 @@ async def main():
             and str(existing_manifest.get("status", "")).strip().lower() != "completed"
             and _manifest_matches_inputs(existing_manifest, reliability_metadata)
         ):
-            checkpoint_events_csv = str(existing_manifest.get("url_result_events_csv", "") or "")
+            checkpoint_events_csv = str(
+                existing_manifest.get("checkpoints_csv", "")
+                or existing_manifest.get("url_result_events_csv", "")
+                or ""
+            )
             if checkpoint_events_csv and os.path.exists(checkpoint_events_csv):
                 existing_run_id = str(existing_manifest.get("run_id", "") or "").strip() or None
 
@@ -565,8 +522,8 @@ async def main():
         run_id=resolved_run_id,
         stall_threshold_seconds=args.stall_threshold_seconds,
         watchdog_warning_seconds=int(RELIABILITY_CONFIG.get("watchdog_warning_seconds", 60)),
-        append_flush_interval_seconds=int(RELIABILITY_CONFIG.get("append_flush_interval_seconds", 2)),
-        append_flush_row_interval=int(RELIABILITY_CONFIG.get("append_flush_row_interval", 1000)),
+        append_flush_interval_seconds=int(RELIABILITY_CONFIG.get("append_flush_interval_seconds", 5)),
+        append_flush_row_interval=int(RELIABILITY_CONFIG.get("append_flush_row_interval", 2000)),
         snapshot_flush_interval_seconds=int(RELIABILITY_CONFIG.get("snapshot_flush_interval_seconds", 30)),
         snapshot_flush_row_interval=int(RELIABILITY_CONFIG.get("snapshot_flush_row_interval", 5000)),
         stage0_progress_log_interval_seconds=int(RELIABILITY_CONFIG.get("stage0_progress_log_interval_seconds", 10)),
@@ -577,12 +534,12 @@ async def main():
     checkpoint_store = CheckpointStore(run_context)
     checkpoint_store.update_manifest(status="running", metadata_json=reliability_metadata)
     logger.info(
-        "Reliability run context | run_id=%s | resume=%s | force_reprocess=%s | manifest=%s | result_events=%s | stage1_failure_policy=%s | stall_threshold_seconds=%d",
+        "Reliability run context | run_id=%s | resume=%s | force_reprocess=%s | manifest=%s | checkpoints=%s | stage1_failure_policy=%s | stall_threshold_seconds=%d",
         run_context.run_id,
         resuming_existing_run,
         args.force_reprocess,
-        run_context.checkpoint_run_manifest_csv,
-        run_context.url_result_events_csv,
+        run_context.run_manifest_csv,
+        run_context.checkpoints_csv,
         run_context.stage1_failure_policy,
         run_context.stall_threshold_seconds,
     )
@@ -599,19 +556,9 @@ async def main():
     run_hashing_shortlist_async = components["run_hashing_shortlist_async"]
     stage1_http_config = components["STAGE1_HTTP_CONFIG"] or {}
     _apply_stage1_http_runtime_profile(stage1_http_config, runtime_profile_settings)
-    effective_dns_max_workers = (
-        args.dns_max_workers
-        if args.dns_max_workers is not None
-        else runtime_profile_settings.get("dns_max_workers")
-    )
 
     if args.high_confidence_threshold < args.medium_confidence_threshold:
         raise ValueError("high-confidence-threshold must be >= medium-confidence-threshold")
-    if args.dns_timeout <= 0:
-        raise ValueError("dns-timeout must be > 0")
-    if args.dns_retries != 0:
-        logger.warning("DNS retries are disabled in CSV checkpoint mode. Forcing dns_retries=0 instead of %s", args.dns_retries)
-        args.dns_retries = 0
     if (
         args.failed_fetch_suspected_min is not None
         and args.failed_fetch_review_min is not None
@@ -624,7 +571,7 @@ async def main():
         args.weight_screenshot,
     )
     logger.info(
-        "Runtime profile requested=%s resolved=%s | host={cpu=%s,ram_gb=%.1f,vram_gb=%.1f,platform=%s} | hash_env=%s | stage1_http_overrides=%s | dns_max_workers=%s",
+        "Runtime profile requested=%s resolved=%s | host={cpu=%s,ram_gb=%.1f,vram_gb=%.1f,platform=%s} | hash_env=%s | stage1_http_overrides=%s",
         runtime_profile_settings["requested_profile"],
         runtime_profile_settings["resolved_profile"],
         runtime_profile_settings["resource_info"].get("cpu_cores", "NA"),
@@ -633,22 +580,14 @@ async def main():
         runtime_profile_settings["resource_info"].get("platform", "unknown"),
         runtime_profile_settings.get("env", {}),
         runtime_profile_settings.get("stage1_http", {}),
-        effective_dns_max_workers if effective_dns_max_workers is not None else "adaptive",
     )
     logger.info(
-        "Effective runtime concurrency | hash={nodes_start=%s,nodes_max=%s,pages_per_node=%s,active_start=%s,active_max=%s,active_floor=%s,aux_workers=%s,aux_http=%s,aux_ssl=%s,per_host=%s,dns_gate_min=%s,dns_gate_max=%s} | stage1_http={url=%s,http=%s,dns=%s,rdap=%s,tls=%s}",
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_WORKER_NODES_START", "NA"),
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_WORKER_NODES_MAX", "NA"),
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_PAGES_PER_NODE", "NA"),
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_ACTIVE_PAGES_START", "NA"),
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_ACTIVE_PAGES_MAX", "NA"),
+        "Effective runtime concurrency | hash={pages=%s,page_concurrency=%s,http_limit=%s,aux_net_limit=%s,active_fetch_floor=%s} | stage1_http={url=%s,http=%s,dns=%s,rdap=%s,tls=%s}",
+        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_PAGES", "NA"),
+        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_PAGE_CONCURRENCY", "NA"),
+        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_HTTP_LIMIT", "NA"),
+        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_AUX_NET_LIMIT", "NA"),
         runtime_profile_settings.get("env", {}).get("PHISHING_HASH_ACTIVE_PAGES_FLOOR", "NA"),
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_AUX_WORKERS", "NA"),
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_AUX_HTTP_LIMIT", "NA"),
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_AUX_SSL_LIMIT", "NA"),
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_PER_HOST_LIMIT", "NA"),
-        runtime_profile_settings.get("env", {}).get("PHISHING_DNS_GATE_MIN_WORKERS", "NA"),
-        runtime_profile_settings.get("env", {}).get("PHISHING_DNS_GATE_MAX_WORKERS", "NA"),
         stage1_http_config.get("concurrency", "NA"),
         stage1_http_config.get("http_concurrency", "NA"),
         stage1_http_config.get("dns_concurrency", "NA"),
@@ -656,20 +595,12 @@ async def main():
         stage1_http_config.get("tls_concurrency", "NA"),
     )
     logger.info(
-        "Hash stage topology | worker_nodes={start=%s,max=%s} | pages_per_node=%s | active_pages={start=%s,max=%s,floor=%s} | queues={render=%s,result=%s} | aux={workers=%s,http=%s,ssl=%s} | per_host=%s | target_urls_per_sec=%s",
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_WORKER_NODES_START", "NA"),
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_WORKER_NODES_MAX", "NA"),
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_PAGES_PER_NODE", "NA"),
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_ACTIVE_PAGES_START", "NA"),
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_ACTIVE_PAGES_MAX", "NA"),
+        "Hash stage topology | pages=%s | shard_workers=%s | shards=auto | http_limit=%s | aux_net_limit=%s | active_pages_floor=%s",
+        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_PAGES", "NA"),
+        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_PAGE_CONCURRENCY", "NA"),
+        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_HTTP_LIMIT", "NA"),
+        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_AUX_NET_LIMIT", "NA"),
         runtime_profile_settings.get("env", {}).get("PHISHING_HASH_ACTIVE_PAGES_FLOOR", "NA"),
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_RENDER_QUEUE_MAX", "NA"),
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_RESULT_QUEUE_MAX", "NA"),
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_AUX_WORKERS", "NA"),
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_AUX_HTTP_LIMIT", "NA"),
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_AUX_SSL_LIMIT", "NA"),
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_PER_HOST_LIMIT", "NA"),
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_TARGET_URLS_PER_SEC", "NA"),
     )
     logger.info(
         "Stage1 lane topology | tiered_fast_path=%s | dns_reuse=%s | final_domain_dns_fallback=%s | fetch={start=%s,max=%s,conn=%s,keepalive=%s,per_host=%s} | parse_workers=%s | enrich={dns=%s,rdap=%s,tls=%s} | queues={fetch=%s,parse=%s,score=%s,enrich=%s,result=%s}",
@@ -692,8 +623,8 @@ async def main():
         stage1_http_config.get("stage1_result_queue_max", "NA"),
     )
     logger.info(
-        "Strict attempt policy | checkpoint_mode=csv | retries={stage1=0,dns=0,rdap=0,tls=0,hash=0,classify=0} | timeouts={dns=%.1fs,stage1_connect=%s,stage1_head=%s,stage1_get=%s,stage1_rdap=%s,stage1_tls=%s}",
-        args.dns_timeout,
+        "Strict attempt policy | checkpoint_mode=csv | retries={stage1=0,rdap=0,tls=0,hash=0,classify=0} | timeouts={stage1_dns=%s,stage1_connect=%s,stage1_head=%s,stage1_get=%s,stage1_rdap=%s,stage1_tls=%s}",
+        stage1_http_config.get("dns_timeout", "NA"),
         stage1_http_config.get("connect_timeout", "NA"),
         stage1_http_config.get("head_timeout", "NA"),
         stage1_http_config.get("get_timeout", "NA"),
@@ -739,13 +670,14 @@ async def main():
                 os.path.join("output", "output_file.csv"),
                 os.path.join("output", "output_file_filtered.csv"),
                 os.path.join("output", "hash_review_queue.csv"),
-                os.path.join("output", "checkpoint_records.csv"),
+                os.path.join("output", "dns_gate_audit.csv"),
+                os.path.join("output", "dns_rejected_lexical_hits.csv"),
+                os.path.join("output", "parked_page_exclusions.csv"),
                 os.path.join("output", "stage1_lexical_debug.csv"),
                 os.path.join("output", "stage1_methods_debug.csv"),
                 os.path.join("output", "stage1_deep_analysis_candidates.csv"),
                 os.path.join("output", "stage2_model_debug.csv"),
                 os.path.join("output", "stage3_classification_debug.csv"),
-                os.path.join("output", "parked_page_exclusions.csv"),
             ]
             if args.stage_smoke_test != "classify":
                 cleanup_patterns.append(os.path.join("output", "holdout.csv"))
@@ -753,7 +685,11 @@ async def main():
                 for f in glob.glob(pattern):
                     os.remove(f)
                     logger.info("🧹 Removed old output: %s", f)
-        
+            legacy_checkpoint_dir = os.path.join("output", "checkpoints")
+            if os.path.isdir(legacy_checkpoint_dir):
+                shutil.rmtree(legacy_checkpoint_dir, ignore_errors=True)
+                logger.info("Removed obsolete checkpoint folder: %s", legacy_checkpoint_dir)
+
         logger.info("Using whitelist file: %s", args.whitelist)
         logger.info("Using shortlisting folder: %s", args.shortlisting)
         if args.limit:
@@ -793,9 +729,8 @@ async def main():
             "Runtime mode=%s | shortlist threshold=%.3f domain_sim_threshold=%.3f "
             "confidence_bands={high>=%.3f, medium>=%.3f} "
             "typo={top_k=%d,min_score=%.3f,lexical_pass_min_score=%.3f} "
-            "dns={timeout=%.2f,retries=%d,max_workers=%s} "
             "stage1_http={url_concurrency=%s,http=%s,dns=%s,rdap=%s,tls=%s,max_html_bytes=%s,max_redirects=%s,escalate_total=%s,brand_min=%s,credential_min=%s,low_band_min=%s,hard_trigger_brand_min=%s} "
-            "recall_passthroughs={stage1_suspected=%s,dns_rejected_strict_lexical=%s,fetch_failed_strict_lexical=%s} "
+            "review_policies={stage1_suspected_passthrough=%s,fetch_failed_strict_lexical_passthrough=%s} "
             "failed_fetch_rescue={suspected_min=%s,review_min=%s} "
             "weights={domain=%.3f,favicon=%.3f,ssl_hash=%.3f,html_hash=%.3f,domain_hash=%.3f,keywords=%.3f} "
             "stage_smoke_test=%s shortlist_debug_csv=%s",
@@ -807,9 +742,6 @@ async def main():
             args.typo_top_k,
             args.typo_min_score,
             args.lexical_pass_min_score,
-            args.dns_timeout,
-            args.dns_retries,
-            effective_dns_max_workers if effective_dns_max_workers is not None else "adaptive",
             stage1_http_config.get("concurrency", "NA"),
             stage1_http_config.get("http_concurrency", "NA"),
             stage1_http_config.get("dns_concurrency", "NA"),
@@ -823,7 +755,6 @@ async def main():
             effective_stage1_thresholds["low_band_min"],
             effective_stage1_thresholds["hard_trigger_brand_min"],
             args.keep_stage1_suspected,
-            args.keep_dns_rejected_strict_lexical,
             args.keep_fetch_failed_strict_lexical,
             args.failed_fetch_suspected_min if args.failed_fetch_suspected_min is not None else "off",
             args.failed_fetch_review_min if args.failed_fetch_review_min is not None else "off",
@@ -862,9 +793,6 @@ async def main():
                     typo_min_score=args.typo_min_score,
                     lexical_pass_min_score=args.lexical_pass_min_score,
                     clip_margin_min=args.clip_margin_min,
-                    dns_timeout=args.dns_timeout,
-                    dns_retries=args.dns_retries,
-                    dns_max_workers=effective_dns_max_workers,
                     shortlist_debug_csv=args.shortlist_debug_csv,
                     stage1_escalate_total_threshold=args.stage1_escalate_total_threshold,
                     stage1_brand_min=args.stage1_brand_min,
@@ -872,7 +800,6 @@ async def main():
                     stage1_low_band_min=args.stage1_low_band_min,
                     stage1_hard_trigger_brand_min=args.stage1_hard_trigger_brand_min,
                     keep_stage1_suspected=args.keep_stage1_suspected,
-                    keep_dns_rejected_strict_lexical=args.keep_dns_rejected_strict_lexical,
                     keep_fetch_failed_strict_lexical=args.keep_fetch_failed_strict_lexical,
                     failed_fetch_suspected_min=args.failed_fetch_suspected_min,
                     failed_fetch_review_min=args.failed_fetch_review_min,
@@ -915,14 +842,10 @@ async def main():
                     typo_min_score=args.typo_min_score,
                     lexical_pass_min_score=args.lexical_pass_min_score,
                     clip_margin_min=args.clip_margin_min,
-                    dns_timeout=args.dns_timeout,
-                    dns_retries=args.dns_retries,
-                    dns_max_workers=effective_dns_max_workers,
                     weights=shortlist_weights,
                     shortlist_debug_csv=args.shortlist_debug_csv,
                     url_sources=url_sources,
                     keep_stage1_suspected=args.keep_stage1_suspected,
-                    keep_dns_rejected_strict_lexical=args.keep_dns_rejected_strict_lexical,
                     keep_fetch_failed_strict_lexical=args.keep_fetch_failed_strict_lexical,
                     stage1_escalate_total_threshold=args.stage1_escalate_total_threshold,
                     stage1_brand_min=args.stage1_brand_min,
@@ -941,7 +864,7 @@ async def main():
                 holdout_df.to_csv(out_csv, index=False)
                 logger.info(f"--- Finished Step 1: Shortlisting Complete ({len(holdout_df)} matched) ---")
 
-                if args.stage_smoke_test in {"dns", "fetch", "lexical", "score"}:
+                if args.stage_smoke_test in {"fetch", "lexical", "score"}:
                     logger.info("Stage smoke test '%s' requested. Stopping after Step 1.", args.stage_smoke_test)
                     df_out = holdout_df
                     checkpoint_store.mark_completed()
@@ -967,9 +890,6 @@ async def main():
                     typo_min_score=args.typo_min_score,
                     lexical_pass_min_score=args.lexical_pass_min_score,
                     clip_margin_min=args.clip_margin_min,
-                    dns_timeout=args.dns_timeout,
-                    dns_retries=args.dns_retries,
-                    dns_max_workers=effective_dns_max_workers,
                     shortlist_debug_csv=args.shortlist_debug_csv,
                     stage1_escalate_total_threshold=args.stage1_escalate_total_threshold,
                     stage1_brand_min=args.stage1_brand_min,
@@ -977,7 +897,6 @@ async def main():
                     stage1_low_band_min=args.stage1_low_band_min,
                     stage1_hard_trigger_brand_min=args.stage1_hard_trigger_brand_min,
                     keep_stage1_suspected=args.keep_stage1_suspected,
-                    keep_dns_rejected_strict_lexical=args.keep_dns_rejected_strict_lexical,
                     keep_fetch_failed_strict_lexical=args.keep_fetch_failed_strict_lexical,
                     failed_fetch_suspected_min=args.failed_fetch_suspected_min,
                     failed_fetch_review_min=args.failed_fetch_review_min,
@@ -1008,9 +927,6 @@ async def main():
                     typo_min_score=args.typo_min_score,
                     lexical_pass_min_score=args.lexical_pass_min_score,
                     clip_margin_min=args.clip_margin_min,
-                    dns_timeout=args.dns_timeout,
-                    dns_retries=args.dns_retries,
-                    dns_max_workers=effective_dns_max_workers,
                     shortlist_debug_csv=args.shortlist_debug_csv,
                     stage1_escalate_total_threshold=args.stage1_escalate_total_threshold,
                     stage1_brand_min=args.stage1_brand_min,
@@ -1018,7 +934,6 @@ async def main():
                     stage1_low_band_min=args.stage1_low_band_min,
                     stage1_hard_trigger_brand_min=args.stage1_hard_trigger_brand_min,
                     keep_stage1_suspected=args.keep_stage1_suspected,
-                    keep_dns_rejected_strict_lexical=args.keep_dns_rejected_strict_lexical,
                     keep_fetch_failed_strict_lexical=args.keep_fetch_failed_strict_lexical,
                     failed_fetch_suspected_min=args.failed_fetch_suspected_min,
                     failed_fetch_review_min=args.failed_fetch_review_min,

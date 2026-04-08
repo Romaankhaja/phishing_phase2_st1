@@ -22,7 +22,7 @@
 - Keep profile changes concurrency-only:
   - Hash shortlist env caps
   - Stage 1 HTTP concurrency caps
-  - DNS gate worker cap
+  - Stage 1 ancillary network caps
   - No profile is allowed to change scoring weights, lexical thresholds, Stage 1 score thresholds, recall passthrough flags, or failed-fetch rescue thresholds.
 - In [phishing_pipeline/rdap_utils.py](c:/Users/SATWIK/Documents/Phishing/phishing_pipeline/rdap_utils.py), add RDAP backpressure and clearer failure handling.
   - Reuse the shared caller client when provided; do not create extra clients per request path.

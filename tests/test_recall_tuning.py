@@ -84,20 +84,10 @@ class RecallTuningHarnessTests(unittest.TestCase):
             pd.DataFrame(
                 [
                     {
-                        "target_url": gt_url,
-                        "source_workbook": "123456.xlsx",
-                        "dns_status": "resolved",
-                        "decision": "accepted",
-                    }
-                ]
-            ).to_csv(iteration_dir / "dns_gate_audit.csv", index=False)
-            pd.DataFrame(
-                [
-                    {
                         "Identified Phishing/Suspected Domain Name": gt_url,
                         "source_workbook": "123456.xlsx",
-                        "fetch_status": "dns_rejected",
-                        "admission_path": "dns_rejected_strict_lexical_passthrough",
+                        "fetch_status": "timeout",
+                        "admission_path": "failed_fetch_strict_lexical_rescue",
                     }
                 ]
             ).to_csv(iteration_dir / "holdout.csv", index=False)

@@ -1,5 +1,0 @@
-input_position,input_url,normalized_url,exclusion_stage,reason,dns_status,dns_decision,fetch_status,final_landing_url,parking_provider,parking_reason,strict_lexical_hit,lexical_score_pass,fallback_rank_only,candidate_generation_reason
-1,paarivahan.com,https://paarivahan.com,dns_gate,dns_rejected,dns_error,rejected,,,,,True,True,False,jw_primary|token_set_primary|skeleton_similarity|host_similarity
-4,sbireward.com,https://sbireward.com,dns_gate,dns_rejected,dns_error,rejected,,,,,True,True,False,jw_primary
-5,airtele.xyz,https://airtele.xyz,dns_gate,dns_rejected,dns_error,rejected,,,,,True,True,False,jw_primary|token_set_primary|skeleton_similarity|host_similarity
-6,airtel-merchants.club,https://airtel-merchants.club,dns_gate,dns_rejected,no_records,rejected,,,,,True,True,False,brand_token_match|jw_primary

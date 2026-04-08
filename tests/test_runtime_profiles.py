@@ -65,7 +65,6 @@ class RuntimeProfileTests(unittest.TestCase):
     def test_cpu_safe_profile_has_expected_concurrency_values(self):
         settings = main_controller._resolve_runtime_profile_settings("cpu-safe")
 
-        self.assertEqual(settings["dns_max_workers"], 192)
         self.assertEqual(settings["stage1_http"]["concurrency"], 96)
         self.assertEqual(settings["stage1_http"]["rdap_concurrency"], 4)
         self.assertEqual(settings["env"]["PHISHING_HASH_PAGES"], 16)
@@ -74,9 +73,8 @@ class RuntimeProfileTests(unittest.TestCase):
     def test_cpu_recall_profile_has_expected_concurrency_values(self):
         settings = main_controller._resolve_runtime_profile_settings("cpu-recall")
 
-        self.assertEqual(settings["dns_max_workers"], 256)
-        self.assertEqual(settings["stage1_http"]["concurrency"], 128)
-        self.assertEqual(settings["stage1_http"]["rdap_concurrency"], 4)
+        self.assertEqual(settings["stage1_http"]["concurrency"], 512)
+        self.assertEqual(settings["stage1_http"]["rdap_concurrency"], 8)
         self.assertEqual(settings["env"]["PHISHING_HASH_PAGES"], 20)
 
     def test_apply_runtime_profile_env_sets_overrides(self):
@@ -87,7 +85,6 @@ class RuntimeProfileTests(unittest.TestCase):
 
             self.assertEqual(os.environ["PHISHING_HASH_PAGES"], "24")
             self.assertEqual(os.environ["PHISHING_HASH_HTTP_LIMIT"], "96")
-            self.assertEqual(os.environ["PHISHING_DNS_GATE_MAX_WORKERS"], "256")
 
     def test_apply_stage1_http_runtime_profile_updates_existing_config(self):
         settings = main_controller._resolve_runtime_profile_settings("cpu-safe")

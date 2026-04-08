@@ -1,4 +1,5 @@
 import csv
+import os
 import tempfile
 import unittest
 
@@ -68,11 +69,16 @@ class ReliabilityContractTests(unittest.TestCase):
                 result_rows = list(csv.DictReader(fh))
             with open(ctx.stage_events_csv, newline="", encoding="utf-8") as fh:
                 event_rows = list(csv.DictReader(fh))
+            with open(ctx.checkpoints_csv, newline="", encoding="utf-8") as fh:
+                checkpoint_rows = list(csv.DictReader(fh))
 
             self.assertEqual(len(result_rows), 1)
             self.assertEqual(result_rows[0]["stage0_status"], "lexical_hit")
             self.assertEqual(len(event_rows), 1)
             self.assertEqual(event_rows[0]["stage_name"], "stage0")
+            self.assertEqual(len(checkpoint_rows), 1)
+            self.assertEqual(checkpoint_rows[0]["record_key"], make_record_key("https://example.com", "demo.xlsx"))
+            self.assertFalse(os.path.isdir(f"{temp_dir}\\checkpoints"))
             self.assertEqual(store.get_manifest()["status"], "completed")
             store.close()
 

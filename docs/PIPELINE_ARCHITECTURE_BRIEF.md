@@ -16,7 +16,7 @@ The pipeline runs in three main layers:
    - packages the submission
 2. `phishing_pipeline/comparison.py`
    - performs Stage 1 hashing-based shortlisting
-   - runs prefetch lexical checks, DNS gate, browser fetch, hash collection, and CLIP scoring
+   - runs prefetch lexical checks, browser fetch, hash collection, and CLIP scoring
    - writes `output/holdout.csv`
 3. `phishing_pipeline/pipeline.py`
    - performs Stage 2 enrichment and final labeling
@@ -31,12 +31,11 @@ flowchart TD
     B --> C[Load URLs from Excel]
     C --> D[Stage 1: comparison.py]
     D --> D1[Prefetch lexical analysis]
-    D1 --> D2[DNS gate]
-    D2 --> D3[Playwright fetch and screenshot]
-    D3 --> D4[Evidence extraction: HTML, favicon, SSL, domain hash, keywords]
-    D4 --> D5[CLIP screenshot similarity]
-    D5 --> D6[Union admission decision]
-    D6 --> E[output/holdout.csv]
+    D1 --> D2[Playwright fetch and screenshot]
+    D2 --> D3[Evidence extraction: HTML, favicon, SSL, domain hash, keywords]
+    D3 --> D4[CLIP screenshot similarity]
+    D4 --> D5[Union admission decision]
+    D5 --> E[output/holdout.csv]
     E --> F[Stage 2: pipeline.py]
     F --> F1[OCR and TVC]
     F1 --> F2[WHOIS or RDAP or DNS or GeoIP]
@@ -103,25 +102,11 @@ Purpose:
 
 - catch typo-like URLs early
 - avoid depending only on screenshot similarity
-- preserve DNS-accepted lexical hits even when fetch quality is weak
+- preserve strong lexical hits even when fetch quality is weak
 
-#### 3.2 DNS gate
+#### 3.2 Playwright fetch and evidence extraction
 
-Only DNS-resolvable URLs continue into the live fetch phase.
-
-Outputs from this step:
-
-- `output/dns_gate_audit.csv`
-- `output/dns_rejected_lexical_hits.csv`
-
-Why it exists:
-
-- avoids wasting browser time on dead domains
-- separates real fetch failures from DNS failures
-
-#### 3.3 Playwright fetch and evidence extraction
-
-For DNS-accepted URLs, the pipeline opens the page and extracts:
+For routed URLs, the pipeline opens the page and extracts:
 
 - screenshot
 - HTML
@@ -143,7 +128,7 @@ await gpu_queue.put(payload)
 
 This stage is usually the most expensive part of the run because it is browser-bound.
 
-#### 3.4 CLIP screenshot validation
+#### 3.3 CLIP screenshot validation
 
 Screenshots are scored on the GPU in micro-batches.
 
@@ -159,7 +144,7 @@ It helps answer:
 
 It does not by itself prove phishing.
 
-#### 3.5 Union admission decision
+#### 3.4 Union admission decision
 
 The final Stage 1 decision is a union of strong signals:
 
@@ -321,7 +306,6 @@ Packaged output location:
 | `output/stage1_lexical_debug.csv` | Stage 1 lexical and admission debugging |
 | `output/stage2_model_debug.csv` | Supporting model debug output |
 | `output/stage3_classification_debug.csv` | Final classification debug trace |
-| `output/dns_gate_audit.csv` | DNS gate decisions |
 | `output/hashing_shortlist_excluded_urls.csv` | Stage 1 exclusions with reason |
 | `output/output_file.csv` | Final internal output CSV |
 | `output/PS-02_ISS_NLP_Submission/` | Submission folder with Excel and evidence files |
@@ -335,7 +319,6 @@ Useful environment overrides for Stage 1:
 ```powershell
 $env:PHISHING_HASH_PAGES = "72"
 $env:PHISHING_HASH_PAGE_CONCURRENCY = "12"
-$env:PHISHING_DNS_GATE_MAX_WORKERS = "384"
 $env:PHISHING_HASH_NAV_TIMEOUT_MS = "6000"
 $env:PHISHING_HASH_SCREENSHOT_TIMEOUT_MS = "2000"
 $env:PHISHING_HASH_FETCH_TIMEOUT_S = "8.0"
@@ -346,7 +329,6 @@ These control:
 
 - total browser page pressure
 - per-shard browser concurrency
-- DNS gate parallelism
 - navigation and screenshot timeouts
 - HTTP connection pressure
 

@@ -14,7 +14,7 @@ ROOT_DIR = os.path.dirname(BASE_DIR)
 FEATURES_CSV     = os.path.join(BASE_DIR, "blacklist_features.csv")
 FEATURES_ENRICH  = os.path.join(BASE_DIR, "features_enriched.csv")
 FINAL_OUTPUT     = os.path.join(ROOT_DIR, "output", "output_file.csv")
-CHECKPOINT_CSV   = os.path.join(ROOT_DIR, "output", "checkpoint_records.csv")
+CHECKPOINT_CSV   = os.path.join(ROOT_DIR, "output", "checkpoints.csv")
 
 # ML Models + Preprocessors
 MODELS_DIR           = os.path.join(ROOT_DIR, "models")
@@ -35,10 +35,11 @@ CITY_DB_PATH = os.path.join(GEOLITE_DIR, "GeoLite2-City.mmdb")
 WHITELISTS_DIR  = os.path.join(ROOT_DIR, "data", "whitelists")
 HOLDOUT_SETS_DIR = os.path.join(ROOT_DIR, "data", "holdout_sets")
 OUTPUT_DIR      = os.path.join(ROOT_DIR, "output")
-CHECKPOINTS_DIR = os.path.join(OUTPUT_DIR, "checkpoints")
+CHECKPOINTS_CSV = os.path.join(OUTPUT_DIR, "checkpoints.csv")
 PIPELINE_RUN_RESULTS_CSV = os.path.join(OUTPUT_DIR, "pipeline_run_results.csv")
 PIPELINE_STAGE_EVENTS_CSV = os.path.join(OUTPUT_DIR, "pipeline_stage_events.csv")
 RUN_MANIFEST_CSV = os.path.join(OUTPUT_DIR, "run_manifest.csv")
+HASH_EXPORT_DIR = os.path.join(OUTPUT_DIR, "hash_folder")
 
 # Screenshots & Evidence
 SCREENS_DIR  = os.path.join(BASE_DIR, "screens")
@@ -91,19 +92,13 @@ STAGE1_HTTP_CONFIG = {
 }
 
 HASH_STAGE_CONFIG = {
-    "hash_worker_nodes_start": 12,
-    "hash_worker_nodes_max": 16,
-    "hash_pages_per_node": 8,
-    "hash_active_pages_start": 96,
-    "hash_active_pages_max": 128,
-    "hash_render_queue_max": 20000,
-    "hash_result_queue_max": 8000,
-    "hash_aux_workers": 96,
-    "hash_aux_http_limit": 128,
-    "hash_aux_ssl_limit": 64,
-    "hash_per_host_limit": 4,
+    "hash_pages": 24,
+    "hash_page_concurrency": 4,
+    "hash_http_limit": 96,
+    "hash_aux_net_limit": 48,
+    "hash_active_pages_floor": 8,
     "hash_progress_log_interval_seconds": 10,
-    "hash_target_urls_per_sec": 40,
+    "hash_target_urls_per_sec": 24,
 }
 
 STAGE3_RECALL_RESCUE_CONFIG = {
@@ -114,8 +109,8 @@ STAGE3_RECALL_RESCUE_CONFIG = {
 RELIABILITY_CONFIG = {
     "stall_threshold_seconds": 180,
     "watchdog_warning_seconds": 60,
-    "append_flush_interval_seconds": 2,
-    "append_flush_row_interval": 1000,
+    "append_flush_interval_seconds": 5,
+    "append_flush_row_interval": 2000,
     "snapshot_flush_interval_seconds": 30,
     "snapshot_flush_row_interval": 5000,
     "stage0_progress_log_interval_seconds": 10,

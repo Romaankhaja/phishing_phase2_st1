@@ -34,100 +34,15 @@ class _DummyRateLimiter:
         return None
 
 
-class ParkedPageDetectorTests(unittest.TestCase):
-    def test_detects_domaineasy_buy_domain_redirect(self):
-        detected = comparison.detect_parked_page_signals(
-            original_url="https://bankofdigitaldollar.com",
-            final_landing_url="https://domaineasy.com/buy-domain/bankofdigitaldollar.com",
-            title_text="Buy Domain",
-            visible_text="Buy domain now",
-        )
-
-        self.assertTrue(detected["is_parked"])
-        self.assertEqual(detected["parking_provider"], "DomainEasy")
-        self.assertEqual(detected["parking_reason"], "provider_buy_domain_redirect")
-
-    def test_detects_squarespace_domain_not_claimed(self):
-        detected = comparison.detect_parked_page_signals(
-            original_url="https://cloudpique.com",
-            final_landing_url="https://cloudpique.com",
-            title_text="Squarespace - Domain not claimed",
-            visible_text="This domain has not been claimed yet.",
-        )
-
-        self.assertTrue(detected["is_parked"])
-        self.assertEqual(detected["parking_provider"], "Squarespace")
-        self.assertEqual(detected["parking_reason"], "provider_branded_parking_template")
-
-    def test_detects_blank_redirect_placeholder(self):
-        detected = comparison.detect_parked_page_signals(
-            original_url="https://cloud-adsprint.click",
-            final_landing_url="https://cloud-adsprint.click",
-            title_text="Redirecting...",
-            visible_text="",
-        )
-
-        self.assertTrue(detected["is_parked"])
-        self.assertEqual(detected["parking_reason"], "placeholder_redirect_page")
-
-    def test_detects_provider_redirect(self):
-        detected = comparison.detect_parked_page_signals(
-            original_url="https://brand-login-check.com",
-            final_landing_url="https://www.afternic.com/forsale/brand-login-check.com",
-            title_text="Buy this domain",
-            visible_text="This domain is for sale",
-        )
-
-        self.assertTrue(detected["is_parked"])
-        self.assertEqual(detected["parking_provider"], "GoDaddy/Afternic")
-        self.assertEqual(detected["parking_reason"], "provider_host_redirect")
-
-    def test_detects_branded_sale_template(self):
-        detected = comparison.detect_parked_page_signals(
-            original_url="https://brand-login-check.com",
-            final_landing_url="https://brand-login-check.com",
-            title_text="Buy this domain",
-            visible_text="Lease to own this premium domain on Dan.com",
-        )
-
-        self.assertTrue(detected["is_parked"])
-        self.assertEqual(detected["parking_provider"], "Dan")
-        self.assertEqual(detected["parking_reason"], "provider_branded_parking_template")
-
-    def test_ignores_regular_content_with_registrar_mention(self):
-        detected = comparison.detect_parked_page_signals(
-            original_url="https://example.org",
-            final_landing_url="https://example.org",
-            title_text="Example Org",
-            visible_text="Our migration away from GoDaddy hosting finished last week.",
-        )
-
-        self.assertFalse(detected["is_parked"])
-
-    def test_stored_parked_page_ignores_nan_replay_values(self):
-        detected = pipeline._detect_stored_parked_page(
-            {
-                "Identified Phishing/Suspected Domain Name": "https://example.org",
-                "final_landing_url": "https://example.org",
-                "parking_provider": float("nan"),
-                "parking_reason": float("nan"),
-                "placeholder_or_parking_reason": float("nan"),
-                "html_title_text": "Example Org",
-                "visible_text_excerpt": "Regular account sign-in page for Example Org.",
-            }
-        )
-
-        self.assertFalse(detected["is_parked"])
-
-    def test_parked_payload_is_not_shortlisted_even_with_high_lexical_score(self):
+class Stage1PayloadTests(unittest.TestCase):
+    def test_failed_payload_no_longer_uses_parking_exclusion_reason(self):
         payload_outcome = comparison._handle_stage1_fetch_payload(
             payload={
                 "url": "https://brand-login-check.com",
                 "normalized_url": "https://brand-login-check.com",
-                "fetch_status": "parked",
-                "final_landing_url": "https://www.afternic.com/forsale/brand-login-check.com",
-                "parking_provider": "GoDaddy/Afternic",
-                "parking_reason": "provider_host_redirect",
+                "fetch_status": "failed",
+                "parking_provider": "HugeDomains",
+                "parking_reason": "provider_branded_parking_template",
             },
             normalized_url="https://brand-login-check.com",
             prefetch_metrics=_prefetch_metrics(best_lexical_score=0.995),
@@ -135,58 +50,43 @@ class ParkedPageDetectorTests(unittest.TestCase):
         )
 
         self.assertIsNone(payload_outcome["queue_payload"])
-        self.assertIsNone(payload_outcome["admitted_prefetch_match"])
-        self.assertEqual(payload_outcome["metric_key"], "fetch_parked")
-        self.assertFalse(payload_outcome["decision_row"]["admitted"])
-        self.assertEqual(payload_outcome["decision_row"]["reason"], "parking_or_placeholder_excluded")
-
-    def test_parked_rows_are_written_to_dedicated_audit(self):
-        input_url = "brand-login-check.com"
-        normalized_url = comparison.normalize_url(input_url)
-        prefetch = _prefetch_metrics()
-        stage1_rows = comparison._build_stage1_debug_rows(
-            input_urls=[input_url],
-            audit_rows=[{"dns_status": "resolved", "decision": "accepted"}],
-            decision_rows=[
-                comparison._build_prefetch_decision_row(
-                    normalized_url=normalized_url,
-                    fetch_status="parked",
-                    prefetch_metrics=prefetch,
-                    scoring_config=comparison._DEFAULT_SCORING_CONFIG,
-                    final_landing_url="https://www.afternic.com/forsale/brand-login-check.com",
-                    parking_provider="GoDaddy/Afternic",
-                    parking_reason="provider_host_redirect",
-                )
-            ],
-            prefetch_metrics_map={normalized_url: prefetch},
-            stage1_analysis_map={
-                normalized_url: comparison._build_lexical_stage1_state(prefetch)
-            },
+        self.assertEqual(payload_outcome["metric_key"], "fetch_failed")
+        self.assertEqual(payload_outcome["decision_row"].get("reason", ""), "")
+        self.assertEqual(
+            payload_outcome["decision_row"].get("parking_reason", ""),
+            "provider_branded_parking_template",
         )
 
-        self.assertEqual(stage1_rows[0]["reason"], "parking_or_placeholder_excluded")
-        self.assertEqual(stage1_rows[0]["parking_provider"], "GoDaddy/Afternic")
+    def test_failed_strict_lexical_payload_is_rescued_into_holdout(self):
+        payload_outcome = comparison._handle_stage1_fetch_payload(
+            payload={
+                "url": "https://brand-login-check.com",
+                "normalized_url": "https://brand-login-check.com",
+                "fetch_status": "failed",
+                "visual_status": "not_attempted",
+                "fetch_error_type": "navigation_error",
+                "fetch_error_detail": "Page.goto: net::ERR_NAME_NOT_RESOLVED at https://brand-login-check.com/",
+            },
+            normalized_url="https://brand-login-check.com",
+            prefetch_metrics=_prefetch_metrics(best_lexical_score=0.995),
+            scoring_config=comparison._DEFAULT_SCORING_CONFIG,
+        )
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            parked_audit_path = Path(tmpdir) / "parked_page_exclusions.csv"
-            comparison._write_stage1_subset_csv(
-                stage1_rows,
-                str(parked_audit_path),
-                lambda row: row.get("reason") == "parking_or_placeholder_excluded",
-            )
-            parked_df = pd.read_csv(parked_audit_path)
-
-        self.assertEqual(len(parked_df), 1)
-        self.assertEqual(parked_df.loc[0, "parking_provider"], "GoDaddy/Afternic")
-        self.assertEqual(parked_df.loc[0, "parking_reason"], "provider_host_redirect")
+        self.assertIsNone(payload_outcome["queue_payload"])
+        self.assertIsNotNone(payload_outcome["admitted_prefetch_match"])
+        self.assertEqual(
+            payload_outcome["admitted_prefetch_match"]["admission_path"],
+            "failed_fetch_strict_lexical_suspected",
+        )
 
 
 class HashOnlyClassificationTests(unittest.TestCase):
-    def test_hybrid_decision_ignores_nan_placeholder_reason(self):
+    def test_hybrid_decision_treats_parking_fields_as_suspicious(self):
         decision = pipeline._hybrid_hash_decision(
             row={
                 "fetch_status": "fetched",
-                "placeholder_or_parking_reason": float("nan"),
+                "placeholder_or_parking_reason": "provider_branded_parking_template",
+                "parking_reason": "provider_branded_parking_template",
                 "strict_lexical_hit": True,
                 "lexical_score_pass": True,
                 "fallback_rank_only": False,
@@ -201,136 +101,12 @@ class HashOnlyClassificationTests(unittest.TestCase):
             dns_records="NA",
         )
 
-        self.assertNotEqual(decision["classification"], "SKIPPED_PARKING_OR_PLACEHOLDER")
-
-    def test_fetch_failed_lexical_only_defaults_to_legitimate(self):
-        classification = pipeline._hybrid_hash_classification(
-            row={
-                "fetch_status": "timeout",
-                "strict_lexical_hit": True,
-                "lexical_score_pass": True,
-                "fallback_rank_only": False,
-                "hash_anchor": False,
-                "clip_anchor": False,
-                "signal_hit_domain": False,
-                "signal_hit_keywords": False,
-                "typo_anchor": False,
-            },
-            registrar="NA",
-            hosting_isp="NA",
-            dns_records="NA",
-        )
-
-        self.assertEqual(classification, "Legitimate")
-
-    def test_fetch_failed_with_suspicious_infra_stays_suspected(self):
-        classification = pipeline._hybrid_hash_classification(
-            row={
-                "fetch_status": "failed",
-                "strict_lexical_hit": True,
-                "lexical_score_pass": True,
-                "fallback_rank_only": False,
-                "hash_anchor": False,
-                "clip_anchor": False,
-                "signal_hit_domain": False,
-                "signal_hit_keywords": False,
-                "typo_anchor": False,
-            },
-            registrar="NameCheap, Inc.",
-            hosting_isp="NA",
-            dns_records="A:1.1.1.1",
-        )
-
-        self.assertEqual(classification, "Legitimate")
+        self.assertEqual(decision["classification"], "Suspected")
+        self.assertEqual(decision["classification_gate_reason"], "parked_sale_lexical_suspected")
 
 
-class ParkedHoldoutReplayTests(unittest.IsolatedAsyncioTestCase):
-    async def test_reused_holdout_parked_row_is_skipped_from_final_output(self):
-        df_filtered = pd.DataFrame(
-            [
-                {
-                    "Cooresponding CSE": "State Bank of India (SBI)",
-                    "Legitimate Domains": "sbi.co.in",
-                    "Identified Phishing/Suspected Domain Name": "https://brand-login-check.com",
-                    "hash_score": 0.0,
-                    "confidence_band": "Low",
-                    "score_margin": 0.0,
-                    "evidence_tier": "weak_evidence",
-                    "lexical_score": 0.98,
-                    "jw_primary": 0.98,
-                    "token_set_primary": 0.94,
-                    "skeleton_similarity": 0.91,
-                    "lexical_rule_hit": True,
-                    "brand_token_hit": True,
-                    "candidate_generation_reason": "brand_token_match|jw_primary",
-                    "dominant_signal_family": "lexical",
-                    "old_fuzzy_hit": False,
-                    "old_fuzzy_cse": "",
-                    "hybrid_lexical_hit": True,
-                    "strict_lexical_hit": True,
-                    "lexical_score_pass": True,
-                    "fallback_rank_only": False,
-                    "admission_reason": "strict_lexical_hit",
-                    "admission_path": "strict_lexical_hit",
-                    "fetch_status": "fetched",
-                    "best_score": 0.0,
-                    "domain_component": 29.4,
-                    "clip_component": 0.0,
-                    "hash_component": 0.0,
-                    "typo_similarity": 0.91,
-                    "typo_min_score_used": 0.45,
-                    "typo_decision_reason": "anchor_typo",
-                    "clip_similarity": 0.0,
-                    "typo_anchor": False,
-                    "hash_anchor": False,
-                    "clip_anchor": False,
-                    "signal_hit_screenshot": False,
-                    "signal_hit_typo": False,
-                    "signal_hit_domain": False,
-                    "signal_hit_favicon": False,
-                    "signal_hit_ssl_hash": False,
-                    "signal_hit_html_hash": False,
-                    "signal_hit_domain_hash": False,
-                    "signal_hit_keywords": False,
-                    "screenshot_path": "",
-                    "html_title_text": "Buy this domain | HugeDomains",
-                    "visible_text_excerpt": "This domain is for sale. Buy this domain from HugeDomains today.",
-                }
-            ]
-        )
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmpdir_path = Path(tmpdir)
-            final_output = tmpdir_path / "output_file.csv"
-            review_queue = tmpdir_path / "hash_review_queue.csv"
-            stage2_debug = tmpdir_path / "stage2_model_debug.csv"
-            stage3_debug = tmpdir_path / "stage3_classification_debug.csv"
-            checkpoint = tmpdir_path / "checkpoint_records.csv"
-
-            with (
-                mock.patch.object(pipeline, "FINAL_OUTPUT", str(final_output)),
-                mock.patch.object(pipeline, "HASH_REVIEW_QUEUE_PATH", str(review_queue)),
-                mock.patch.object(pipeline, "STAGE2_MODEL_DEBUG_PATH", str(stage2_debug)),
-                mock.patch.object(pipeline, "STAGE3_CLASSIFICATION_DEBUG_PATH", str(stage3_debug)),
-                mock.patch.object(pipeline, "CHECKPOINT_CSV", str(checkpoint)),
-                mock.patch.object(pipeline, "load_models_and_preproc", side_effect=RuntimeError("models not needed")),
-            ):
-                result = await pipeline._run_hash_only_pipeline(
-                    df_filtered=df_filtered,
-                    whois_rate_limiter=_DummyRateLimiter(),
-                    high_confidence_threshold=78.0,
-                    medium_confidence_threshold=68.0,
-                )
-
-            self.assertEqual(len(result), 0)
-            final_df = pd.read_csv(final_output)
-            self.assertEqual(len(final_df), 0)
-            stage3_df = pd.read_csv(stage3_debug)
-            self.assertEqual(len(stage3_df), 1)
-            self.assertEqual(stage3_df.loc[0, "classification"], "SKIPPED_PARKING_OR_PLACEHOLDER")
-            self.assertEqual(stage3_df.loc[0, "parking_provider"], "HugeDomains")
-
-    async def test_replayed_blank_parking_fields_do_not_skip_classification(self):
+class HoldoutReplayTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reused_holdout_with_parking_fields_is_suspected(self):
         base_row = {
             "Cooresponding CSE": "State Bank of India (SBI)",
             "Legitimate Domains": "sbi.co.in",
@@ -360,8 +136,8 @@ class ParkedHoldoutReplayTests(unittest.IsolatedAsyncioTestCase):
             "fetch_error_type": "",
             "fetch_error_detail": "",
             "final_landing_url": "https://brand-login-check.com/login",
-            "parking_provider": "",
-            "parking_reason": "",
+            "parking_provider": "HugeDomains",
+            "parking_reason": "provider_branded_parking_template",
             "best_score": 66.0,
             "domain_component": 29.4,
             "clip_component": 0.0,
@@ -375,15 +151,15 @@ class ParkedHoldoutReplayTests(unittest.IsolatedAsyncioTestCase):
             "clip_anchor": False,
             "signal_hit_screenshot": False,
             "signal_hit_typo": True,
-            "signal_hit_domain": True,
+            "signal_hit_domain": False,
             "signal_hit_favicon": False,
             "signal_hit_ssl_hash": False,
             "signal_hit_html_hash": False,
             "signal_hit_domain_hash": False,
             "signal_hit_keywords": False,
             "screenshot_path": "",
-            "html_title_text": "Customer Login",
-            "visible_text_excerpt": "Secure account sign-in page for customers.",
+            "html_title_text": "Buy this domain | HugeDomains",
+            "visible_text_excerpt": "This domain is for sale. Buy this domain from HugeDomains today.",
         }
 
         class _FakeResponse:
@@ -448,18 +224,119 @@ class ParkedHoldoutReplayTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(final_df), 1)
             self.assertEqual(
                 final_df.loc[0, "Phishing/Suspected Domains (i.e. Class Label)"],
-                "Legitimate",
+                "Suspected",
             )
+            filtered_df = pd.read_csv(filtered_output)
+            self.assertEqual(len(filtered_df), 1)
+            review_df = pd.read_csv(review_queue)
+            self.assertEqual(len(review_df), 0)
+            stage3_df = pd.read_csv(stage3_debug)
+            self.assertEqual(len(stage3_df), 1)
+            self.assertEqual(stage3_df.loc[0, "classification"], "Suspected")
+            self.assertEqual(
+                stage3_df.loc[0, "classification_gate_reason"],
+                "parked_sale_lexical_suspected",
+            )
+
+    async def test_zero_corroboration_legitimate_row_goes_to_review_queue_only(self):
+        df_filtered = pd.DataFrame(
+            [
+                {
+                    "Cooresponding CSE": "State Bank of India (SBI)",
+                    "Legitimate Domains": "sbi.co.in",
+                    "Identified Phishing/Suspected Domain Name": "https://brand-login-check.com",
+                    "hash_score": 66.0,
+                    "confidence_band": "Low",
+                    "evidence_tier": "weak_evidence",
+                    "lexical_score": 0.98,
+                    "strict_lexical_hit": True,
+                    "lexical_score_pass": True,
+                    "fallback_rank_only": False,
+                    "fetch_status": "fetched",
+                    "visual_status": "available",
+                    "final_landing_url": "https://brand-login-check.com/login",
+                    "hash_anchor": False,
+                    "clip_anchor": False,
+                    "clip_corroborated": False,
+                    "direct_brand_evidence_count": 0,
+                    "signal_hit_domain": False,
+                    "signal_hit_keywords": False,
+                    "screenshot_path": "",
+                    "html_title_text": "Customer Login",
+                    "visible_text_excerpt": "Secure account sign-in page for customers.",
+                }
+            ]
+        )
+
+        class _FakeResponse:
+            status_code = 500
+
+            def json(self):
+                return {}
+
+        class _FakeAsyncClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, *args, **kwargs):
+                return _FakeResponse()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            final_output = tmpdir_path / "output_file.csv"
+            review_queue = tmpdir_path / "hash_review_queue.csv"
+            stage2_debug = tmpdir_path / "stage2_model_debug.csv"
+            stage3_debug = tmpdir_path / "stage3_classification_debug.csv"
+            checkpoint = tmpdir_path / "checkpoint_records.csv"
+
+            with (
+                mock.patch.object(pipeline, "FINAL_OUTPUT", str(final_output)),
+                mock.patch.object(pipeline, "HASH_REVIEW_QUEUE_PATH", str(review_queue)),
+                mock.patch.object(pipeline, "STAGE2_MODEL_DEBUG_PATH", str(stage2_debug)),
+                mock.patch.object(pipeline, "STAGE3_CLASSIFICATION_DEBUG_PATH", str(stage3_debug)),
+                mock.patch.object(pipeline, "CHECKPOINT_CSV", str(checkpoint)),
+                mock.patch.object(pipeline, "load_models_and_preproc", side_effect=RuntimeError("models not needed")),
+                mock.patch.object(pipeline, "extract_network_features_async", new=mock.AsyncMock(return_value={})),
+                mock.patch.object(
+                    pipeline,
+                    "enrich_with_geoip",
+                    side_effect=lambda df, *_args, **_kwargs: df.assign(asn_org="NA", country="NA", ip_address="NA"),
+                ),
+                mock.patch.object(pipeline.httpx, "AsyncClient", _FakeAsyncClient),
+                mock.patch.object(pipeline.socket, "gethostbyname", side_effect=OSError("offline")),
+                mock.patch.object(pipeline.whois, "whois", side_effect=RuntimeError("offline")),
+                mock.patch.object(pipeline.dns.resolver, "resolve", side_effect=RuntimeError("offline")),
+            ):
+                result = await pipeline._run_hash_only_pipeline(
+                    df_filtered=df_filtered,
+                    whois_rate_limiter=_DummyRateLimiter(),
+                    high_confidence_threshold=78.0,
+                    medium_confidence_threshold=68.0,
+                )
+
+            filtered_output = Path(str(final_output).replace(".csv", "_filtered.csv"))
+            self.assertEqual(len(result), 0)
+            final_df = pd.read_csv(final_output)
+            self.assertEqual(len(final_df), 0)
             filtered_df = pd.read_csv(filtered_output)
             self.assertEqual(len(filtered_df), 0)
             review_df = pd.read_csv(review_queue)
             self.assertEqual(len(review_df), 1)
+            self.assertEqual(review_df.loc[0, "final_classification"], "Legitimate")
             stage3_df = pd.read_csv(stage3_debug)
-            self.assertEqual(len(stage3_df), 1)
             self.assertEqual(stage3_df.loc[0, "classification"], "Legitimate")
-            self.assertNotEqual(stage3_df.loc[0, "model_feature_status"], "skipped_parked_page")
+            self.assertEqual(
+                stage3_df.loc[0, "classification_gate_reason"],
+                "lexical_without_any_corroboration_legitimate_review",
+            )
 
-    async def test_not_registered_domain_is_skipped_before_final_output(self):
+    async def test_not_registered_domain_routes_to_suspected(self):
         df_filtered = pd.DataFrame(
             [
                 {
@@ -530,12 +407,21 @@ class ParkedHoldoutReplayTests(unittest.IsolatedAsyncioTestCase):
                     medium_confidence_threshold=68.0,
                 )
 
-            self.assertEqual(len(result), 0)
+            self.assertEqual(len(result), 1)
             final_df = pd.read_csv(final_output)
-            self.assertEqual(len(final_df), 0)
+            self.assertEqual(len(final_df), 1)
+            self.assertEqual(
+                final_df.loc[0, "Phishing/Suspected Domains (i.e. Class Label)"],
+                "Suspected",
+            )
+            review_df = pd.read_csv(review_queue)
+            self.assertEqual(len(review_df), 0)
             stage3_df = pd.read_csv(stage3_debug)
-            self.assertEqual(stage3_df.loc[0, "classification"], "SKIPPED_PARKING_OR_PLACEHOLDER")
-            self.assertEqual(stage3_df.loc[0, "review_only_reason"], "not_registered_domain")
+            self.assertEqual(stage3_df.loc[0, "classification"], "Suspected")
+            self.assertEqual(
+                stage3_df.loc[0, "classification_gate_reason"],
+                "not_registered_domain_suspected",
+            )
 
 
 if __name__ == "__main__":

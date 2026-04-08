@@ -155,17 +155,17 @@ def tune_xgb(X, y, task_name):
     )
 
     search.fit(X, y)
-    print(f"🏆 {task_name} Best Params: {search.best_params_}")
-    print(f"✅ {task_name} CV F1 Macro: {search.best_score_:.4f}")
+    print(f" {task_name} Best Params: {search.best_params_}")
+    print(f" {task_name} CV F1 Macro: {search.best_score_:.4f}")
     return search.best_estimator_
 
 # ==========================
 # 8. Train Both Models
 # ==========================
-print("\n🔹 Training Label (Brand) Model...")
+print("\n Training Label (Brand) Model...")
 best_model_label = tune_xgb(X_all, y_label, "Label (Brand)")
 
-print("\n🔹 Training Source (Domain) Model...")
+print("\n Training Source (Domain) Model...")
 best_model_source = tune_xgb(X_source, y_source, "Source (Domain)")
 
 # ==========================

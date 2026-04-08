@@ -185,14 +185,14 @@
   <rect class="review" x="394" y="840" width="278" height="132"/>
   <text class="label" x="416" y="876">Review Queue</text>
   <text class="body" x="416" y="904">`fetch_failed_lexical_hits.csv`</text>
-  <text class="body" x="416" y="926">`parked_page_exclusions.csv`</text>
+  <text class="body" x="416" y="926">Low-confidence review rows</text>
   <text class="body" x="416" y="948">Review-only, never auto-promoted downstream.</text>
 
   <rect class="debug" x="710" y="840" width="280" height="132"/>
-  <text class="label" x="732" y="876">DNS Audit</text>
-  <text class="body" x="732" y="904">`dns_gate_audit.csv`</text>
-  <text class="body" x="732" y="926">`dns_rejected_lexical_hits.csv`</text>
-  <text class="body" x="732" y="948">DNS now runs after lexical prefiltering.</text>
+  <text class="label" x="732" y="876">Stage 1 Debug</text>
+  <text class="body" x="732" y="904">`stage1_lexical_debug.csv`</text>
+  <text class="body" x="732" y="926">`fetch_failed_lexical_hits.csv`</text>
+  <text class="body" x="732" y="948">Routing and fetch failures after lexical prefiltering.</text>
 
   <rect class="output" x="1028" y="840" width="290" height="132"/>
   <text class="label" x="1050" y="876">Stage 1 Output</text>

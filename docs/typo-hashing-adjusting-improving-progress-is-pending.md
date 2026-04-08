@@ -4,14 +4,14 @@
 - Current run is empty because Stage 1 produced zero shortlisted rows, so downstream files stayed header-only.
 - Measured from your artifacts:
 1. `223` input URLs started (`output/hashing_shortlist.log`).
-2. DNS gate accepted `171`, rejected `52` (`output/dns_gate_audit.csv`).
-3. Of accepted URLs, `44` timed out in fetch and `127` were scored, but `0` crossed shortlist threshold `65` (`output/hashing_shortlist.log`).
-4. Exclusion audit confirms all non-DNS accepted rows were grouped as `below_threshold_or_fetch_failed` (`output/hashing_shortlist_excluded_urls.csv`).
-- For your injected typo set specifically, only `4/25` resolved; `21/25` were DNS-rejected. This matches your decision to keep DNS gate unchanged and drop DNS failures.
+2. Stage 0 lexical admission kept the candidate typo-like URLs for Stage 1 fetch and scoring.
+3. Of routed URLs, `44` timed out in fetch and `127` were scored, but `0` crossed shortlist threshold `65` (`output/hashing_shortlist.log`).
+4. Exclusion audit confirms all routed rows were grouped as `below_threshold_or_fetch_failed` (`output/hashing_shortlist_excluded_urls.csv`).
+- For your injected typo set specifically, weak fetch or weak corroboration was the loss point; the shortlist no longer drops lexical hits behind a DNS prefilter.
 
 ### Key Changes To Implement
 - **Stage 1 shortlist logic (`phishing_pipeline/comparison.py`)**
-1. Keep DNS gate behavior unchanged.
+1. Route lexical candidates directly into fetch and shortlist scoring.
 2. Split exclusion reason into two explicit reasons:
    - `fetch_timeout_or_fetch_failed`
    - `below_score_threshold`
@@ -35,34 +35,31 @@
 - Add optional debug CLI switches in `main_controller.py`:
 1. `--lexical-pass-min-score` (default `0.85`)
 2. `--shortlist-debug-csv` (path for per-stage diagnostics)
-3. `--stage-smoke-test` (`dns|fetch|lexical|score|classify|all`)
+3. `--stage-smoke-test` (`fetch|lexical|score|classify|all`)
 - Add new debug columns to holdout and excluded CSVs (no change to submission `.xlsx` column contract).
 
 ### Individual Stage Test Plan (Bug Isolation)
 1. **Input + normalization stage**
    - Verify row count and normalized host extraction from `data/holdout_sets/urls.xlsx`.
    - Acceptance: all rows map to deterministic normalized URLs and hostnames.
-2. **DNS gate stage**
-   - Run DNS gate only, write audit, and compute status distribution.
-   - Acceptance: exact accepted/rejected counts reproducible; rejected rows clearly explain `dns_error/no_records/resolver_error/timeout`.
-3. **Fetch stage**
-   - Run fetch/screenshot only for DNS-accepted URLs with timeout metrics.
+2. **Fetch stage**
+   - Run fetch/screenshot for routed lexical candidates with timeout metrics.
    - Acceptance: timeout rate reported separately; no silent drops.
-4. **Lexical stage**
+3. **Lexical stage**
    - Run lexical matcher only on fetched URLs and compare against known typo samples.
    - Acceptance: known typos (for resolvable domains) show high lexical scores and `lexical_rule_hit=True`.
-5. **Scoring gate stage**
+4. **Scoring gate stage**
    - Run scorer without final threshold filtering and log component contributions.
    - Acceptance: each URL has explainable component-level score breakdown.
-6. **Classification stage**
+5. **Classification stage**
    - Run WHOIS/RDAP + final class rules on holdout.
    - Acceptance: phishing remains strict; typo-like rows with weaker corroboration become suspected, not dropped.
-7. **Packaging stage**
+6. **Packaging stage**
    - Regenerate submission artifacts after clearing stale folder.
    - Acceptance: output reflects only current run rows and current evidence files.
 
 ### Assumptions / Defaults Locked
-- DNS gateway remains unchanged.
-- DNS-failed URLs are dropped from final output.
+- Lexical candidates are no longer dropped by a Stage 1 hostname prefilter.
+- DNS evidence remains enrichment-only rather than a prefilter.
 - WHOIS/RDAP is used as post-shortlist corroboration.
 - Phishing remains high-precision; recall improvements target suspected capture, not phishing inflation.
