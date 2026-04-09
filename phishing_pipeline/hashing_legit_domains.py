@@ -5,13 +5,8 @@ import ssl
 import os
 import time
 import multiprocessing as mp
-import numpy as np
 import psutil
-import torch
-from io import BytesIO
 from playwright.async_api import async_playwright
-from PIL import Image
-from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 from .similarity_hashing import (
     compute_domain_simhash,
@@ -23,12 +18,7 @@ try:
     import aiohttp
     _has_aiohttp = True
 except ImportError:
-    import requests as _requests_fallback
     _has_aiohttp = False
-
-# Use the shared, optimized CLIP from comparison.py (lazy-loaded, FP16, batched)
-from .comparison import get_clip_embeddings_batch
-
 
 def _read_env_int(name: str, default: int, minimum: int = 1) -> int:
     raw = os.getenv(name)
@@ -40,15 +30,9 @@ def _read_env_int(name: str, default: int, minimum: int = 1) -> int:
         return default
 
 
-def _runtime_parallelism() -> tuple[int, int]:
+def _runtime_parallelism() -> int:
     cpu_count = mp.cpu_count() or 4
     ram_gb = psutil.virtual_memory().total / (1024 ** 3)
-    vram_gb = 0.0
-    if torch.cuda.is_available():
-        try:
-            vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-        except Exception:
-            vram_gb = 0.0
 
     if cpu_count >= 32 and ram_gb >= 96:
         max_pages = min(64, max(32, cpu_count))
@@ -57,22 +41,10 @@ def _runtime_parallelism() -> tuple[int, int]:
     else:
         max_pages = 16
 
-    if vram_gb >= 80:
-        clip_batch = 512
-    elif vram_gb >= 40:
-        clip_batch = 256
-    elif vram_gb >= 16:
-        clip_batch = 128
-    else:
-        clip_batch = 64
-
-    return (
-        _read_env_int("PHISHING_LEGIT_HASH_PAGES", max_pages),
-        _read_env_int("PHISHING_LEGIT_CLIP_BATCH", clip_batch),
-    )
+    return _read_env_int("PHISHING_LEGIT_HASH_PAGES", max_pages)
 
 
-MAX_CONCURRENT_PAGES, CLIP_BATCH_SIZE = _runtime_parallelism()
+MAX_CONCURRENT_PAGES = _runtime_parallelism()
 
 # â”€â”€ Async favicon fetching â”€â”€
 async def favicon_hash_async(domain, session=None):
@@ -184,8 +156,7 @@ df = df.dropna(subset=["domain"])
 entity_db = {}
 
 
-async def _scan_domain(domain, entity, context, semaphore, aio_session, lock,
-                        pending_clips):
+async def _scan_domain(domain, entity, context, semaphore, aio_session, lock):
     """
     Scan a single domain concurrently.
     Semaphore limits parallel Playwright pages.
@@ -213,11 +184,8 @@ async def _scan_domain(domain, entity, context, semaphore, aio_session, lock,
             fav_result, ssl_result = await asyncio.gather(fav_task, ssl_task)
 
             ###################################
-            # STORE DATA (non-CLIP) â€” protected by lock
+            # STORE DATA â€” protected by lock
             ###################################
-
-            img = Image.open(BytesIO(screenshot)).convert("RGB")
-            img = img.resize((224, 224))  # pre-resize for speed
 
             async with lock:
                 entity_db[entity]["domains"].append(domain)
@@ -225,7 +193,6 @@ async def _scan_domain(domain, entity, context, semaphore, aio_session, lock,
                 entity_db[entity]["page_phashes"].append(compute_image_phash(screenshot))
                 entity_db[entity]["favicon_phashes"].append(fav_result)
                 entity_db[entity]["ssl_simhashes"].append(ssl_result)
-                pending_clips[entity].append(img)
 
         except Exception as e:
             print(f"  âš  Error: {domain} â€” {e}")
@@ -242,9 +209,6 @@ async def generate_hashes():
     # aiohttp session for non-blocking favicon fetches
     connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT_PAGES * 2) if _has_aiohttp else None
     aio_session = aiohttp.ClientSession(connector=connector) if _has_aiohttp else None
-
-    # pending_clips[entity] = list of PIL images (collected during browsing)
-    pending_clips = {}
 
     async with async_playwright() as p:
 
@@ -267,18 +231,14 @@ async def generate_hashes():
                 "domains": [],
                 "domain_simhashes": [],
                 "page_phashes": [],
-                "screenshot_clip": [],   # will be filled in Phase 2
                 "favicon_phashes": [],
                 "ssl_simhashes": [],
                 "keywords": []
             }
 
-            pending_clips[entity] = []
-
             for domain in group["domain"]:
                 all_tasks.append(
-                    _scan_domain(domain, entity, context, semaphore, aio_session,
-                                 lock, pending_clips)
+                    _scan_domain(domain, entity, context, semaphore, aio_session, lock)
                 )
 
         total = len(all_tasks)
@@ -293,27 +253,6 @@ async def generate_hashes():
 
     browse_elapsed = time.perf_counter() - t0
     print(f"â± Phase 1 (browsing) done in {browse_elapsed:.1f}s")
-
-    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    # PHASE 2: Batch CLIP embedding (GPU-bound)
-    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    # Collect ALL images across all entities into one flat list for maximum batching
-    all_images = []
-    image_map = []  # (entity, index_within_entity)
-
-    for entity, images in pending_clips.items():
-        for i, img in enumerate(images):
-            all_images.append(img)
-            image_map.append((entity, i))
-
-    if all_images:
-        print(f"ðŸ§  Batch-embedding {len(all_images)} screenshots through CLIP (batch_size={CLIP_BATCH_SIZE})...")
-        embeddings = get_clip_embeddings_batch(all_images, batch_size=CLIP_BATCH_SIZE)
-
-        for (entity, _), emb in zip(image_map, embeddings):
-            entity_db[entity]["screenshot_clip"].append(emb.tolist())
-
-        print("âœ… Batch CLIP embedding complete.")
 
     total_elapsed = time.perf_counter() - t0
     print(f"â± Total generation time: {total_elapsed:.1f}s")
@@ -341,5 +280,5 @@ with open(os.path.join(os.path.dirname(BASE_DIR), "data", "entity_hash_db.json")
     json.dump(output_payload, f, indent=4)
 
 
-print("âœ… DB GENERATED WITH SIMILARITY HASHES (schema v2) + CLIP")
+print("âœ… DB GENERATED WITH SIMILARITY HASHES (schema v2)")
 

@@ -16,7 +16,7 @@ The pipeline runs in three main layers:
    - packages the submission
 2. `phishing_pipeline/comparison.py`
    - performs Stage 1 hashing-based shortlisting
-   - runs prefetch lexical checks, browser fetch, hash collection, and CLIP scoring
+   - runs prefetch lexical checks, browser fetch, hash collection, and Stage 1 evidence scoring
    - writes `output/holdout.csv`
 3. `phishing_pipeline/pipeline.py`
    - performs Stage 2 enrichment and final labeling
@@ -32,10 +32,9 @@ flowchart TD
     C --> D[Stage 1: comparison.py]
     D --> D1[Prefetch lexical analysis]
     D1 --> D2[Playwright fetch and screenshot]
-    D2 --> D3[Evidence extraction: HTML, favicon, SSL, domain hash, keywords]
-    D3 --> D4[CLIP screenshot similarity]
-    D4 --> D5[Union admission decision]
-    D5 --> E[output/holdout.csv]
+    D2 --> D3[Evidence extraction and hash scoring]
+    D3 --> D4[Union admission decision]
+    D4 --> E[output/holdout.csv]
     E --> F[Stage 2: pipeline.py]
     F --> F1[OCR and TVC]
     F1 --> F2[WHOIS or RDAP or DNS or GeoIP]
@@ -101,7 +100,7 @@ This happens in:
 Purpose:
 
 - catch typo-like URLs early
-- avoid depending only on screenshot similarity
+- avoid depending only on fetched page evidence
 - preserve strong lexical hits even when fetch quality is weak
 
 #### 3.2 Playwright fetch and evidence extraction
@@ -128,21 +127,21 @@ await gpu_queue.put(payload)
 
 This stage is usually the most expensive part of the run because it is browser-bound.
 
-#### 3.3 CLIP screenshot validation
+#### 3.3 Stage 1 evidence scoring
 
-Screenshots are scored on the GPU in micro-batches.
+Fetched rows are scored with the Stage 1 evidence set.
 
 This happens in:
 
 - `_gpu_microbatch_scorer(...)`
 
-CLIP is a validation signal, not the only admission signal.
+The active scoring path uses domain, favicon, SSL, HTML, domain-hash, and keyword signals.
 
 It helps answer:
 
-- does the page visually resemble a known legitimate site?
+- does the page structurally or textually align with a known legitimate target?
 
-It does not by itself prove phishing.
+It does not by itself produce a final phishing label.
 
 #### 3.4 Union admission decision
 
@@ -240,15 +239,15 @@ Simplified decision shape:
 if fallback_rank_only and not strict_lexical_hit:
     return "Legitimate"
 
-if not strict_lexical_hit and not lexical_score_pass:
+if not lexical_survivor:
     return "Legitimate"
 
-strong_corroborator = hash_anchor or tvc_brand_spoofed or brand_aligned_clip
+strong_direct_evidence = hash_anchor or tvc_brand_spoof_strong or content_spoof_strong
 
-if fetched and lexical_strong and strong_corroborator and suspicious_or_mismatched:
+if fetched and strict_lexical_hit and strong_direct_evidence:
     return "Phishing"
 
-if strict_lexical_hit and (fetch_failed or partial_support):
+if lexical_survivor and (weak_direct_evidence or parked_sale_signal or network_corroborated):
     return "Suspected"
 
 return "Legitimate"

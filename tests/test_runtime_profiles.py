@@ -48,6 +48,24 @@ class RuntimeProfileTests(unittest.TestCase):
 
         self.assertEqual(settings["resolved_profile"], "cpu-recall")
 
+    def test_auto_profile_server_shape_uses_h100_target_values(self):
+        settings = main_controller._resolve_runtime_profile_settings(
+            "auto",
+            resource_info={
+                "cpu_cores": 48,
+                "ram_gb": 250.0,
+                "vram_gb": 80.0,
+                "platform": "linux",
+            },
+        )
+
+        self.assertEqual(settings["resolved_profile"], "cpu-recall")
+        self.assertEqual(settings["stage1_http"]["stage1_fetch_concurrency_start"], 1024)
+        self.assertEqual(settings["stage1_http"]["stage1_fetch_concurrency_max"], 2048)
+        self.assertEqual(settings["stage1_http"]["stage1_parse_workers"], 32)
+        self.assertEqual(settings["env"]["PHISHING_HASH_PAGE_CONCURRENCY"], 8)
+        self.assertEqual(settings["env"]["PHISHING_HASH_AUX_NET_LIMIT"], 128)
+
     def test_explicit_profile_bypasses_auto_resolution(self):
         settings = main_controller._resolve_runtime_profile_settings(
             "cpu-fast",
@@ -73,9 +91,13 @@ class RuntimeProfileTests(unittest.TestCase):
     def test_cpu_recall_profile_has_expected_concurrency_values(self):
         settings = main_controller._resolve_runtime_profile_settings("cpu-recall")
 
-        self.assertEqual(settings["stage1_http"]["concurrency"], 512)
-        self.assertEqual(settings["stage1_http"]["rdap_concurrency"], 8)
-        self.assertEqual(settings["env"]["PHISHING_HASH_PAGES"], 20)
+        self.assertEqual(settings["stage1_http"]["concurrency"], 1024)
+        self.assertEqual(settings["stage1_http"]["http_concurrency"], 2048)
+        self.assertEqual(settings["stage1_http"]["rdap_concurrency"], 24)
+        self.assertEqual(settings["stage1_http"]["stage1_fetch_queue_max"], 50000)
+        self.assertEqual(settings["stage1_http"]["stage1_target_urls_per_sec"], 1500)
+        self.assertEqual(settings["env"]["PHISHING_HASH_PAGES"], 64)
+        self.assertEqual(settings["env"]["PHISHING_HASH_HTTP_LIMIT"], 256)
 
     def test_apply_runtime_profile_env_sets_overrides(self):
         settings = main_controller._resolve_runtime_profile_settings("cpu-fast")

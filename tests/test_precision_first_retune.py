@@ -12,7 +12,6 @@ class Stage1AdmissionRetuneTests(unittest.TestCase):
             strict_lexical_hit=True,
             lexical_score_pass=True,
             hash_anchor=False,
-            clip_anchor=False,
         )
 
         self.assertFalse(decision["admitted_to_holdout"])
@@ -26,7 +25,6 @@ class Stage1AdmissionRetuneTests(unittest.TestCase):
             strict_lexical_hit=True,
             lexical_score_pass=True,
             hash_anchor=False,
-            clip_anchor=False,
             network_corroborated=True,
         )
 
@@ -41,7 +39,6 @@ class Stage1AdmissionRetuneTests(unittest.TestCase):
             strict_lexical_hit=True,
             lexical_score_pass=True,
             hash_anchor=False,
-            clip_anchor=False,
             parked_sale_signal=True,
         )
 
@@ -56,7 +53,6 @@ class Stage1AdmissionRetuneTests(unittest.TestCase):
             strict_lexical_hit=True,
             lexical_score_pass=True,
             hash_anchor=True,
-            clip_anchor=False,
         )
 
         self.assertTrue(decision["admitted_to_holdout"])
@@ -224,8 +220,6 @@ class Stage3DecisionRetuneTests(unittest.TestCase):
                 "lexical_score_pass": True,
                 "fallback_rank_only": False,
                 "hash_anchor": False,
-                "clip_anchor": False,
-                "clip_corroborated": False,
                 "direct_brand_evidence_count": 1,
                 "signal_hit_keywords": False,
                 "Identified Phishing/Suspected Domain Name": "https://crsor.info",
@@ -248,7 +242,6 @@ class Stage3DecisionRetuneTests(unittest.TestCase):
                 "lexical_score_pass": True,
                 "fallback_rank_only": False,
                 "hash_anchor": False,
-                "clip_anchor": False,
                 "signal_hit_domain": False,
                 "signal_hit_keywords": False,
                 "Identified Phishing/Suspected Domain Name": "https://brand-login-check.com",
@@ -274,7 +267,6 @@ class Stage3DecisionRetuneTests(unittest.TestCase):
                 "lexical_score_pass": True,
                 "fallback_rank_only": False,
                 "hash_anchor": False,
-                "clip_anchor": False,
                 "signal_hit_domain": False,
                 "signal_hit_keywords": False,
                 "Identified Phishing/Suspected Domain Name": "https://brand-login-check.com",
@@ -299,7 +291,6 @@ class Stage3DecisionRetuneTests(unittest.TestCase):
                 "lexical_score_pass": True,
                 "fallback_rank_only": False,
                 "hash_anchor": True,
-                "clip_anchor": False,
                 "signal_hit_domain": False,
                 "signal_hit_keywords": False,
                 "Identified Phishing/Suspected Domain Name": "https://brand-login-check.com",
@@ -320,7 +311,6 @@ class Stage3DecisionRetuneTests(unittest.TestCase):
                 "lexical_score_pass": True,
                 "fallback_rank_only": False,
                 "hash_anchor": False,
-                "clip_anchor": False,
                 "signal_hit_domain": False,
                 "signal_hit_keywords": False,
                 "Identified Phishing/Suspected Domain Name": "https://brand-login-check.com",
@@ -336,28 +326,6 @@ class Stage3DecisionRetuneTests(unittest.TestCase):
         self.assertTrue(decision["emit_output"])
         self.assertNotEqual(decision["classification"], "Phishing")
 
-    def test_clip_only_row_without_brand_corroboration_is_legitimate(self):
-        decision = pipeline._hybrid_hash_decision(
-            row={
-                "fetch_status": "fetched",
-                "strict_lexical_hit": True,
-                "lexical_score_pass": True,
-                "fallback_rank_only": False,
-                "hash_anchor": False,
-                "clip_anchor": True,
-                "clip_corroborated": False,
-                "direct_brand_evidence_count": 0,
-                "signal_hit_keywords": False,
-                "Identified Phishing/Suspected Domain Name": "https://brand-login-check.com",
-            },
-            registrar="NA",
-            hosting_isp="NA",
-            dns_records="NA",
-        )
-
-        self.assertEqual(decision["classification"], "Legitimate")
-        self.assertTrue(decision["emit_output"])
-
     def test_direct_brand_evidence_without_hash_is_suspected(self):
         decision = pipeline._hybrid_hash_decision(
             row={
@@ -366,8 +334,6 @@ class Stage3DecisionRetuneTests(unittest.TestCase):
                 "lexical_score_pass": True,
                 "fallback_rank_only": False,
                 "hash_anchor": False,
-                "clip_anchor": False,
-                "clip_corroborated": False,
                 "direct_brand_evidence_count": 1,
                 "signal_hit_keywords": False,
                 "Identified Phishing/Suspected Domain Name": "https://brand-login-check.com",
@@ -388,8 +354,6 @@ class Stage3DecisionRetuneTests(unittest.TestCase):
                 "lexical_score_pass": True,
                 "fallback_rank_only": False,
                 "hash_anchor": False,
-                "clip_anchor": False,
-                "clip_corroborated": False,
                 "deceptive_host_embedding": True,
                 "direct_brand_evidence_count": 3,
                 "content_spoof_strong": True,
@@ -414,8 +378,6 @@ class Stage3DecisionRetuneTests(unittest.TestCase):
                 "lexical_score_pass": True,
                 "fallback_rank_only": False,
                 "hash_anchor": False,
-                "clip_anchor": False,
-                "clip_corroborated": False,
                 "deceptive_host_embedding": True,
                 "direct_brand_evidence_count": 2,
                 "content_spoof_strong": False,
@@ -440,8 +402,6 @@ class Stage3DecisionRetuneTests(unittest.TestCase):
                 "lexical_score_pass": True,
                 "fallback_rank_only": False,
                 "hash_anchor": False,
-                "clip_anchor": False,
-                "clip_corroborated": False,
                 "deceptive_host_embedding": False,
                 "direct_brand_evidence_count": 4,
                 "content_spoof_strong": False,

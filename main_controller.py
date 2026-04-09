@@ -213,41 +213,42 @@ def _resolve_runtime_profile_settings(
                 "stage1_enrich_tls_concurrency": 16,
                 "stage1_fetch_queue_max": 4000,
                 "stage1_parse_queue_max": 2000,
-                "stage1_score_queue_max": 2000,
+            "stage1_score_queue_max": 2000,
                 "stage1_enrich_queue_max": 2000,
                 "stage1_result_queue_max": 2000,
             },
         },
         "cpu-recall": {
             "env": {
-                "PHISHING_HASH_PAGES": 20,
-                "PHISHING_HASH_PAGE_CONCURRENCY": 4,
-                "PHISHING_HASH_HTTP_LIMIT": 80,
-                "PHISHING_HASH_AUX_NET_LIMIT": 32,
-                "PHISHING_HASH_ACTIVE_PAGES_FLOOR": 8,
+                "PHISHING_HASH_PAGES": 64,
+                "PHISHING_HASH_PAGE_CONCURRENCY": 8,
+                "PHISHING_HASH_HTTP_LIMIT": 256,
+                "PHISHING_HASH_AUX_NET_LIMIT": 128,
+                "PHISHING_HASH_ACTIVE_PAGES_FLOOR": 24,
                 "PHISHING_HASH_PROGRESS_LOG_INTERVAL_SECONDS": 10,
                 "PHISHING_HASH_ADAPTIVE_DOWNSHIFT": "true",
             },
             "stage1_http": {
-                "concurrency": 512,
-                "http_concurrency": 1024,
-                "dns_concurrency": 256,
-                "rdap_concurrency": 8,
-                "tls_concurrency": 32,
-                "stage1_fetch_concurrency_start": 512,
-                "stage1_fetch_concurrency_max": 1024,
-                "stage1_http_connection_limit": 1024,
-                "stage1_http_keepalive_limit": 256,
+                "concurrency": 1024,
+                "http_concurrency": 2048,
+                "dns_concurrency": 1024,
+                "rdap_concurrency": 24,
+                "tls_concurrency": 64,
+                "stage1_target_urls_per_sec": 1500,
+                "stage1_fetch_concurrency_start": 1024,
+                "stage1_fetch_concurrency_max": 2048,
+                "stage1_http_connection_limit": 2048,
+                "stage1_http_keepalive_limit": 1024,
                 "stage1_per_host_limit": 4,
-                "stage1_parse_workers": 12,
-                "stage1_enrich_dns_concurrency": 256,
-                "stage1_enrich_rdap_concurrency": 8,
-                "stage1_enrich_tls_concurrency": 32,
-                "stage1_fetch_queue_max": 20000,
-                "stage1_parse_queue_max": 8000,
-                "stage1_score_queue_max": 8000,
-                "stage1_enrich_queue_max": 4000,
-                "stage1_result_queue_max": 8000,
+                "stage1_parse_workers": 32,
+                "stage1_enrich_dns_concurrency": 1024,
+                "stage1_enrich_rdap_concurrency": 24,
+                "stage1_enrich_tls_concurrency": 64,
+                "stage1_fetch_queue_max": 50000,
+                "stage1_parse_queue_max": 16000,
+                "stage1_score_queue_max": 16000,
+                "stage1_enrich_queue_max": 12000,
+                "stage1_result_queue_max": 24000,
             },
         },
         "cpu-fast": {
@@ -435,8 +436,6 @@ async def main():
                         help="Minimum typosquat similarity to count as typo anchor (default=0.45)")
     parser.add_argument("--lexical-pass-min-score", type=_probability_float, default=0.85,
                         help="Minimum lexical score allowed to pass Stage 1 admission even below hash threshold (default=0.85)")
-    parser.add_argument("--clip-margin-min", type=_non_negative_float, default=0.20,
-                        help="Deprecated compatibility no-op. CLIP routing is disabled.")
     parser.add_argument("--stage1-escalate-total-threshold", type=_non_negative_int, default=None,
                         help="Override Stage1 HTTP escalate_total_threshold (default=config)")
     parser.add_argument("--stage1-brand-min", type=_non_negative_int, default=None,
@@ -457,8 +456,6 @@ async def main():
                         help="Lexical score rescue threshold for REVIEW_ONLY on non-fetched strict-lexical rows")
     parser.add_argument("--weight-domain", type=_non_negative_float, default=30.0,
                         help="Weight for domain similarity score contribution (default=30)")
-    parser.add_argument("--weight-screenshot", type=_non_negative_float, default=20.0,
-                        help="Deprecated compatibility no-op. Screenshot/CLIP routing weight is ignored.")
     parser.add_argument("--weight-favicon", type=_non_negative_float, default=14.0,
                         help="Weight for favicon hash exact-match contribution (default=14)")
     parser.add_argument("--weight-ssl-hash", type=_non_negative_float, default=12.0,
@@ -565,11 +562,6 @@ async def main():
         and args.failed_fetch_suspected_min < args.failed_fetch_review_min
     ):
         raise ValueError("failed-fetch-suspected-min must be >= failed-fetch-review-min")
-    logger.info(
-        "Deprecated CLI compatibility | clip_margin_min=%.3f ignored | weight_screenshot=%.3f ignored",
-        args.clip_margin_min,
-        args.weight_screenshot,
-    )
     logger.info(
         "Runtime profile requested=%s resolved=%s | host={cpu=%s,ram_gb=%.1f,vram_gb=%.1f,platform=%s} | hash_env=%s | stage1_http_overrides=%s",
         runtime_profile_settings["requested_profile"],
@@ -792,7 +784,6 @@ async def main():
                     typo_top_k=args.typo_top_k,
                     typo_min_score=args.typo_min_score,
                     lexical_pass_min_score=args.lexical_pass_min_score,
-                    clip_margin_min=args.clip_margin_min,
                     shortlist_debug_csv=args.shortlist_debug_csv,
                     stage1_escalate_total_threshold=args.stage1_escalate_total_threshold,
                     stage1_brand_min=args.stage1_brand_min,
@@ -824,7 +815,6 @@ async def main():
                 }
                 shortlist_weights = {
                     "domain": args.weight_domain,
-                    "screenshot": args.weight_screenshot,
                     "favicon": args.weight_favicon,
                     "ssl_hash": args.weight_ssl_hash,
                     "html_hash": args.weight_html_hash,
@@ -841,7 +831,6 @@ async def main():
                     typo_top_k=args.typo_top_k,
                     typo_min_score=args.typo_min_score,
                     lexical_pass_min_score=args.lexical_pass_min_score,
-                    clip_margin_min=args.clip_margin_min,
                     weights=shortlist_weights,
                     shortlist_debug_csv=args.shortlist_debug_csv,
                     url_sources=url_sources,
@@ -889,7 +878,6 @@ async def main():
                     typo_top_k=args.typo_top_k,
                     typo_min_score=args.typo_min_score,
                     lexical_pass_min_score=args.lexical_pass_min_score,
-                    clip_margin_min=args.clip_margin_min,
                     shortlist_debug_csv=args.shortlist_debug_csv,
                     stage1_escalate_total_threshold=args.stage1_escalate_total_threshold,
                     stage1_brand_min=args.stage1_brand_min,
@@ -926,7 +914,6 @@ async def main():
                     typo_top_k=args.typo_top_k,
                     typo_min_score=args.typo_min_score,
                     lexical_pass_min_score=args.lexical_pass_min_score,
-                    clip_margin_min=args.clip_margin_min,
                     shortlist_debug_csv=args.shortlist_debug_csv,
                     stage1_escalate_total_threshold=args.stage1_escalate_total_threshold,
                     stage1_brand_min=args.stage1_brand_min,

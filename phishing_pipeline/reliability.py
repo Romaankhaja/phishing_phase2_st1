@@ -791,6 +791,10 @@ class ProgressTracker:
                 self.skipped += 1
             self._last_progress_monotonic = time.monotonic()
 
+    def add_total(self, count: int = 1) -> None:
+        with self._lock:
+            self.total = max(0, self.total + max(0, int(count)))
+
     def seconds_since_progress(self) -> float:
         with self._lock:
             return max(0.0, time.monotonic() - self._last_progress_monotonic)

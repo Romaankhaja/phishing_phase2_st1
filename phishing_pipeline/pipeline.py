@@ -870,8 +870,7 @@ def _normalize_evidence_tier(row: dict) -> str:
 
     lexical_hit = _as_bool(row.get("lexical_rule_hit")) or _as_bool(row.get("typo_anchor"))
     hash_hit = _as_bool(row.get("hash_anchor"))
-    visual_hit = _as_bool(row.get("clip_anchor"))
-    if lexical_hit and (hash_hit or visual_hit):
+    if lexical_hit and hash_hit:
         return "strong_evidence"
     return "weak_evidence"
 
@@ -1244,8 +1243,6 @@ def _hybrid_hash_decision(
         return decision
 
     hash_anchor = _as_bool_flag(row.get("hash_anchor"))
-    clip_anchor = _as_bool_flag(row.get("clip_anchor"))
-    clip_corroborated = bool(_as_bool_flag(row.get("clip_corroborated")) and clip_anchor)
     keyword_hit = _as_bool_flag(row.get("signal_hit_keywords"))
     weak_hash_or_domain_signal = any(
         _as_bool_flag(row.get(field))
@@ -1267,7 +1264,6 @@ def _hybrid_hash_decision(
     strong_direct_evidence = bool(
         hash_anchor
         or tvc_spoof_strong
-        or clip_corroborated
         or content_spoof_strong
     )
     weak_direct_evidence = bool(
@@ -1279,7 +1275,6 @@ def _hybrid_hash_decision(
     )
     non_lexical_corroborators = [
         hash_anchor,
-        clip_corroborated,
         tvc_spoof_strong,
         content_spoof_strong,
         weak_tvc_spoof,
@@ -1395,8 +1390,6 @@ async def _run_hash_only_pipeline(
         if str(row.get("fetch_status", "")).strip().lower() in {"failed", "timeout"} and _as_bool_flag(row.get("strict_lexical_hit"))
         else "low_confidence_hash_bypass"
         if _as_bool_flag(row.get("hash_anchor"))
-        else "low_confidence_clip_anchor"
-        if _as_bool_flag(row.get("clip_anchor"))
         else "low_confidence_strict_lexical"
         if _as_bool_flag(row.get("strict_lexical_hit"))
         else "low_confidence_lexical_score_pass"
@@ -1706,10 +1699,8 @@ async def _run_hash_only_pipeline(
                         "fallback_rank_only": row.get("fallback_rank_only", False),
                         "typo_anchor": row.get("typo_anchor", False),
                         "hash_anchor": row.get("hash_anchor", False),
-                        "clip_anchor": row.get("clip_anchor", False),
                         "generic_token_only_match": row.get("generic_token_only_match", False),
                         "direct_brand_evidence_count": row.get("direct_brand_evidence_count", 0),
-                        "clip_corroborated": row.get("clip_corroborated", False),
                         "stage1_passthrough": row.get("stage1_passthrough", False),
                         "tvc_brand_detected": False,
                         "tvc_detected_brand": "none",
@@ -1926,10 +1917,8 @@ async def _run_hash_only_pipeline(
                         "fallback_rank_only": row.get("fallback_rank_only", False),
                         "typo_anchor": row.get("typo_anchor", False),
                         "hash_anchor": row.get("hash_anchor", False),
-                        "clip_anchor": row.get("clip_anchor", False),
                         "generic_token_only_match": row.get("generic_token_only_match", False),
                         "direct_brand_evidence_count": row.get("direct_brand_evidence_count", 0),
-                        "clip_corroborated": row.get("clip_corroborated", False),
                         "stage1_passthrough": row.get("stage1_passthrough", False),
                         "tvc_brand_detected": False,
                         "tvc_detected_brand": "none",
@@ -2209,10 +2198,8 @@ async def _run_hash_only_pipeline(
                     "fallback_rank_only": row.get("fallback_rank_only", False),
                     "typo_anchor": row.get("typo_anchor", False),
                     "hash_anchor": row.get("hash_anchor", False),
-                    "clip_anchor": row.get("clip_anchor", False),
                     "generic_token_only_match": row.get("generic_token_only_match", False),
                     "direct_brand_evidence_count": row.get("direct_brand_evidence_count", 0),
-                    "clip_corroborated": row.get("clip_corroborated", False),
                     "stage1_passthrough": row.get("stage1_passthrough", False),
                     "tvc_brand_detected": ocr_tvc.get("tvc_brand_detected", False),
                     "tvc_detected_brand": ocr_tvc.get("tvc_detected_brand", "none"),
@@ -2478,7 +2465,6 @@ async def run_pipeline(
     typo_top_k=10,
     typo_min_score=0.75,
     lexical_pass_min_score=0.85,
-    clip_margin_min=0.20,
     shortlist_debug_csv=None,
     stage1_escalate_total_threshold=None,
     stage1_brand_min=None,
@@ -2507,7 +2493,7 @@ async def run_pipeline(
     logger.info(
         "Pipeline mode=%s | high_confidence_threshold=%.2f | medium_confidence_threshold=%.2f | "
         "hashing_threshold=%.2f | domain_similarity_threshold=%.3f | typo_top_k=%d | "
-        "typo_min_score=%.3f | lexical_pass_min_score=%.3f | clip_margin_min=%.3f | "
+        "typo_min_score=%.3f | lexical_pass_min_score=%.3f | "
         "stage1_overrides={escalate_total=%s,brand_min=%s,credential_min=%s,low_band_min=%s,hard_trigger_brand_min=%s} | "
         "review_policies={stage1_suspected_passthrough=%s,fetch_failed_strict_lexical_passthrough=%s} | "
         "failed_fetch_rescue={suspected_min=%s,review_min=%s}",
@@ -2519,7 +2505,6 @@ async def run_pipeline(
         int(typo_top_k),
         typo_min_score,
         lexical_pass_min_score,
-        clip_margin_min,
         stage1_escalate_total_threshold if stage1_escalate_total_threshold is not None else "default",
         stage1_brand_min if stage1_brand_min is not None else "default",
         stage1_credential_min if stage1_credential_min is not None else "default",
@@ -2567,7 +2552,6 @@ async def run_pipeline(
                 typo_top_k=typo_top_k,
                 typo_min_score=typo_min_score,
                 lexical_pass_min_score=lexical_pass_min_score,
-                clip_margin_min=clip_margin_min,
                 shortlist_debug_csv=shortlist_debug_csv,
                 url_sources=url_sources,
                 keep_stage1_suspected=keep_stage1_suspected,

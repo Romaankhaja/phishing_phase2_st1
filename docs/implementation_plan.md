@@ -23,7 +23,7 @@ But our latest local `comparison.py` says:
 
 ---
 
-### Bug 2: CLIP `'BaseModelOutputWithPooling' has no attribute 'norm'`
+### Bug 2: Legacy Screenshot Model `'BaseModelOutputWithPooling' has no attribute 'norm'`
 
 **Evidence:** Appears **repeatedly** throughout the log (lines 899, 900, 3920, 3921, 4029, 4783, 5964, 9725-9727, 9832).
 
@@ -81,7 +81,7 @@ GCS may have been killed... The program will terminate.
 ### [MODIFY] [comparison.py](file:///c:/Users/SATWIK/Documents/Phishing/phishing_pipeline/comparison.py)
 
 1. **Fix `fetch_features` page leak** — wrap `page.close()` in `finally` so it always runs
-2. **Confirm CLIP bypass** — already fixed locally with `vision_model` + `visual_projection`
+2. **Confirm legacy screenshot-model bypass** — already fixed locally with `vision_model` + `visual_projection`
 3. **Confirm concurrency** — already fixed locally (24 actors, Semaphore(6), 4 GPU actors)
 4. **Add graceful aiohttp session closure** in `ScraperActor` destructor
 

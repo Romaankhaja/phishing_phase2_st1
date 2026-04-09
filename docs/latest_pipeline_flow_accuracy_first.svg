@@ -161,7 +161,7 @@
   <text class="body" x="1014" y="718">`fetched`</text>
   <text class="body" x="1096" y="718">HTML + screenshot available</text>
   <text class="body" x="1014" y="740">`fetched_visual_missing`</text>
-  <text class="body" x="1198" y="740">HTML kept, CLIP skipped</text>
+  <text class="body" x="1198" y="740">HTML kept, reduced evidence set</text>
   <text class="body" x="1014" y="762">`failed` / `timeout`</text>
   <text class="body" x="1148" y="762">review-only, no final output</text>
   <text class="body" x="1014" y="784">`parked`</text>
@@ -170,9 +170,9 @@
   <rect class="box" x="1368" y="620" width="510" height="188"/>
   <rect class="chipDark" x="1388" y="638" width="124" height="24"/>
   <text class="chipText" x="1406" y="654">Scoring</text>
-  <text class="label" x="1388" y="690">CPU Hash + Optional CLIP</text>
+  <text class="label" x="1388" y="690">CPU Hash Scoring</text>
   <text class="body" x="1388" y="718">CPU evidence: domain, favicon, SSL, HTML hash, domain hash, keywords</text>
-  <text class="body" x="1388" y="740">CLIP screenshot similarity runs only if screenshot bytes exist</text>
+  <text class="body" x="1388" y="740">Scores domain, favicon, SSL, HTML, domain hash, keywords</text>
   <text class="body" x="1388" y="762">Admit shortlist rows from fetched states only</text>
   <text class="small" x="1388" y="790">Stage 1 result is `holdout.csv` plus review and debug artifacts.</text>
 

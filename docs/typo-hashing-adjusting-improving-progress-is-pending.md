@@ -19,7 +19,7 @@
    - keep current rule: `best_score > hashing_threshold`
    - add lexical pass rule: `lexical_rule_hit=True` and `lexical_score >= 0.85` (even if hash score below threshold)
 4. Add per-row scoring debug fields in holdout/excluded outputs:
-   - `best_score`, `lexical_score`, `clip_similarity`, `domain_component`, `hash_component`, `whois_ready_flag`
+   - `best_score`, `lexical_score`, `domain_component`, `hash_component`, `whois_ready_flag`
 - **Stage 2 classification (`phishing_pipeline/pipeline.py`)**
 1. Process all holdout candidates (including lexical-pass rows).
 2. Use WHOIS/RDAP as corroboration exactly as you requested:

@@ -64,7 +64,6 @@ class SimilarityHashScoringTests(unittest.TestCase):
         legacy_db = {
             "Example Entity": {
                 "domains": ["example.com"],
-                "screenshot_clip": [],
                 "favicon_hashes": ["abc123"],
                 "ssl_hashes": ["def456"],
                 "html_hashes": ["789abc"],
@@ -74,7 +73,7 @@ class SimilarityHashScoringTests(unittest.TestCase):
         }
 
         with mock.patch.object(comparison, "_entity_db_meta", {}):
-            with self.assertLogs(comparison._clip_logger.name, level="WARNING") as logs:
+            with self.assertLogs(comparison._hash_logger.name, level="WARNING") as logs:
                 entity_index = comparison._build_entity_index(legacy_db)
 
         self.assertFalse(entity_index["use_similarity_hashing"])
@@ -84,7 +83,6 @@ class SimilarityHashScoringTests(unittest.TestCase):
         similarity_db = {
             "Example Entity": {
                 "domains": ["example.com"],
-                "screenshot_clip": [],
                 "favicon_phashes": ["aaaaaaaaaaaaaaaa"],
                 "ssl_simhashes": ["bbbbbbbbbbbbbbbb"],
                 "page_phashes": ["cccccccccccccccc"],
@@ -174,8 +172,6 @@ class SimilarityHashScoringTests(unittest.TestCase):
                 payload=payload,
                 scores=scores,
                 denominators=denominators,
-                screenshot_hit=np.array([False]),
-                screenshot_similarity=np.array([0.0]),
                 metrics=metrics,
                 results=results,
                 review_results=review_results,
@@ -247,8 +243,6 @@ class SimilarityHashScoringTests(unittest.TestCase):
                 payload=payload,
                 scores=scores,
                 denominators=denominators,
-                screenshot_hit=np.array([False]),
-                screenshot_similarity=np.array([0.0]),
                 metrics={"final_matches_above_threshold": 0},
                 results=results,
                 review_results=[],

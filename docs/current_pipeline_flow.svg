@@ -59,7 +59,7 @@
   <rect class="box" x="1362" y="200" width="338" height="130"/>
   <text class="label" x="1387" y="238">Evidence Scoring + Union Admission</text>
   <text class="body" x="1387" y="268">CPU lexical/hash/keyword scoring</text>
-  <text class="body" x="1387" y="292">CLIP screenshot validation + hash bypass</text>
+  <text class="body" x="1387" y="292">Hash and keyword validation + hash bypass</text>
   <text class="body" x="1387" y="314">Admit strict lexical or hash-backed rows.</text>
 
   <rect class="debug" x="382" y="348" width="250" height="42"/>
