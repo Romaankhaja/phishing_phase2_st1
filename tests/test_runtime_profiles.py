@@ -20,6 +20,7 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(settings["requested_profile"], "auto")
         self.assertEqual(settings["resolved_profile"], "cpu-safe")
         self.assertEqual(settings["name"], "cpu-safe")
+        self.assertEqual(settings["env"]["PHISHING_SHORTLIST_EXECUTION_MODE"], "legacy-batch")
 
     def test_default_alias_resolves_like_auto(self):
         settings = main_controller._resolve_runtime_profile_settings(
@@ -47,6 +48,7 @@ class RuntimeProfileTests(unittest.TestCase):
         )
 
         self.assertEqual(settings["resolved_profile"], "cpu-recall")
+        self.assertEqual(settings["env"]["PHISHING_SHORTLIST_EXECUTION_MODE"], "streaming-concurrent")
 
     def test_auto_profile_server_shape_uses_h100_target_values(self):
         settings = main_controller._resolve_runtime_profile_settings(
@@ -60,11 +62,15 @@ class RuntimeProfileTests(unittest.TestCase):
         )
 
         self.assertEqual(settings["resolved_profile"], "cpu-recall")
-        self.assertEqual(settings["stage1_http"]["stage1_fetch_concurrency_start"], 1024)
-        self.assertEqual(settings["stage1_http"]["stage1_fetch_concurrency_max"], 2048)
-        self.assertEqual(settings["stage1_http"]["stage1_parse_workers"], 32)
+        self.assertEqual(settings["stage1_http"]["stage1_fetch_concurrency_start"], 192)
+        self.assertEqual(settings["stage1_http"]["stage1_fetch_concurrency_max"], 512)
+        self.assertEqual(settings["stage1_http"]["stage1_fetch_concurrency_floor"], 64)
+        self.assertEqual(settings["stage1_http"]["stage1_cpu_workers"], 24)
+        self.assertEqual(settings["stage1_http"]["stage1_parse_workers"], 24)
+        self.assertEqual(settings["env"]["PHISHING_LEXICAL_WORKERS"], 16)
         self.assertEqual(settings["env"]["PHISHING_HASH_PAGE_CONCURRENCY"], 8)
         self.assertEqual(settings["env"]["PHISHING_HASH_AUX_NET_LIMIT"], 128)
+        self.assertEqual(settings["env"]["PHISHING_SHORTLIST_EXECUTION_MODE"], "streaming-concurrent")
 
     def test_explicit_profile_bypasses_auto_resolution(self):
         settings = main_controller._resolve_runtime_profile_settings(
@@ -87,17 +93,22 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(settings["stage1_http"]["rdap_concurrency"], 4)
         self.assertEqual(settings["env"]["PHISHING_HASH_PAGES"], 16)
         self.assertEqual(settings["env"]["PHISHING_HASH_HTTP_LIMIT"], 64)
+        self.assertEqual(settings["env"]["PHISHING_SHORTLIST_EXECUTION_MODE"], "legacy-batch")
 
     def test_cpu_recall_profile_has_expected_concurrency_values(self):
         settings = main_controller._resolve_runtime_profile_settings("cpu-recall")
 
-        self.assertEqual(settings["stage1_http"]["concurrency"], 1024)
-        self.assertEqual(settings["stage1_http"]["http_concurrency"], 2048)
+        self.assertEqual(settings["stage1_http"]["concurrency"], 192)
+        self.assertEqual(settings["stage1_http"]["http_concurrency"], 512)
         self.assertEqual(settings["stage1_http"]["rdap_concurrency"], 24)
-        self.assertEqual(settings["stage1_http"]["stage1_fetch_queue_max"], 50000)
+        self.assertEqual(settings["stage1_http"]["stage1_fetch_queue_max"], 4096)
+        self.assertEqual(settings["stage1_http"]["stage1_cpu_queue_max"], 2048)
         self.assertEqual(settings["stage1_http"]["stage1_target_urls_per_sec"], 1500)
         self.assertEqual(settings["env"]["PHISHING_HASH_PAGES"], 64)
         self.assertEqual(settings["env"]["PHISHING_HASH_HTTP_LIMIT"], 256)
+        self.assertEqual(settings["env"]["PHISHING_HASH_ACTIVE_PAGES_FLOOR"], 8)
+        self.assertEqual(settings["env"]["PHISHING_LEXICAL_BATCH_SIZE"], 512)
+        self.assertEqual(settings["env"]["PHISHING_SHORTLIST_EXECUTION_MODE"], "streaming-concurrent")
 
     def test_apply_runtime_profile_env_sets_overrides(self):
         settings = main_controller._resolve_runtime_profile_settings("cpu-fast")
@@ -107,6 +118,7 @@ class RuntimeProfileTests(unittest.TestCase):
 
             self.assertEqual(os.environ["PHISHING_HASH_PAGES"], "24")
             self.assertEqual(os.environ["PHISHING_HASH_HTTP_LIMIT"], "96")
+            self.assertEqual(os.environ["PHISHING_SHORTLIST_EXECUTION_MODE"], "streaming-concurrent")
 
     def test_apply_stage1_http_runtime_profile_updates_existing_config(self):
         settings = main_controller._resolve_runtime_profile_settings("cpu-safe")

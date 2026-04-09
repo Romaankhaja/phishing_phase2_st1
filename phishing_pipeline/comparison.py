@@ -866,6 +866,113 @@ def _append_shortlist_stage_event(
     )
 
 
+def _append_shortlist_stage_event_now(
+    *,
+    run_context: RunContext | None,
+    checkpoint_store: CheckpointStore | None,
+    raw_url: str,
+    normalized_url: str,
+    source_workbook: str,
+    stage_name: str,
+    worker_id: str,
+    status: str,
+    retry_count: int = 0,
+    timeout_flag: bool = False,
+    error_type: str = "",
+    error_message: str = "",
+    fallback_taken: str = "",
+) -> None:
+    started_at = utc_now_iso()
+    started_monotonic = time.perf_counter()
+    _append_shortlist_stage_event(
+        run_context=run_context,
+        checkpoint_store=checkpoint_store,
+        raw_url=raw_url,
+        normalized_url=normalized_url,
+        source_workbook=source_workbook,
+        stage_name=stage_name,
+        worker_id=worker_id,
+        started_at=started_at,
+        started_monotonic=started_monotonic,
+        status=status,
+        retry_count=retry_count,
+        timeout_flag=timeout_flag,
+        error_type=error_type,
+        error_message=error_message,
+        fallback_taken=fallback_taken,
+    )
+
+
+def _hash_event_status_from_metric(metric_key: str) -> str:
+    normalized = str(metric_key or "").strip().lower()
+    if normalized == "fetch_timed_out":
+        return "timed_out"
+    if normalized == "fetch_failed":
+        return "failed"
+    return normalized or "failed"
+
+
+def _append_hash_stage_event(
+    *,
+    run_context: RunContext | None,
+    checkpoint_store: CheckpointStore | None,
+    raw_url: str,
+    normalized_url: str,
+    source_workbook: str,
+    worker_id: str,
+    status: str,
+    timeout_flag: bool = False,
+    error_type: str = "",
+    error_message: str = "",
+) -> None:
+    _append_shortlist_stage_event_now(
+        run_context=run_context,
+        checkpoint_store=checkpoint_store,
+        raw_url=raw_url,
+        normalized_url=normalized_url,
+        source_workbook=source_workbook,
+        stage_name="hash",
+        worker_id=worker_id,
+        status=status,
+        timeout_flag=timeout_flag,
+        error_type=error_type,
+        error_message=error_message,
+    )
+
+
+def _normalize_shortlist_execution_mode(value: str | None) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"safe-local", "safe_local", "fallback", "legacy", "legacy-batch", "legacy_batch"}:
+        return "legacy-batch"
+    if normalized in {"streaming", "streaming-concurrent", "streaming_concurrent", "concurrent"}:
+        return "streaming-concurrent"
+    return "streaming-concurrent"
+
+
+def _resolve_shortlist_execution_mode() -> str:
+    return _normalize_shortlist_execution_mode(os.environ.get("PHISHING_SHORTLIST_EXECUTION_MODE"))
+
+
+def _normalize_shortlist_cpu_executor_mode(value: str | None) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"process", "process-pool", "process_pool"}:
+        return "process"
+    if normalized in {"thread", "thread-pool", "thread_pool", "local"}:
+        return "thread"
+    return "auto"
+
+
+def _resolve_shortlist_cpu_executor_mode() -> str:
+    override = _normalize_shortlist_cpu_executor_mode(
+        os.environ.get("PHISHING_SHORTLIST_CPU_EXECUTOR_MODE")
+    )
+    if override != "auto":
+        return override
+    if os.name == "nt":
+        return "thread"
+    return "process"
+
+
 def _coerce_optional_stage1_threshold(
     name: str,
     value,
@@ -1595,6 +1702,7 @@ def _handle_stage1_fetch_payload(
             "admitted_prefetch_match": None,
             "queue_payload": payload,
             "metric_key": "hashed_success",
+            "payload": dict(payload or {}),
         }
 
     decision_row = _build_prefetch_decision_row(
@@ -1624,6 +1732,7 @@ def _handle_stage1_fetch_payload(
         ),
         "queue_payload": None,
         "metric_key": metric_key,
+        "payload": dict(payload or {}),
     }
 
 
@@ -3701,6 +3810,7 @@ def _build_lexical_cache(entity_index: dict) -> tuple[_LexicalEntityFeatures, ..
 
 _LEXICAL_CACHE = _build_lexical_cache(_entity_index)
 _LEXICAL_WORKER_CACHE: tuple[_LexicalEntityFeatures, ...] | None = None
+_STAGE1_CPU_WORKER_CONTEXT: dict[str, Any] | None = None
 
 
 def _init_lexical_worker(lexical_cache: tuple[_LexicalEntityFeatures, ...]) -> None:
@@ -3710,6 +3820,84 @@ def _init_lexical_worker(lexical_cache: tuple[_LexicalEntityFeatures, ...]) -> N
 
 def _active_lexical_cache() -> tuple[_LexicalEntityFeatures, ...]:
     return _LEXICAL_WORKER_CACHE if _LEXICAL_WORKER_CACHE is not None else _LEXICAL_CACHE
+
+
+def _init_stage1_cpu_worker(
+    entity_context: dict[str, dict[str, Any]],
+    ordered_entities: tuple[str, ...],
+    stage1_http_config: dict[str, Any],
+) -> None:
+    global _STAGE1_CPU_WORKER_CONTEXT
+    _STAGE1_CPU_WORKER_CONTEXT = {
+        "entity_context": dict(entity_context or {}),
+        "ordered_entities": tuple(ordered_entities or ()),
+        "stage1_http_config": dict(stage1_http_config or {}),
+    }
+
+
+def _active_stage1_cpu_context() -> dict[str, Any]:
+    if _STAGE1_CPU_WORKER_CONTEXT is not None:
+        return _STAGE1_CPU_WORKER_CONTEXT
+    entity_context, ordered_entities = get_stage1_entity_context()
+    return {
+        "entity_context": dict(entity_context or {}),
+        "ordered_entities": tuple(ordered_entities or ()),
+        "stage1_http_config": dict(STAGE1_HTTP_CONFIG),
+    }
+
+
+def _create_stage1_cpu_executor(
+    worker_count: int,
+    entity_context: dict[str, dict[str, Any]],
+    ordered_entities: tuple[str, ...],
+    stage1_http_config: dict[str, Any],
+):
+    _init_stage1_cpu_worker(entity_context, ordered_entities, stage1_http_config)
+    executor_mode = _resolve_shortlist_cpu_executor_mode()
+    if executor_mode == "thread":
+        return ThreadPoolExecutor(max_workers=max(1, int(worker_count))), "thread"
+    try:
+        return (
+            ProcessPoolExecutor(
+                max_workers=max(1, int(worker_count)),
+                initializer=_init_stage1_cpu_worker,
+                initargs=(
+                    dict(entity_context or {}),
+                    tuple(ordered_entities or ()),
+                    dict(stage1_http_config or {}),
+                ),
+            ),
+            "process",
+        )
+    except Exception as exc:
+        _hash_logger.warning(
+            "Stage1 CPU pool fallback to threads after process-pool init failure: %s",
+            exc,
+        )
+        return ThreadPoolExecutor(max_workers=max(1, int(worker_count))), "thread"
+
+
+def _create_stage0_lexical_executor():
+    worker_count = max(1, int(LEXICAL_WORKERS))
+    _init_lexical_worker(_LEXICAL_CACHE)
+    executor_mode = _resolve_shortlist_cpu_executor_mode()
+    if executor_mode == "thread":
+        return ThreadPoolExecutor(max_workers=worker_count), "thread"
+    try:
+        return (
+            ProcessPoolExecutor(
+                max_workers=worker_count,
+                initializer=_init_lexical_worker,
+                initargs=(_LEXICAL_CACHE,),
+            ),
+            "process",
+        )
+    except Exception as exc:
+        _hash_logger.warning(
+            "Stage0 lexical pool fallback to threads after process-pool init failure: %s",
+            exc,
+        )
+        return ThreadPoolExecutor(max_workers=worker_count), "thread"
 
 # â”€â”€ Top-level helper for ProcessPoolExecutor (must be picklable) â”€â”€
 
@@ -4718,6 +4906,8 @@ async def _run_browser_shard(
     aio_session,
     scoring_config,
     hash_progress=None,
+    run_context: RunContext | None = None,
+    checkpoint_store: CheckpointStore | None = None,
 ):
     """
     Long-lived browser shard with SCRAPER_PAGE_CONCURRENCY workers
@@ -4765,6 +4955,7 @@ async def _run_browser_shard(
                     scoring_config=scoring_config,
                     stage1_analysis=stage1_analysis,
                 )
+                source_workbook = str(prefetch_metrics.get("source_workbook", "") or "")
                 queue_payload = _commit_legacy_shard_fetch_outcome(
                     payload_outcome,
                     metrics=metrics,
@@ -4773,7 +4964,31 @@ async def _run_browser_shard(
                     hash_progress=hash_progress,
                 )
                 if queue_payload is not None:
+                    _append_hash_stage_event(
+                        run_context=run_context,
+                        checkpoint_store=checkpoint_store,
+                        raw_url=str(payload.get("url", url) or url),
+                        normalized_url=str(payload.get("normalized_url", normalized_url) or normalized_url),
+                        source_workbook=source_workbook,
+                        worker_id=f"hash-shard-{shard_id}",
+                        status="fetched",
+                    )
                     await asyncio.wait_for(gpu_queue.put(queue_payload), timeout=5.0)
+                else:
+                    _append_hash_stage_event(
+                        run_context=run_context,
+                        checkpoint_store=checkpoint_store,
+                        raw_url=str(payload_outcome.get("payload", {}).get("url", url) or url),
+                        normalized_url=str(
+                            payload_outcome.get("payload", {}).get("normalized_url", normalized_url) or normalized_url
+                        ),
+                        source_workbook=source_workbook,
+                        worker_id=f"hash-shard-{shard_id}",
+                        status=_hash_event_status_from_metric(str(payload_outcome.get("metric_key", "") or "")),
+                        timeout_flag=str(payload_outcome.get("metric_key", "") or "") == "fetch_timed_out",
+                        error_type=str(payload_outcome.get("payload", {}).get("fetch_error_type", "") or ""),
+                        error_message=str(payload_outcome.get("payload", {}).get("fetch_error_detail", "") or ""),
+                    )
             except Exception as exc:
                 normalized_url = normalize_url(url)
                 prefetch_metrics = prefetch_metrics_map.get(normalized_url)
@@ -4785,6 +5000,7 @@ async def _run_browser_shard(
                     payload={
                         "url": normalized_url,
                         "normalized_url": normalized_url,
+                        "source_workbook": prefetch_metrics.get("source_workbook", ""),
                         "fetch_status": "failed",
                         "visual_status": "not_attempted",
                         "fetch_error_type": "worker_error",
@@ -4804,6 +5020,17 @@ async def _run_browser_shard(
                     decision_rows=decision_rows,
                     prefetch_admitted_failures=prefetch_admitted_failures,
                     hash_progress=hash_progress,
+                )
+                _append_hash_stage_event(
+                    run_context=run_context,
+                    checkpoint_store=checkpoint_store,
+                    raw_url=url,
+                    normalized_url=normalized_url,
+                    source_workbook=str(prefetch_metrics.get("source_workbook", "") or ""),
+                    worker_id=f"hash-shard-{shard_id}",
+                    status="failed",
+                    error_type="worker_error",
+                    error_message=_compact_exception_message(exc),
                 )
                 _hash_logger.warning(
                     "Shard %d error on %s: %s: %s",
@@ -5321,7 +5548,18 @@ def _finalize_scored_hash_payload(
         review_results.append(review_record)
 
 
-async def _gpu_microbatch_scorer(gpu_queue, results, review_results, decision_rows, metrics, threshold, scoring_config, hash_progress=None):
+async def _gpu_microbatch_scorer(
+    gpu_queue,
+    results,
+    review_results,
+    decision_rows,
+    metrics,
+    threshold,
+    scoring_config,
+    hash_progress=None,
+    run_context: RunContext | None = None,
+    checkpoint_store: CheckpointStore | None = None,
+):
     """
     Queue scorer for browser-fetched payloads.
     Payloads are finalized with hash/domain signals only.
@@ -5344,6 +5582,8 @@ async def _gpu_microbatch_scorer(gpu_queue, results, review_results, decision_ro
         )
 
         for payload in current_batch:
+            results_before = len(results)
+            review_before = len(review_results)
             scores = payload["cpu_scores"].copy()
             denominators = payload["cpu_denominators"].copy()
             _finalize_scored_hash_payload(
@@ -5356,6 +5596,21 @@ async def _gpu_microbatch_scorer(gpu_queue, results, review_results, decision_ro
                 decision_rows=decision_rows,
                 threshold=threshold,
                 scoring_config=scoring_config,
+            )
+            if len(results) > results_before:
+                final_status = "shortlisted"
+            elif len(review_results) > review_before:
+                final_status = "review_only"
+            else:
+                final_status = "filtered"
+            _append_hash_stage_event(
+                run_context=run_context,
+                checkpoint_store=checkpoint_store,
+                raw_url=str(payload.get("url", payload.get("normalized_url", "")) or payload.get("normalized_url", "")),
+                normalized_url=str(payload.get("normalized_url", payload.get("url", "")) or payload.get("url", "")),
+                source_workbook=str(payload.get("source_workbook", "") or ""),
+                worker_id="hash-finalize",
+                status=final_status,
             )
             metrics["hashed_success"] += 1
             metrics["processed"] += 1
@@ -5699,6 +5954,8 @@ async def _run_hash_browser_node(
     active_workers,
     worker_states,
     worker_tasks,
+    run_context: RunContext | None = None,
+    checkpoint_store: CheckpointStore | None = None,
 ):
     p = None
     browser = None
@@ -5761,6 +6018,7 @@ async def _run_hash_browser_node(
                 item = await render_queue.get()
                 item_taken = True
                 if item is None:
+                    metrics["shutdown_sentinels_drained"] = metrics.get("shutdown_sentinels_drained", 0) + 1
                     _set_hash_worker_state(
                         worker_states,
                         worker_id,
@@ -5775,6 +6033,9 @@ async def _run_hash_browser_node(
                 normalized_url = str(item.get("normalized_url", "") or normalize_url(raw_url))
                 prefetch_metrics = item.get("prefetch_metrics") or prefetch_metrics_map.get(normalized_url) or {}
                 stage1_analysis = item.get("stage1_analysis") or stage1_analysis_map.get(normalized_url, {}) or {}
+                source_workbook = str(
+                    item.get("source_workbook", "") or prefetch_metrics.get("source_workbook", "") or ""
+                )
                 active_workers[worker_id] = normalized_url
                 _set_hash_worker_state(
                     worker_states,
@@ -5796,12 +6057,22 @@ async def _run_hash_browser_node(
                     )
                     metrics["render_completed"] += 1
                     if str(render_payload.get("fetch_status", "")).strip().lower() in {"fetched", "fetched_visual_missing"}:
+                        _append_hash_stage_event(
+                            run_context=run_context,
+                            checkpoint_store=checkpoint_store,
+                            raw_url=str(render_payload.get("url", raw_url) or raw_url),
+                            normalized_url=str(render_payload.get("normalized_url", normalized_url) or normalized_url),
+                            source_workbook=source_workbook,
+                            worker_id=worker_id,
+                            status="fetched",
+                        )
                         await _queue_hash_lane_item(
                             aux_queue,
                             {
                                 "render_payload": render_payload,
                                 "prefetch_metrics": prefetch_metrics,
                                 "stage1_analysis": stage1_analysis,
+                                "source_workbook": source_workbook,
                             },
                             lane_name="aux",
                             metrics=metrics,
@@ -5821,6 +6092,18 @@ async def _run_hash_browser_node(
                             decision_rows=decision_rows,
                             prefetch_admitted_failures=prefetch_admitted_failures,
                             hash_progress=hash_progress,
+                        )
+                        _append_hash_stage_event(
+                            run_context=run_context,
+                            checkpoint_store=checkpoint_store,
+                            raw_url=str(render_payload.get("url", raw_url) or raw_url),
+                            normalized_url=str(render_payload.get("normalized_url", normalized_url) or normalized_url),
+                            source_workbook=source_workbook,
+                            worker_id=worker_id,
+                            status=_hash_event_status_from_metric(str(payload_outcome.get("metric_key", "") or "")),
+                            timeout_flag=str(payload_outcome.get("metric_key", "") or "") == "fetch_timed_out",
+                            error_type=str(render_payload.get("fetch_error_type", "") or ""),
+                            error_message=str(render_payload.get("fetch_error_detail", "") or ""),
                         )
                         recycle_page = True
                     consecutive_failures = 0
@@ -5853,6 +6136,17 @@ async def _run_hash_browser_node(
                             prefetch_admitted_failures=prefetch_admitted_failures,
                             hash_progress=hash_progress,
                         )
+                        _append_hash_stage_event(
+                            run_context=run_context,
+                            checkpoint_store=checkpoint_store,
+                            raw_url=raw_url or normalized_url,
+                            normalized_url=normalized_url or raw_url,
+                            source_workbook=source_workbook,
+                            worker_id=worker_id,
+                            status="failed",
+                            error_type="worker_stall",
+                            error_message="hash render worker cancelled during stall recovery",
+                        )
                     consecutive_failures += 1
                     raise
                 except Exception as exc:
@@ -5880,6 +6174,17 @@ async def _run_hash_browser_node(
                         decision_rows=decision_rows,
                         prefetch_admitted_failures=prefetch_admitted_failures,
                         hash_progress=hash_progress,
+                    )
+                    _append_hash_stage_event(
+                        run_context=run_context,
+                        checkpoint_store=checkpoint_store,
+                        raw_url=raw_url or normalized_url,
+                        normalized_url=normalized_url or raw_url,
+                        source_workbook=source_workbook,
+                        worker_id=worker_id,
+                        status="failed",
+                        error_type="render_worker_error",
+                        error_message=_compact_exception_message(exc),
                     )
                     recycle_page = True
                     _hash_logger.warning(
@@ -5988,6 +6293,8 @@ async def _run_hash_aux_worker(
     hash_progress,
     scoring_config,
     active_workers,
+    run_context: RunContext | None = None,
+    checkpoint_store: CheckpointStore | None = None,
 ):
     while True:
         item = await aux_queue.get()
@@ -5998,6 +6305,7 @@ async def _run_hash_aux_worker(
         normalized_url = str(render_payload.get("normalized_url", render_payload.get("url", "")) or "")
         prefetch_metrics = item.get("prefetch_metrics") or {}
         stage1_analysis = item.get("stage1_analysis") or {}
+        source_workbook = str(item.get("source_workbook", "") or prefetch_metrics.get("source_workbook", "") or "")
         active_workers[worker_id] = normalized_url
         try:
             scored_payload = await _enrich_render_payload_for_hashing(
@@ -6020,7 +6328,7 @@ async def _run_hash_aux_worker(
                 payload={
                     "url": render_payload.get("url", normalized_url),
                     "normalized_url": normalized_url,
-                    "source_workbook": prefetch_metrics.get("source_workbook", ""),
+                    "source_workbook": source_workbook,
                     "fetch_status": "failed",
                     "visual_status": render_payload.get("visual_status", "not_attempted"),
                     "fetch_error_type": "aux_hash_error",
@@ -6041,6 +6349,18 @@ async def _run_hash_aux_worker(
                 decision_rows=decision_rows,
                 prefetch_admitted_failures=prefetch_admitted_failures,
                 hash_progress=hash_progress,
+            )
+            _append_hash_stage_event(
+                run_context=run_context,
+                checkpoint_store=checkpoint_store,
+                raw_url=str(render_payload.get("url", normalized_url) or normalized_url),
+                normalized_url=normalized_url,
+                source_workbook=source_workbook,
+                worker_id=worker_id,
+                status=_hash_event_status_from_metric(str(payload_outcome.get("metric_key", "") or "")),
+                timeout_flag=str(payload_outcome.get("metric_key", "") or "") == "fetch_timed_out",
+                error_type="aux_hash_error",
+                error_message=_compact_exception_message(exc),
             )
             _hash_logger.warning(
                 "Hash aux worker %s error on %s: %s: %s",
@@ -6652,11 +6972,14 @@ def _compute_stage0_prefetch_metrics_parallel(
         )
         last_progress_log_monotonic = now_monotonic
 
-    with ProcessPoolExecutor(
-        max_workers=LEXICAL_WORKERS,
-        initializer=_init_lexical_worker,
-        initargs=(_LEXICAL_CACHE,),
-    ) as lexical_pool:
+    lexical_pool, lexical_executor_kind = _create_stage0_lexical_executor()
+    _hash_logger.info(
+        "Stage0 lexical executor | kind=%s | workers=%d | shortlist_execution_mode=%s",
+        lexical_executor_kind,
+        LEXICAL_WORKERS,
+        _resolve_shortlist_execution_mode(),
+    )
+    with lexical_pool:
         future_map = {}
         batch_iter = iter(_iter_lexical_batches(metric_urls, LEXICAL_BATCH_SIZE))
 
@@ -6751,6 +7074,7 @@ async def _compute_stage0_prefetch_metrics_parallel_streaming(
     progress_bar=None,
     skipped_count: int = 0,
     on_batch_complete=None,
+    submission_gate=None,
 ) -> dict[str, Any]:
     metric_urls = [str(url or "").strip() for url in metric_urls if str(url or "").strip()]
     if not metric_urls:
@@ -6814,16 +7138,21 @@ async def _compute_stage0_prefetch_metrics_parallel_streaming(
         )
         last_progress_log_monotonic = now_monotonic
 
-    with ProcessPoolExecutor(
-        max_workers=LEXICAL_WORKERS,
-        initializer=_init_lexical_worker,
-        initargs=(_LEXICAL_CACHE,),
-    ) as lexical_pool:
+    lexical_pool, lexical_executor_kind = _create_stage0_lexical_executor()
+    _hash_logger.info(
+        "Stage0 lexical executor | kind=%s | workers=%d | shortlist_execution_mode=%s",
+        lexical_executor_kind,
+        LEXICAL_WORKERS,
+        _resolve_shortlist_execution_mode(),
+    )
+    with lexical_pool:
         future_map: dict[asyncio.Future, tuple[int, list[str], float]] = {}
         batch_iter = iter(_iter_lexical_batches(metric_urls, LEXICAL_BATCH_SIZE))
 
-        def _submit_next_batch() -> bool:
+        async def _submit_next_batch() -> bool:
             nonlocal submitted_batches
+            if submission_gate is not None:
+                await _await_maybe(submission_gate())
             try:
                 batch_urls = next(batch_iter)
             except StopIteration:
@@ -6838,8 +7167,9 @@ async def _compute_stage0_prefetch_metrics_parallel_streaming(
             future_map[wrapped_future] = (submitted_batches, batch_urls, time.perf_counter())
             return True
 
-        while len(future_map) < LEXICAL_INFLIGHT_BATCHES and _submit_next_batch():
-            pass
+        while len(future_map) < LEXICAL_INFLIGHT_BATCHES:
+            if not await _submit_next_batch():
+                break
 
         while future_map:
             done, _ = await asyncio.wait(tuple(future_map.keys()), return_when=asyncio.FIRST_COMPLETED)
@@ -6881,8 +7211,9 @@ async def _compute_stage0_prefetch_metrics_parallel_streaming(
 
                 _log_progress(active_batches=len(future_map))
 
-            while len(future_map) < LEXICAL_INFLIGHT_BATCHES and _submit_next_batch():
-                pass
+            while len(future_map) < LEXICAL_INFLIGHT_BATCHES:
+                if not await _submit_next_batch():
+                    break
 
     avg_batch_latency_ms = (
         (total_batch_latency_s / completed_batches) * 1000.0
@@ -6936,6 +7267,34 @@ def _stage1_score_payload_sync(
     return scored_result
 
 
+def _stage1_cpu_pass_sync(
+    result: dict[str, Any],
+    html_bytes: bytes,
+    response_encoding: str | None,
+    rescore_only: bool = False,
+) -> dict[str, Any]:
+    cpu_context = _active_stage1_cpu_context()
+    working_result = dict(result or {})
+    stage1_http_config = dict(cpu_context.get("stage1_http_config") or STAGE1_HTTP_CONFIG)
+    if not rescore_only:
+        working_result = _stage1_parse_payload_sync(
+            working_result,
+            html_bytes,
+            response_encoding,
+            stage1_http_config,
+        )
+    return _stage1_score_payload_sync(
+        working_result,
+        dict(cpu_context.get("entity_context") or {}),
+        tuple(cpu_context.get("ordered_entities") or ()),
+        stage1_http_config,
+    )
+
+
+def _count_stage1_active_workers(active_workers: dict[str, str], prefix: str) -> int:
+    return sum(1 for worker_id in active_workers if worker_id.startswith(prefix))
+
+
 def _stage1_queue_pressure_snapshot(
     stage1_http_config: dict[str, Any],
     *,
@@ -6945,10 +7304,24 @@ def _stage1_queue_pressure_snapshot(
     enrich_queue,
     result_queue,
 ) -> dict[str, Any]:
+    cpu_queue_limit = max(
+        1,
+        int(
+            stage1_http_config.get(
+                "stage1_cpu_queue_max",
+                max(
+                    int(stage1_http_config.get("stage1_parse_queue_max", 1) or 1),
+                    int(stage1_http_config.get("stage1_score_queue_max", 1) or 1),
+                ),
+            )
+            or 1
+        ),
+    )
     queue_depths = {
         "ingress_queue_depth": ingress_queue.qsize(),
         "parse_queue_depth": parse_queue.qsize(),
         "score_queue_depth": score_queue.qsize(),
+        "cpu_queue_depth": parse_queue.qsize() + score_queue.qsize(),
         "enrich_queue_depth": enrich_queue.qsize(),
         "result_queue_depth": result_queue.qsize(),
     }
@@ -6956,6 +7329,7 @@ def _stage1_queue_pressure_snapshot(
         "ingress_queue_limit": max(1, int(stage1_http_config.get("stage1_fetch_queue_max", 1) or 1)),
         "parse_queue_limit": max(1, int(stage1_http_config.get("stage1_parse_queue_max", 1) or 1)),
         "score_queue_limit": max(1, int(stage1_http_config.get("stage1_score_queue_max", 1) or 1)),
+        "cpu_queue_limit": cpu_queue_limit,
         "enrich_queue_limit": max(1, int(stage1_http_config.get("stage1_enrich_queue_max", 1) or 1)),
         "result_queue_limit": max(1, int(stage1_http_config.get("stage1_result_queue_max", 1) or 1)),
     }
@@ -6963,6 +7337,7 @@ def _stage1_queue_pressure_snapshot(
         "ingress_queue_ratio": queue_depths["ingress_queue_depth"] / queue_limits["ingress_queue_limit"],
         "parse_queue_ratio": queue_depths["parse_queue_depth"] / queue_limits["parse_queue_limit"],
         "score_queue_ratio": queue_depths["score_queue_depth"] / queue_limits["score_queue_limit"],
+        "cpu_queue_ratio": queue_depths["cpu_queue_depth"] / queue_limits["cpu_queue_limit"],
         "enrich_queue_ratio": queue_depths["enrich_queue_depth"] / queue_limits["enrich_queue_limit"],
         "result_queue_ratio": queue_depths["result_queue_depth"] / queue_limits["result_queue_limit"],
     }
@@ -6970,7 +7345,12 @@ def _stage1_queue_pressure_snapshot(
         **queue_depths,
         **queue_limits,
         **queue_ratios,
-        "queue_pressure_ratio": max(queue_ratios.values()),
+        "queue_pressure_ratio": max(
+            queue_ratios["ingress_queue_ratio"],
+            queue_ratios["cpu_queue_ratio"],
+            queue_ratios["enrich_queue_ratio"],
+            queue_ratios["result_queue_ratio"],
+        ),
     }
 
 
@@ -6983,12 +7363,18 @@ def _compute_hash_stage1_backlog_cap(
     full_limit = max(1, int(full_limit))
     if stage1_done or not stage1_snapshot:
         return full_limit
-    queue_pressure_ratio = float(stage1_snapshot.get("queue_pressure_ratio", 0.0) or 0.0)
-    if queue_pressure_ratio >= 0.75:
-        return min(full_limit, 32)
-    if queue_pressure_ratio >= 0.40:
-        return min(full_limit, 48)
-    return min(full_limit, 48)
+    reserved_floor = min(
+        full_limit,
+        max(1, int(stage1_snapshot.get("hash_reserved_floor", ACTIVE_FETCH_LIMIT_FLOOR) or ACTIVE_FETCH_LIMIT_FLOOR)),
+    )
+    cpu_backlog_s = float(stage1_snapshot.get("cpu_backlog_s", 0.0) or 0.0)
+    ingress_ratio = float(stage1_snapshot.get("ingress_queue_ratio", 0.0) or 0.0)
+    cpu_queue_ratio = float(stage1_snapshot.get("cpu_queue_ratio", 0.0) or 0.0)
+    if cpu_backlog_s <= 0.5 and ingress_ratio < 0.25 and cpu_queue_ratio < 0.25:
+        return full_limit
+    if cpu_backlog_s <= 1.0 and ingress_ratio < 0.50 and cpu_queue_ratio < 0.50:
+        return min(full_limit, max(reserved_floor, 16))
+    return reserved_floor
 
 
 def _update_stage1_queue_depth_sink(ctx: dict[str, Any], snapshot: dict[str, Any]) -> None:
@@ -6999,7 +7385,88 @@ def _update_stage1_queue_depth_sink(ctx: dict[str, Any], snapshot: dict[str, Any
     queue_depth_sink.update(snapshot)
     queue_depth_sink["done"] = bool(ctx["pipeline_done_event"].is_set())
     queue_depth_sink["active_workers"] = len(ctx["active_workers"])
+    queue_depth_sink["live_fetches"] = int(ctx["fetch_limiter"].active)
     queue_depth_sink["fetch_limit"] = int(ctx["fetch_limiter"].limit)
+    queue_depth_sink["cpu_busy_workers"] = (
+        _count_stage1_active_workers(ctx["active_workers"], "stage1-parse-")
+        + _count_stage1_active_workers(ctx["active_workers"], "stage1-score-")
+    )
+    queue_depth_sink["cpu_backlog_s"] = float(ctx["telemetry"].get("cpu_backlog_s", 0.0) or 0.0)
+    queue_depth_sink["cpu_completed_rate"] = float(ctx["telemetry"].get("cpu_completed_rate", 0.0) or 0.0)
+    queue_depth_sink["hash_reserved_floor"] = ACTIVE_FETCH_LIMIT_FLOOR
+
+
+def _compute_stage1_fetch_limit_adjustment(
+    *,
+    current_limit: int,
+    floor_limit: int,
+    max_limit: int,
+    ingress_queue_depth: int,
+    ingress_queue_limit: int,
+    cpu_queue_depth: int,
+    cpu_queue_limit: int,
+    cpu_completed_rate: float,
+    timeout_ratio: float,
+    fd_ratio: float,
+    ram_usage_ratio: float,
+    step: int = 32,
+) -> dict[str, Any]:
+    floor_limit = max(1, int(floor_limit))
+    max_limit = max(floor_limit, int(max_limit))
+    current_limit = max(floor_limit, min(max_limit, int(current_limit)))
+    ingress_ratio = ingress_queue_depth / max(1, int(ingress_queue_limit))
+    cpu_queue_ratio = cpu_queue_depth / max(1, int(cpu_queue_limit))
+    cpu_backlog_s = cpu_queue_depth / max(float(cpu_completed_rate or 0.0), 1.0)
+
+    if cpu_queue_ratio >= 0.80:
+        next_limit = max(floor_limit, math.ceil(current_limit * 0.5))
+        return {
+            "action": "hard_clamp" if next_limit < current_limit else "hold",
+            "next_limit": next_limit,
+            "cpu_backlog_s": cpu_backlog_s,
+            "ingress_ratio": ingress_ratio,
+            "cpu_queue_ratio": cpu_queue_ratio,
+        }
+
+    if (
+        cpu_backlog_s > 2.0
+        or cpu_queue_ratio > 0.60
+        or timeout_ratio >= 0.35
+        or fd_ratio >= 0.70
+        or ram_usage_ratio >= 0.75
+    ):
+        next_limit = max(floor_limit, current_limit - max(int(step), current_limit // 4))
+        return {
+            "action": "downshift" if next_limit < current_limit else "hold",
+            "next_limit": next_limit,
+            "cpu_backlog_s": cpu_backlog_s,
+            "ingress_ratio": ingress_ratio,
+            "cpu_queue_ratio": cpu_queue_ratio,
+        }
+
+    if (
+        cpu_backlog_s < 1.0
+        and ingress_ratio < 0.50
+        and timeout_ratio < 0.20
+        and fd_ratio < 0.65
+        and ram_usage_ratio < 0.70
+        and current_limit < max_limit
+    ):
+        return {
+            "action": "upshift",
+            "next_limit": min(max_limit, current_limit + max(1, int(step))),
+            "cpu_backlog_s": cpu_backlog_s,
+            "ingress_ratio": ingress_ratio,
+            "cpu_queue_ratio": cpu_queue_ratio,
+        }
+
+    return {
+        "action": "hold",
+        "next_limit": current_limit,
+        "cpu_backlog_s": cpu_backlog_s,
+        "ingress_ratio": ingress_ratio,
+        "cpu_queue_ratio": cpu_queue_ratio,
+    }
 
 
 async def _stage1_ingress_get(ctx: dict[str, Any]):
@@ -7018,9 +7485,16 @@ async def _stage1_progress_monitor(ctx: dict[str, Any]) -> None:
     progress = ctx["progress"]
     progress_bar = ctx.get("progress_bar")
     telemetry = ctx["telemetry"]
+    counters = ctx["lane_counters"]
     last_progress_log_monotonic = float(ctx["stage1_started_monotonic"])
     last_completed = 0
     last_total = progress.total
+    last_fetch_started = 0
+    last_fetch_completed = 0
+    last_cpu_completed = 0
+    last_enrich_completed = 0
+    last_ingress_wait_s = 0.0
+    last_cpu_wait_s = 0.0
     while not ctx["pipeline_done_event"].is_set():
         before_sleep = time.perf_counter()
         await asyncio.sleep(0.5)
@@ -7036,7 +7510,9 @@ async def _stage1_progress_monitor(ctx: dict[str, Any]) -> None:
             enrich_queue=ctx["enrich_queue"],
             result_queue=ctx["result_queue"],
         )
+        telemetry["cpu_queue_ratio"] = float(snapshot.get("cpu_queue_ratio", 0.0) or 0.0)
         telemetry["queue_pressure_ratio"] = float(snapshot.get("queue_pressure_ratio", 0.0) or 0.0)
+        telemetry["cpu_backlog_s"] = snapshot["cpu_queue_depth"] / max(float(telemetry.get("cpu_completed_rate", 0.0) or 0.0), 1.0)
         _update_stage1_queue_depth_sink(ctx, snapshot)
 
         completed = progress.completed
@@ -7057,6 +7533,7 @@ async def _stage1_progress_monitor(ctx: dict[str, Any]) -> None:
                     "sq": ctx["score_queue"].qsize(),
                     "eq": ctx["enrich_queue"].qsize(),
                     "rq": ctx["result_queue"].qsize(),
+                    "fetch": ctx["fetch_limiter"].active,
                     "limit": ctx["fetch_limiter"].limit,
                     "esc": ctx["progress_metrics"]["escalated"],
                     "fail": ctx["progress_metrics"]["failed"],
@@ -7079,8 +7556,27 @@ async def _stage1_progress_monitor(ctx: dict[str, Any]) -> None:
         telemetry["fd_limit"] = int(resource_snapshot.get("fd_limit", 0) or 0)
         telemetry["fd_ratio"] = float(resource_snapshot.get("fd_usage_ratio", 0.0) or 0.0)
         telemetry["ram_usage_ratio"] = float(resource_snapshot.get("ram_usage_ratio", 0.0) or 0.0)
+        window_s = max(0.001, now_monotonic - last_progress_log_monotonic)
+        fetch_started_delta = counters["fetch_started"] - last_fetch_started
+        fetch_completed_delta = counters["fetch_completed"] - last_fetch_completed
+        cpu_completed_delta = counters["cpu_completed"] - last_cpu_completed
+        enrich_completed_delta = counters["enrich_completed"] - last_enrich_completed
+        ingress_wait_delta = counters["ingress_wait_s"] - last_ingress_wait_s
+        cpu_wait_delta = counters["cpu_wait_s"] - last_cpu_wait_s
+        telemetry["fetch_started_rate"] = fetch_started_delta / window_s
+        telemetry["fetch_completed_rate"] = fetch_completed_delta / window_s
+        telemetry["cpu_completed_rate"] = cpu_completed_delta / window_s
+        telemetry["enrich_completed_rate"] = enrich_completed_delta / window_s
+        telemetry["cpu_backlog_s"] = snapshot["cpu_queue_depth"] / max(float(telemetry["cpu_completed_rate"] or 0.0), 1.0)
+        avg_ingress_wait_ms = 1000.0 * ingress_wait_delta / max(1, fetch_started_delta)
+        avg_cpu_wait_ms = 1000.0 * cpu_wait_delta / max(1, cpu_completed_delta)
+        cpu_busy_workers = (
+            _count_stage1_active_workers(ctx["active_workers"], "stage1-parse-")
+            + _count_stage1_active_workers(ctx["active_workers"], "stage1-score-")
+        )
+        _update_stage1_queue_depth_sink(ctx, snapshot)
         _hash_logger.info(
-            "Stage1 cheap HTTP progress | processed=%d/%d | rate=%.1f url/s | elapsed=%.1fs | eta=%.1fs | active=%d | queues={in=%d,parse=%d,score=%d,enrich=%d,result=%d} | fetch_limit=%d | escalated=%d | failed=%d | failure_fallback=%d | fd=%s/%s | ram=%.1f%% | event_loop_lag_ms=%.1f | timeout_ratio=%.3f | queue_pressure=%.3f",
+            "Stage1 cheap HTTP progress | processed=%d/%d | rate=%.1f url/s | elapsed=%.1fs | eta=%.1fs | active=%d | queues={in=%d,parse=%d,score=%d,cpu=%d,enrich=%d,result=%d} | fetch={start=%.1f/s,done=%.1f/s,live=%d,limit=%d} | cpu={done=%.1f/s,busy=%d,backlog_s=%.2f} | enrich=%.1f/s | waits={in=%.1fms,cpu=%.1fms} | escalated=%d | failed=%d | failure_fallback=%d | fd=%s/%s | ram=%.1f%% | event_loop_lag_ms=%.1f | timeout_ratio=%.3f | queue_pressure=%.3f",
             completed,
             total,
             rate,
@@ -7090,9 +7586,19 @@ async def _stage1_progress_monitor(ctx: dict[str, Any]) -> None:
             ctx["ingress_queue"].qsize(),
             ctx["parse_queue"].qsize(),
             ctx["score_queue"].qsize(),
+            int(snapshot.get("cpu_queue_depth", 0) or 0),
             ctx["enrich_queue"].qsize(),
             ctx["result_queue"].qsize(),
+            float(telemetry["fetch_started_rate"] or 0.0),
+            float(telemetry["fetch_completed_rate"] or 0.0),
+            int(ctx["fetch_limiter"].active),
             ctx["fetch_limiter"].limit,
+            float(telemetry["cpu_completed_rate"] or 0.0),
+            cpu_busy_workers,
+            float(telemetry["cpu_backlog_s"] or 0.0),
+            float(telemetry["enrich_completed_rate"] or 0.0),
+            avg_ingress_wait_ms,
+            avg_cpu_wait_ms,
             ctx["progress_metrics"]["escalated"],
             ctx["progress_metrics"]["failed"],
             ctx["progress_metrics"]["fallback_dns"],
@@ -7104,16 +7610,27 @@ async def _stage1_progress_monitor(ctx: dict[str, Any]) -> None:
             float(telemetry["queue_pressure_ratio"] or 0.0),
         )
         last_progress_log_monotonic = now_monotonic
+        last_fetch_started = counters["fetch_started"]
+        last_fetch_completed = counters["fetch_completed"]
+        last_cpu_completed = counters["cpu_completed"]
+        last_enrich_completed = counters["enrich_completed"]
+        last_ingress_wait_s = counters["ingress_wait_s"]
+        last_cpu_wait_s = counters["cpu_wait_s"]
 
 
 async def _stage1_ramp_monitor(ctx: dict[str, Any]) -> None:
     progress = ctx["progress"]
     telemetry = ctx["telemetry"]
+    counters = ctx["lane_counters"]
+    control_interval_s = max(
+        0.25,
+        float(ctx["stage1_http_config"].get("stage1_control_interval_seconds", 2.0) or 2.0),
+    )
     last_completed = 0
+    last_cpu_completed = 0
     last_timeout = 0
-    bad_windows = 0
     while not ctx["pipeline_done_event"].is_set():
-        await asyncio.sleep(HASH_RAMP_INTERVAL_SECONDS)
+        await asyncio.sleep(control_interval_s)
         if ctx["pipeline_done_event"].is_set():
             break
 
@@ -7136,139 +7653,140 @@ async def _stage1_ramp_monitor(ctx: dict[str, Any]) -> None:
         current_completed = progress.completed
         window_processed = current_completed - last_completed
         window_timeout = max(0, ctx["progress_metrics"]["timeout"] - last_timeout)
+        window_cpu_completed = counters["cpu_completed"] - last_cpu_completed
         last_completed = current_completed
+        last_cpu_completed = counters["cpu_completed"]
         last_timeout = ctx["progress_metrics"]["timeout"]
         telemetry["timeout_ratio"] = window_timeout / max(1, window_processed)
+        telemetry["cpu_completed_rate"] = window_cpu_completed / max(control_interval_s, 0.001)
 
-        queue_ratios = [
-            float(snapshot.get("ingress_queue_ratio", 0.0) or 0.0),
-            float(snapshot.get("parse_queue_ratio", 0.0) or 0.0),
-            float(snapshot.get("score_queue_ratio", 0.0) or 0.0),
-            float(snapshot.get("enrich_queue_ratio", 0.0) or 0.0),
-            float(snapshot.get("result_queue_ratio", 0.0) or 0.0),
-        ]
-        healthy = (
-            float(telemetry["event_loop_lag_ms"] or 0.0) < 50.0
-            and float(telemetry["timeout_ratio"] or 0.0) < 0.25
-            and float(telemetry["fd_ratio"] or 0.0) < 0.70
-            and float(telemetry["ram_usage_ratio"] or 0.0) < 0.75
-            and all(ratio < 0.40 for ratio in queue_ratios)
+        decision = _compute_stage1_fetch_limit_adjustment(
+            current_limit=ctx["fetch_limiter"].limit,
+            floor_limit=ctx["stage1_floor_limit"],
+            max_limit=ctx["fetch_concurrency_max"],
+            ingress_queue_depth=int(snapshot.get("ingress_queue_depth", 0) or 0),
+            ingress_queue_limit=int(snapshot.get("ingress_queue_limit", 1) or 1),
+            cpu_queue_depth=int(snapshot.get("cpu_queue_depth", 0) or 0),
+            cpu_queue_limit=int(snapshot.get("cpu_queue_limit", 1) or 1),
+            cpu_completed_rate=float(telemetry["cpu_completed_rate"] or 0.0),
+            timeout_ratio=float(telemetry["timeout_ratio"] or 0.0),
+            fd_ratio=float(telemetry["fd_ratio"] or 0.0),
+            ram_usage_ratio=float(telemetry["ram_usage_ratio"] or 0.0),
+            step=int(ctx["stage1_ramp_step"]),
         )
-        if healthy and ctx["fetch_limiter"].limit < int(ctx["fetch_concurrency_max"]):
-            previous_limit = ctx["fetch_limiter"].limit
-            await ctx["fetch_limiter"].set_limit(
-                min(int(ctx["fetch_concurrency_max"]), ctx["fetch_limiter"].limit + int(ctx["stage1_ramp_step"]))
-            )
-            _hash_logger.info(
-                "Stage1 fetch ramp up | limit %d -> %d | timeout_ratio=%.3f | queue_pressure=%.3f | fd_ratio=%.3f | ram_ratio=%.3f",
-                previous_limit,
-                ctx["fetch_limiter"].limit,
-                float(telemetry["timeout_ratio"] or 0.0),
-                float(telemetry["queue_pressure_ratio"] or 0.0),
-                float(telemetry["fd_ratio"] or 0.0),
-                float(telemetry["ram_usage_ratio"] or 0.0),
-            )
-            bad_windows = 0
+        telemetry["cpu_backlog_s"] = float(decision.get("cpu_backlog_s", 0.0) or 0.0)
+        telemetry["cpu_queue_ratio"] = float(decision.get("cpu_queue_ratio", 0.0) or 0.0)
+        _update_stage1_queue_depth_sink(ctx, snapshot)
+        if int(decision["next_limit"]) == int(ctx["fetch_limiter"].limit):
             continue
 
-        bad_window = (
-            float(telemetry["timeout_ratio"] or 0.0) >= 0.35
-            or float(telemetry["fd_ratio"] or 0.0) >= 0.70
-            or float(telemetry["ram_usage_ratio"] or 0.0) >= 0.75
-            or any(ratio >= 0.75 for ratio in queue_ratios)
-        )
-        if not bad_window:
-            bad_windows = 0
-            continue
-        bad_windows += 1
-        if bad_windows < 2 or ctx["fetch_limiter"].limit <= int(ctx["stage1_floor_limit"]):
-            continue
         previous_limit = ctx["fetch_limiter"].limit
-        await ctx["fetch_limiter"].set_limit(
-            max(int(ctx["stage1_floor_limit"]), ctx["fetch_limiter"].limit - int(ctx["stage1_ramp_step"]))
-        )
+        await ctx["fetch_limiter"].set_limit(int(decision["next_limit"]))
         _hash_logger.info(
-            "Stage1 fetch downshift | limit %d -> %d | timeout_ratio=%.3f | queue_pressure=%.3f | fd_ratio=%.3f | ram_ratio=%.3f",
+            "Stage1 fetch %s | limit %d -> %d | cpu_backlog_s=%.2f | cpu_queue_ratio=%.3f | ingress_ratio=%.3f | timeout_ratio=%.3f | fd_ratio=%.3f | ram_ratio=%.3f",
+            str(decision.get("action", "hold") or "hold"),
             previous_limit,
             ctx["fetch_limiter"].limit,
+            float(decision.get("cpu_backlog_s", 0.0) or 0.0),
+            float(decision.get("cpu_queue_ratio", 0.0) or 0.0),
+            float(decision.get("ingress_ratio", 0.0) or 0.0),
             float(telemetry["timeout_ratio"] or 0.0),
-            float(telemetry["queue_pressure_ratio"] or 0.0),
             float(telemetry["fd_ratio"] or 0.0),
             float(telemetry["ram_usage_ratio"] or 0.0),
         )
-        bad_windows = 0
 
 
 async def _stage1_fetch_worker(worker_index: int, client: httpx.AsyncClient, ctx: dict[str, Any]) -> None:
     worker_id = f"stage1-fetch-{worker_index}"
     while True:
-        item = await _stage1_ingress_get(ctx)
-        if item is None:
-            break
-        raw_url = str(item.get("raw_url", "") or "")
-        normalized_url = str(item.get("normalized_url", "") or normalize_url(raw_url))
-        source_workbook = str(item.get("source_workbook", "") or ctx["source_workbook_map"].get(normalized_url, ""))
-        stage_started_at = utc_now_iso()
-        started_monotonic = time.perf_counter()
-        ctx["active_workers"][worker_id] = normalized_url
+        item = None
+        normalized_url = ""
+        fetch_acquired = False
         try:
-            retry_count = 0
-            timeout_hit = False
             try:
-                fetch_payload, retry_count, timeout_hit = await async_with_timeout_and_retry(
-                    lambda: fetch_stage1_http_artifacts(
-                        raw_url,
-                        client,
-                        config=ctx["stage1_http_config"],
-                        concurrency_controls=ctx["concurrency_controls"],
-                        fetch_limiter=ctx["fetch_limiter"],
-                        per_host_limiter=ctx["per_host_limiter"],
-                    ),
-                    timeout=18.0,
-                    max_retries=0,
+                item = await _stage1_ingress_get(ctx)
+                if item is None:
+                    break
+                raw_url = str(item.get("raw_url", "") or "")
+                normalized_url = str(item.get("normalized_url", "") or normalize_url(raw_url))
+                source_workbook = str(
+                    item.get("source_workbook", "") or ctx["source_workbook_map"].get(normalized_url, "")
                 )
-                result = dict(fetch_payload.get("result") or _default_stage1_result(raw_url))
-            except Exception as exc:
-                error = normalize_exception(exc)
-                timeout_hit = _stage1_timeout_flag_from_message(error["error_message"])
-                fetch_payload = {
-                    "result": _build_stage1_failed_result(
-                        raw_url,
-                        normalized_url=normalized_url,
-                        error_type=error["error_type"],
-                        error_message=error["error_message"],
-                        timeout_hit=timeout_hit,
-                    ),
-                    "html_bytes": b"",
-                    "response_encoding": None,
-                }
-                result = dict(fetch_payload["result"])
-            result["stage1_retry_count"] = retry_count
-            result["stage1_timeout_hit"] = bool(
-                result.get("stage1_timeout_hit", False)
-                or timeout_hit
-                or _stage1_timeout_flag_from_message(
-                    result.get("stage1_error_message", ""),
-                    result.get("fetch_error_detail", ""),
+                dequeue_monotonic = time.perf_counter()
+                ingress_enqueued_monotonic = float(
+                    item.get("ingress_enqueued_monotonic", dequeue_monotonic) or dequeue_monotonic
                 )
-            )
-            await ctx["parse_queue"].put(
-                {
-                    "record": {
-                        "raw_url": raw_url,
-                        "normalized_url": normalized_url,
-                        "source_workbook": source_workbook,
-                        "stage_started_at": stage_started_at,
-                        "started_monotonic": started_monotonic,
-                    },
-                    "result": result,
-                    "html_bytes": fetch_payload.get("html_bytes") or b"",
-                    "response_encoding": fetch_payload.get("response_encoding"),
-                }
-            )
+                await ctx["fetch_limiter"].acquire()
+                fetch_acquired = True
+                stage_started_at = utc_now_iso()
+                started_monotonic = time.perf_counter()
+                ctx["lane_counters"]["fetch_started"] += 1
+                ctx["lane_counters"]["ingress_wait_s"] += max(0.0, started_monotonic - ingress_enqueued_monotonic)
+                ctx["active_workers"][worker_id] = normalized_url
+
+                retry_count = 0
+                timeout_hit = False
+                try:
+                    fetch_payload, retry_count, timeout_hit = await async_with_timeout_and_retry(
+                        lambda: fetch_stage1_http_artifacts(
+                            raw_url,
+                            client,
+                            config=ctx["stage1_http_config"],
+                            concurrency_controls=ctx["concurrency_controls"],
+                            fetch_limiter=None,
+                            per_host_limiter=ctx["per_host_limiter"],
+                        ),
+                        timeout=18.0,
+                        max_retries=0,
+                    )
+                    result = dict(fetch_payload.get("result") or _default_stage1_result(raw_url))
+                except Exception as exc:
+                    error = normalize_exception(exc)
+                    timeout_hit = _stage1_timeout_flag_from_message(error["error_message"])
+                    fetch_payload = {
+                        "result": _build_stage1_failed_result(
+                            raw_url,
+                            normalized_url=normalized_url,
+                            error_type=error["error_type"],
+                            error_message=error["error_message"],
+                            timeout_hit=timeout_hit,
+                        ),
+                        "html_bytes": b"",
+                        "response_encoding": None,
+                    }
+                    result = dict(fetch_payload["result"])
+                result["stage1_retry_count"] = retry_count
+                result["stage1_timeout_hit"] = bool(
+                    result.get("stage1_timeout_hit", False)
+                    or timeout_hit
+                    or _stage1_timeout_flag_from_message(
+                        result.get("stage1_error_message", ""),
+                        result.get("fetch_error_detail", ""),
+                    )
+                )
+                ctx["lane_counters"]["fetch_completed"] += 1
+                await ctx["parse_queue"].put(
+                    {
+                        "record": {
+                            "raw_url": raw_url,
+                            "normalized_url": normalized_url,
+                            "source_workbook": source_workbook,
+                            "stage_started_at": stage_started_at,
+                            "started_monotonic": started_monotonic,
+                        },
+                        "result": result,
+                        "html_bytes": fetch_payload.get("html_bytes") or b"",
+                        "response_encoding": fetch_payload.get("response_encoding"),
+                        "parse_enqueued_monotonic": time.perf_counter(),
+                    }
+                )
+            finally:
+                ctx["active_workers"].pop(worker_id, None)
+                if item is not None:
+                    ctx["ingress_queue"].task_done()
         finally:
-            ctx["active_workers"].pop(worker_id, None)
-            ctx["ingress_queue"].task_done()
+            if fetch_acquired:
+                await ctx["fetch_limiter"].release()
 
 
 async def _stage1_parse_worker(worker_index: int, ctx: dict[str, Any]) -> None:
@@ -7283,15 +7801,28 @@ async def _stage1_parse_worker(worker_index: int, ctx: dict[str, Any]) -> None:
         ctx["active_workers"][worker_id] = normalized_url
         try:
             try:
+                parse_enqueued_monotonic = float(
+                    item.get("parse_enqueued_monotonic", time.perf_counter()) or time.perf_counter()
+                )
+                ctx["lane_counters"]["cpu_wait_s"] += max(0.0, time.perf_counter() - parse_enqueued_monotonic)
                 item["result"] = await loop.run_in_executor(
-                    ctx["parse_executor"],
-                    _stage1_parse_payload_sync,
+                    ctx["cpu_executor"],
+                    _stage1_cpu_pass_sync,
                     item.get("result") or {},
                     item.get("html_bytes") or b"",
                     item.get("response_encoding"),
-                    ctx["stage1_http_config"],
+                    False,
                 )
-                await ctx["score_queue"].put(item)
+                ctx["lane_counters"]["cpu_completed"] += 1
+                item.pop("html_bytes", None)
+                item.pop("response_encoding", None)
+                item.pop("parse_enqueued_monotonic", None)
+                if should_enrich_stage1_result(item["result"], config=ctx["stage1_http_config"]):
+                    await ctx["enrich_queue"].put(item)
+                else:
+                    await ctx["result_queue"].put(
+                        {"record": item.get("record") or {}, "result": item.get("result") or {}}
+                    )
             except Exception as exc:
                 error = normalize_exception(exc)
                 record = item.get("record") or {}
@@ -7324,18 +7855,23 @@ async def _stage1_score_worker(worker_index: int, ctx: dict[str, Any]) -> None:
         ctx["active_workers"][worker_id] = normalized_url
         try:
             try:
-                item["result"] = await loop.run_in_executor(
-                    ctx["parse_executor"],
-                    _stage1_score_payload_sync,
-                    item.get("result") or {},
-                    ctx["entity_context"],
-                    ctx["ordered_entities"],
-                    ctx["stage1_http_config"],
+                score_enqueued_monotonic = float(
+                    item.get("score_enqueued_monotonic", time.perf_counter()) or time.perf_counter()
                 )
-                if should_enrich_stage1_result(item["result"], config=ctx["stage1_http_config"]):
-                    await ctx["enrich_queue"].put(item)
-                else:
-                    await ctx["result_queue"].put({"record": item.get("record") or {}, "result": item.get("result") or {}})
+                ctx["lane_counters"]["cpu_wait_s"] += max(0.0, time.perf_counter() - score_enqueued_monotonic)
+                item["result"] = await loop.run_in_executor(
+                    ctx["cpu_executor"],
+                    _stage1_cpu_pass_sync,
+                    item.get("result") or {},
+                    b"",
+                    None,
+                    True,
+                )
+                ctx["lane_counters"]["cpu_completed"] += 1
+                item.pop("score_enqueued_monotonic", None)
+                await ctx["result_queue"].put(
+                    {"record": item.get("record") or {}, "result": item.get("result") or {}}
+                )
             except Exception as exc:
                 error = normalize_exception(exc)
                 record = item.get("record") or {}
@@ -7358,7 +7894,6 @@ async def _stage1_score_worker(worker_index: int, ctx: dict[str, Any]) -> None:
 
 async def _stage1_enrich_worker(worker_index: int, client: httpx.AsyncClient, ctx: dict[str, Any]) -> None:
     worker_id = f"stage1-enrich-{worker_index}"
-    loop = asyncio.get_running_loop()
     while True:
         item = await ctx["enrich_queue"].get()
         if item is None:
@@ -7376,15 +7911,14 @@ async def _stage1_enrich_worker(worker_index: int, client: httpx.AsyncClient, ct
                     concurrency_controls=ctx["concurrency_controls"],
                     dns_prefetch=ctx["dns_prefetch_map"].get(normalized_url, {}),
                 )
-                item["result"] = await loop.run_in_executor(
-                    ctx["parse_executor"],
-                    _stage1_score_payload_sync,
-                    enriched,
-                    ctx["entity_context"],
-                    ctx["ordered_entities"],
-                    ctx["stage1_http_config"],
+                ctx["lane_counters"]["enrich_completed"] += 1
+                await ctx["score_queue"].put(
+                    {
+                        "record": record,
+                        "result": enriched,
+                        "score_enqueued_monotonic": time.perf_counter(),
+                    }
                 )
-                await ctx["result_queue"].put({"record": record, "result": item.get("result") or {}})
             except Exception as exc:
                 error = normalize_exception(exc)
                 await ctx["result_queue"].put(
@@ -7479,7 +8013,7 @@ async def _stage1_finalize_worker(ctx: dict[str, Any]) -> None:
                 if ctx.get("admitted_urls") is not None:
                     ctx["admitted_urls"].append(raw_url)
                 if ctx.get("on_admit") is not None:
-                    await _await_maybe(ctx["on_admit"](raw_url, normalized_url, final_analysis))
+                    await _await_maybe(ctx["on_admit"](raw_url, normalized_url, final_analysis, source_workbook))
 
             _upsert_shortlist_checkpoint(
                 run_context=ctx.get("run_context"),
@@ -7553,7 +8087,7 @@ async def _run_stage1_http_pipeline(
     checkpoint_store: CheckpointStore | None = None,
     queue_depth_sink: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    stage1_http_config = dict(stage1_http_config or STAGE1_HTTP_CONFIG)
+    stage1_http_config = resolve_stage1_http_config(stage1_http_config or STAGE1_HTTP_CONFIG)
     scoring_config = dict(scoring_config or _DEFAULT_SCORING_CONFIG)
     source_workbook_map = dict(source_workbook_map or {})
     dns_prefetch_map = dict(dns_prefetch_map or {})
@@ -7567,6 +8101,19 @@ async def _run_stage1_http_pipeline(
     fetch_concurrency_max = max(
         fetch_concurrency_start,
         int(stage1_http_config.get("stage1_fetch_concurrency_max", fetch_concurrency_start)),
+    )
+    cpu_worker_count = max(
+        1,
+        int(stage1_http_config.get("stage1_cpu_workers", stage1_http_config.get("stage1_parse_workers", 4)) or 4),
+    )
+    stage1_http_config["stage1_cpu_workers"] = cpu_worker_count
+    stage1_http_config["stage1_parse_workers"] = cpu_worker_count
+    score_worker_count = max(
+        1,
+        min(
+            cpu_worker_count,
+            int(stage1_http_config.get("stage1_score_workers", max(1, cpu_worker_count // 4)) or max(1, cpu_worker_count // 4)),
+        ),
     )
     stage1_http_config["http_concurrency"] = max(
         1,
@@ -7590,15 +8137,18 @@ async def _run_stage1_http_pipeline(
         int(stage1_http_config.get("stage1_enrich_tls_concurrency", stage1_http_config.get("tls_concurrency", 32))),
     )
 
-    parse_worker_count = max(1, int(stage1_http_config.get("stage1_parse_workers", 4) or 4))
-    score_worker_count = parse_worker_count
     enrich_worker_count = min(
         fetch_concurrency_max,
-        max(parse_worker_count, int(stage1_http_config.get("stage1_enrich_tls_concurrency", 32) or 32) * 2),
+        max(8, int(stage1_http_config.get("stage1_enrich_tls_concurrency", 32) or 32)),
     )
-    stage1_floor_limit = 512 if fetch_concurrency_max >= 1024 else fetch_concurrency_start
-    stage1_floor_limit = max(1, min(fetch_concurrency_start, stage1_floor_limit))
-    stage1_ramp_step = 128 if fetch_concurrency_max >= 1024 else 64
+    stage1_floor_limit = max(
+        1,
+        min(
+            fetch_concurrency_start,
+            int(stage1_http_config.get("stage1_fetch_concurrency_floor", min(fetch_concurrency_start, 64)) or min(fetch_concurrency_start, 64)),
+        ),
+    )
+    stage1_ramp_step = 32
     entity_context, ordered_entities = get_stage1_entity_context()
     concurrency_controls = build_stage1_concurrency_controls(stage1_http_config)
     http_concurrency = max(1, int(stage1_http_config.get("http_concurrency", fetch_concurrency_max)))
@@ -7616,6 +8166,12 @@ async def _run_stage1_http_pipeline(
     timeout = httpx.Timeout(
         stage1_http_config["get_timeout"],
         connect=stage1_http_config["connect_timeout"],
+    )
+    cpu_executor, cpu_executor_kind = _create_stage1_cpu_executor(
+        cpu_worker_count,
+        entity_context,
+        ordered_entities,
+        stage1_http_config,
     )
 
     ctx = {
@@ -7657,7 +8213,21 @@ async def _run_stage1_http_pipeline(
             "fd_ratio": 0.0,
             "ram_usage_ratio": 0.0,
             "timeout_ratio": 0.0,
+            "cpu_backlog_s": 0.0,
+            "cpu_queue_ratio": 0.0,
+            "cpu_completed_rate": 0.0,
+            "fetch_started_rate": 0.0,
+            "fetch_completed_rate": 0.0,
+            "enrich_completed_rate": 0.0,
             "queue_pressure_ratio": 0.0,
+        },
+        "lane_counters": {
+            "fetch_started": 0,
+            "fetch_completed": 0,
+            "cpu_completed": 0,
+            "enrich_completed": 0,
+            "ingress_wait_s": 0.0,
+            "cpu_wait_s": 0.0,
         },
         "stage1_started_monotonic": time.perf_counter(),
         "pipeline_done_event": asyncio.Event(),
@@ -7665,7 +8235,8 @@ async def _run_stage1_http_pipeline(
         "score_queue": asyncio.Queue(maxsize=max(1, int(stage1_http_config.get("stage1_score_queue_max", 2000) or 2000))),
         "enrich_queue": asyncio.Queue(maxsize=max(1, int(stage1_http_config.get("stage1_enrich_queue_max", 2000) or 2000))),
         "result_queue": asyncio.Queue(maxsize=max(1, int(stage1_http_config.get("stage1_result_queue_max", 2000) or 2000))),
-        "parse_executor": ThreadPoolExecutor(max_workers=parse_worker_count),
+        "cpu_executor": cpu_executor,
+        "cpu_executor_kind": cpu_executor_kind,
         "progress_bar": None,
     }
 
@@ -7677,15 +8248,17 @@ async def _run_stage1_http_pipeline(
         headers={"User-Agent": "Mozilla/5.0 (compatible; stage1-router/1.0)"},
     ) as client:
         _hash_logger.info(
-            "Stage1 fast-path runtime | fetch_concurrency=%d..%d | http_limit=%d | keepalive_limit=%d | per_host_limit=%d | parse_workers=%d | score_workers=%d | enrich_workers=%d | dns_reuse=%s",
+            "Stage1 fast-path runtime | fetch_concurrency=%d..%d | fetch_floor=%d | http_limit=%d | keepalive_limit=%d | per_host_limit=%d | cpu_workers=%d | score_workers=%d | enrich_workers=%d | cpu_executor=%s | dns_reuse=%s",
             fetch_concurrency_start,
             fetch_concurrency_max,
+            stage1_floor_limit,
             http_concurrency,
             keepalive_concurrency,
             int(stage1_http_config.get("stage1_per_host_limit", 4) or 4),
-            parse_worker_count,
+            cpu_worker_count,
             score_worker_count,
             enrich_worker_count,
+            cpu_executor_kind,
             True,
         )
         try:
@@ -7704,21 +8277,21 @@ async def _run_stage1_http_pipeline(
         progress_task = asyncio.create_task(_stage1_progress_monitor(ctx))
         ramp_task = asyncio.create_task(_stage1_ramp_monitor(ctx))
         fetch_tasks = [asyncio.create_task(_stage1_fetch_worker(index, client, ctx)) for index in range(fetch_concurrency_max)]
-        parse_tasks = [asyncio.create_task(_stage1_parse_worker(index, ctx)) for index in range(parse_worker_count)]
+        parse_tasks = [asyncio.create_task(_stage1_parse_worker(index, ctx)) for index in range(cpu_worker_count)]
         score_tasks = [asyncio.create_task(_stage1_score_worker(index, ctx)) for index in range(score_worker_count)]
         enrich_tasks = [asyncio.create_task(_stage1_enrich_worker(index, client, ctx)) for index in range(enrich_worker_count)]
         finalize_task = asyncio.create_task(_stage1_finalize_worker(ctx))
         try:
             await asyncio.gather(*fetch_tasks)
-            for _ in range(parse_worker_count):
+            for _ in range(cpu_worker_count):
                 await ctx["parse_queue"].put(None)
             await asyncio.gather(*parse_tasks)
-            for _ in range(score_worker_count):
-                await ctx["score_queue"].put(None)
-            await asyncio.gather(*score_tasks)
             for _ in range(enrich_worker_count):
                 await ctx["enrich_queue"].put(None)
             await asyncio.gather(*enrich_tasks)
+            for _ in range(score_worker_count):
+                await ctx["score_queue"].put(None)
+            await asyncio.gather(*score_tasks)
             await ctx["result_queue"].put(None)
             await finalize_task
         finally:
@@ -7733,7 +8306,7 @@ async def _run_stage1_http_pipeline(
                 if progress.completed > ctx["progress_bar"].n:
                     ctx["progress_bar"].update(progress.completed - ctx["progress_bar"].n)
                 ctx["progress_bar"].close()
-            ctx["parse_executor"].shutdown(wait=True, cancel_futures=True)
+            ctx["cpu_executor"].shutdown(wait=True, cancel_futures=True)
 
     elapsed_s = max(0.001, time.perf_counter() - float(ctx["stage1_started_monotonic"]))
     final_snapshot = _stage1_queue_pressure_snapshot(
@@ -7785,6 +8358,7 @@ async def _analyze_stage1_http_candidates_pipelined(
                 "raw_url": raw_url,
                 "normalized_url": normalized_url,
                 "source_workbook": source_workbook_map.get(normalized_url, ""),
+                "ingress_enqueued_monotonic": time.perf_counter(),
             }
         )
     progress = ProgressTracker(total=len(urls))
@@ -7848,10 +8422,12 @@ async def _run_hashing_shortlist_streaming_concurrent(
         stage0_progress_bar = None
 
     t0 = time.perf_counter()
-    metrics["hash_execution_mode"] = "legacy_shards"
-    url_queue = asyncio.Queue(maxsize=max(1024, HASH_RENDER_QUEUE_MAX))
+    metrics["hash_execution_mode"] = "browser_nodes"
+    render_queue = asyncio.Queue(maxsize=max(1024, HASH_RENDER_QUEUE_MAX))
+    aux_queue = asyncio.Queue(maxsize=max(1, HASH_RESULT_QUEUE_MAX))
     gpu_queue = asyncio.Queue(maxsize=GPU_QUEUE_MAXSIZE)
     active_fetch_limiter = _AdaptiveFetchLimiter(ACTIVE_FETCH_LIMIT_INITIAL)
+    host_limiter = _PerHostLimiter(HASH_PER_HOST_LIMIT)
     results = []
     review_results = []
     prefetch_admitted_failures = []
@@ -7869,6 +8445,12 @@ async def _run_hashing_shortlist_streaming_concurrent(
     stage1_queue_depth_sink: dict[str, Any] = {}
     stage1_progress = ProgressTracker(total=0)
     stage1_task = None
+    active_hash_workers: dict[str, str] = {}
+    hash_worker_states: dict[str, dict[str, Any]] = {}
+    hash_worker_tasks: dict[str, asyncio.Task] = {}
+    node_tasks: list[asyncio.Task] = []
+    aux_tasks: list[asyncio.Task] = []
+    aux_worker_count = 0
 
     connector = aiohttp.TCPConnector(limit=_AIOHTTP_CONNECTOR_LIMIT, ttl_dns_cache=300) if _has_aiohttp else None
     aio_session = aiohttp.ClientSession(connector=connector) if _has_aiohttp else None
@@ -7885,9 +8467,37 @@ async def _run_hashing_shortlist_streaming_concurrent(
     except Exception:
         hash_progress_bar = None
 
-    async def _admit_to_hash(raw_url: str, normalized_url: str, stage1_analysis: dict[str, Any]) -> None:
+    async def _admit_to_hash(
+        raw_url: str,
+        normalized_url: str,
+        stage1_analysis: dict[str, Any],
+        source_workbook: str = "",
+    ) -> None:
         hash_progress.add_total(1)
-        await url_queue.put(raw_url)
+        resolved_source_workbook = str(
+            source_workbook
+            or stage1_analysis.get("source_workbook", "")
+            or source_workbook_map.get(normalized_url, "")
+            or prefetch_metrics_map.get(normalized_url, {}).get("source_workbook", "")
+        )
+        _append_hash_stage_event(
+            run_context=run_context,
+            checkpoint_store=checkpoint_store,
+            raw_url=raw_url,
+            normalized_url=normalized_url,
+            source_workbook=resolved_source_workbook,
+            worker_id="hash-admit",
+            status="admitted",
+        )
+        await render_queue.put(
+            {
+                "url": raw_url,
+                "normalized_url": normalized_url,
+                "source_workbook": resolved_source_workbook,
+                "prefetch_metrics": dict(prefetch_metrics_map.get(normalized_url, {}) or {}),
+                "stage1_analysis": dict(stage1_analysis or {}),
+            }
+        )
 
     async def _hash_monitor():
         nonlocal hash_last_log, hash_last_processed, hash_last_window_processed
@@ -7896,9 +8506,19 @@ async def _run_hashing_shortlist_streaming_concurrent(
         while not hash_shutdown_event.is_set():
             await asyncio.sleep(0.5)
             now = time.perf_counter()
+            worker_summary = _summarize_hash_worker_states(hash_worker_states)
+            resource_snapshot = _get_hash_runtime_resource_snapshot()
+            metrics["fd_count"] = int(resource_snapshot.get("fd_count", 0) or 0)
+            metrics["fd_limit"] = int(resource_snapshot.get("fd_limit", 0) or 0)
+            metrics["fd_usage_ratio"] = float(resource_snapshot.get("fd_usage_ratio", 0.0) or 0.0)
+            metrics["ram_usage_ratio"] = float(resource_snapshot.get("ram_usage_ratio", 0.0) or 0.0)
+            metrics["render_queue_depth"] = render_queue.qsize()
+            metrics["aux_queue_depth"] = aux_queue.qsize()
             metrics["gpu_queue_depth"] = gpu_queue.qsize()
             metrics["active_fetch_limit"] = active_fetch_limiter.limit
             metrics["stage_elapsed_s"] = now - t0
+            metrics["worker_nodes_alive"] = sum(1 for task in node_tasks if not task.done())
+            metrics["live_page_workers"] = int(worker_summary.get("live_page_workers", 0) or 0)
             current = metrics["processed"]
             total = hash_progress.total
             if hash_progress_bar is not None:
@@ -7956,24 +8576,50 @@ async def _run_hashing_shortlist_streaming_concurrent(
 
     loop = asyncio.get_running_loop()
     _install_asyncio_exception_logging(loop)
-    shard_tasks = [
+    node_tasks = [
         asyncio.create_task(
-            _run_browser_shard(
-                i,
-                url_queue,
-                gpu_queue,
-                metrics,
-                decision_rows,
-                prefetch_metrics_map,
-                stage1_analysis_map,
-                prefetch_admitted_failures,
-                active_fetch_limiter,
-                aio_session,
-                scoring_config,
+            _run_hash_browser_node(
+                node_id=i,
+                render_queue=render_queue,
+                aux_queue=aux_queue,
+                metrics=metrics,
+                decision_rows=decision_rows,
+                prefetch_admitted_failures=prefetch_admitted_failures,
+                prefetch_metrics_map=prefetch_metrics_map,
+                stage1_analysis_map=stage1_analysis_map,
+                active_fetch_limiter=active_fetch_limiter,
+                host_limiter=host_limiter,
                 hash_progress=hash_progress,
+                scoring_config=scoring_config,
+                active_workers=active_hash_workers,
+                worker_states=hash_worker_states,
+                worker_tasks=hash_worker_tasks,
+                run_context=run_context,
+                checkpoint_store=checkpoint_store,
             )
         )
         for i in range(BROWSER_SHARDS)
+    ]
+    aux_worker_count = max(1, min(AUX_NET_CONCURRENCY_LIMIT, HASH_RENDER_WORKER_COUNT))
+    aux_tasks = [
+        asyncio.create_task(
+            _run_hash_aux_worker(
+                worker_id=f"hash-aux-{index}",
+                aux_queue=aux_queue,
+                gpu_queue=gpu_queue,
+                metrics=metrics,
+                decision_rows=decision_rows,
+                prefetch_admitted_failures=prefetch_admitted_failures,
+                active_fetch_limiter=active_fetch_limiter,
+                aio_session=aio_session,
+                hash_progress=hash_progress,
+                scoring_config=scoring_config,
+                active_workers=active_hash_workers,
+                run_context=run_context,
+                checkpoint_store=checkpoint_store,
+            )
+        )
+        for index in range(aux_worker_count)
     ]
     scorer_task = asyncio.create_task(
         _gpu_microbatch_scorer(
@@ -7985,6 +8631,8 @@ async def _run_hashing_shortlist_streaming_concurrent(
             threshold,
             scoring_config,
             hash_progress=hash_progress,
+            run_context=run_context,
+            checkpoint_store=checkpoint_store,
         )
     )
     hash_monitor_task = asyncio.create_task(_hash_monitor())
@@ -8005,6 +8653,16 @@ async def _run_hashing_shortlist_streaming_concurrent(
             )
             if is_completed:
                 stage0_skipped += 1
+                _append_shortlist_stage_event_now(
+                    run_context=run_context,
+                    checkpoint_store=checkpoint_store,
+                    raw_url=raw_url,
+                    normalized_url=normalized_url,
+                    source_workbook=source_workbook,
+                    stage_name="stage0",
+                    worker_id="stage0-lexical",
+                    status="skipped",
+                )
                 if stage0_progress_bar is not None:
                     stage0_progress_bar.update(1)
                 continue
@@ -8015,6 +8673,14 @@ async def _run_hashing_shortlist_streaming_concurrent(
                 pending_metric_urls.append(normalized_url)
 
         stage1_ingress_queue = asyncio.Queue(maxsize=max(1, int(stage1_http_config.get("stage1_fetch_queue_max", 2000) or 2000)))
+
+        async def _wait_for_stage1_ingress_headroom() -> None:
+            ingress_limit = int(getattr(stage1_ingress_queue, "maxsize", 0) or 0)
+            if ingress_limit <= 0:
+                return
+            required_headroom = min(ingress_limit, max(1, int(LEXICAL_BATCH_SIZE)))
+            while (ingress_limit - stage1_ingress_queue.qsize()) < required_headroom:
+                await asyncio.sleep(0.05)
 
         async def _handle_stage0_batch(batch_urls, batch_results):
             nonlocal stage0_hits, stage0_misses
@@ -8028,7 +8694,7 @@ async def _run_hashing_shortlist_streaming_concurrent(
                         stage1_state = _build_lexical_stage1_state(prefetch_row)
                         stage1_analysis_map[normalized_url] = stage1_state
                         lexical_candidate_urls.append(raw_url)
-                        await _admit_to_hash(raw_url, normalized_url, stage1_state)
+                        await _admit_to_hash(raw_url, normalized_url, stage1_state, source_workbook)
                         _upsert_shortlist_checkpoint(
                             run_context=run_context,
                             checkpoint_store=checkpoint_store,
@@ -8039,6 +8705,16 @@ async def _run_hashing_shortlist_streaming_concurrent(
                             stage_status="lexical_hit",
                             current_stage="stage0",
                         )
+                        _append_shortlist_stage_event_now(
+                            run_context=run_context,
+                            checkpoint_store=checkpoint_store,
+                            raw_url=raw_url,
+                            normalized_url=normalized_url,
+                            source_workbook=source_workbook,
+                            stage_name="stage0",
+                            worker_id="stage0-lexical",
+                            status="lexical_hit",
+                        )
                     else:
                         stage0_misses += 1
                         lexical_miss_urls.append(raw_url)
@@ -8048,6 +8724,7 @@ async def _run_hashing_shortlist_streaming_concurrent(
                                 "raw_url": raw_url,
                                 "normalized_url": normalized_url,
                                 "source_workbook": source_workbook,
+                                "ingress_enqueued_monotonic": time.perf_counter(),
                             }
                         )
                         _upsert_shortlist_checkpoint(
@@ -8059,6 +8736,16 @@ async def _run_hashing_shortlist_streaming_concurrent(
                             stage_name="stage0",
                             stage_status="filtered_lexical_miss",
                             current_stage="stage0",
+                        )
+                        _append_shortlist_stage_event_now(
+                            run_context=run_context,
+                            checkpoint_store=checkpoint_store,
+                            raw_url=raw_url,
+                            normalized_url=normalized_url,
+                            source_workbook=source_workbook,
+                            stage_name="stage0",
+                            worker_id="stage0-lexical",
+                            status="filtered_lexical_miss",
                         )
 
         stage1_task = asyncio.create_task(
@@ -8088,6 +8775,7 @@ async def _run_hashing_shortlist_streaming_concurrent(
             progress_bar=stage0_progress_bar,
             skipped_count=stage0_skipped,
             on_batch_complete=_handle_stage0_batch,
+            submission_gate=_wait_for_stage1_ingress_headroom,
         )
         stage1_producer_done_event.set()
         stage1_summary = await stage1_task
@@ -8157,9 +8845,13 @@ async def _run_hashing_shortlist_streaming_concurrent(
             f"({stage0_hits} Stage0 lexical hits + {stage1_rescued_miss_count} Stage1 rescues)"
         )
 
-        for _ in range(BROWSER_SHARDS * SCRAPER_PAGE_CONCURRENCY):
-            await url_queue.put(None)
-        await asyncio.gather(*shard_tasks)
+        metrics["shutdown_sentinels_expected"] = BROWSER_SHARDS * HASH_PAGES_PER_NODE
+        for _ in range(BROWSER_SHARDS * HASH_PAGES_PER_NODE):
+            await render_queue.put(None)
+        await asyncio.gather(*node_tasks)
+        for _ in range(aux_worker_count):
+            await aux_queue.put(None)
+        await asyncio.gather(*aux_tasks)
         await gpu_queue.put(None)
         await scorer_task
         hash_shutdown_event.set()
@@ -8244,11 +8936,15 @@ async def _run_hashing_shortlist_streaming_concurrent(
         if not hash_shutdown_event.is_set():
             hash_shutdown_event.set()
         with suppress(Exception):
-            await asyncio.gather(*shard_tasks, return_exceptions=True)
+            await asyncio.gather(*node_tasks, return_exceptions=True)
         with suppress(Exception):
-            await asyncio.gather(scorer_task, return_exceptions=True)
-        with suppress(Exception):
-            await asyncio.gather(hash_monitor_task, return_exceptions=True)
+            await asyncio.gather(*aux_tasks, return_exceptions=True)
+        if scorer_task is not None:
+            with suppress(Exception):
+                await asyncio.gather(scorer_task, return_exceptions=True)
+        if hash_monitor_task is not None:
+            with suppress(Exception):
+                await asyncio.gather(hash_monitor_task, return_exceptions=True)
         if aio_session is not None:
             await aio_session.close()
         _close_hashing_log()
@@ -8420,19 +9116,22 @@ async def run_hashing_shortlist_streaming(
     _hash_logger.info("Hashing log file: %s", log_path)
     print(f"Hashing log: {log_path}")
 
-    return await _run_hashing_shortlist_streaming_concurrent(
-        input_urls=input_urls,
-        threshold=threshold,
-        scoring_config=scoring_config,
-        stage1_http_config=stage1_http_config,
-        source_workbook_map=source_workbook_map,
-        original_count=original_count,
-        metrics=metrics,
-        shortlist_debug_csv=shortlist_debug_csv,
-        run_context=run_context,
-        checkpoint_store=checkpoint_store,
-        completed_record_keys=completed_record_keys,
-    )
+    shortlist_execution_mode = _resolve_shortlist_execution_mode()
+    _hash_logger.info("Shortlist execution mode | mode=%s", shortlist_execution_mode)
+    if shortlist_execution_mode == "streaming-concurrent":
+        return await _run_hashing_shortlist_streaming_concurrent(
+            input_urls=input_urls,
+            threshold=threshold,
+            scoring_config=scoring_config,
+            stage1_http_config=stage1_http_config,
+            source_workbook_map=source_workbook_map,
+            original_count=original_count,
+            metrics=metrics,
+            shortlist_debug_csv=shortlist_debug_csv,
+            run_context=run_context,
+            checkpoint_store=checkpoint_store,
+            completed_record_keys=completed_record_keys,
+        )
 
     try:
         from tqdm import tqdm as tqdm_sync
@@ -8463,6 +9162,16 @@ async def run_hashing_shortlist_streaming(
         stage0_records.append((raw_url, normalized_url, source_workbook, is_completed))
         if is_completed:
             stage0_skipped += 1
+            _append_shortlist_stage_event_now(
+                run_context=run_context,
+                checkpoint_store=checkpoint_store,
+                raw_url=raw_url,
+                normalized_url=normalized_url,
+                source_workbook=source_workbook,
+                stage_name="stage0",
+                worker_id="stage0-lexical",
+                status="skipped",
+            )
             if stage0_progress_bar is not None:
                 stage0_progress_bar.update(1)
             continue
@@ -8515,6 +9224,16 @@ async def run_hashing_shortlist_streaming(
                 stage_status="lexical_hit",
                 current_stage="stage0",
             )
+            _append_shortlist_stage_event_now(
+                run_context=run_context,
+                checkpoint_store=checkpoint_store,
+                raw_url=raw_url,
+                normalized_url=normalized_url,
+                source_workbook=source_workbook,
+                stage_name="stage0",
+                worker_id="stage0-lexical",
+                status="lexical_hit",
+            )
         else:
             lexical_miss_urls.append(raw_url)
             stage0_misses += 1
@@ -8528,6 +9247,16 @@ async def run_hashing_shortlist_streaming(
                 stage_name="stage0",
                 stage_status="filtered_lexical_miss",
                 current_stage="stage0",
+            )
+            _append_shortlist_stage_event_now(
+                run_context=run_context,
+                checkpoint_store=checkpoint_store,
+                raw_url=raw_url,
+                normalized_url=normalized_url,
+                source_workbook=source_workbook,
+                stage_name="stage0",
+                worker_id="stage0-lexical",
+                status="filtered_lexical_miss",
             )
         stage0_processed += 1
 
@@ -8696,6 +9425,17 @@ async def run_hashing_shortlist_streaming(
         metrics["hash_execution_mode"] = "legacy_shards"
 
         for raw_url in shortlisted_urls:
+            normalized_url = normalize_url(raw_url)
+            source_workbook = str(source_workbook_map.get(normalized_url, "") or "")
+            _append_hash_stage_event(
+                run_context=run_context,
+                checkpoint_store=checkpoint_store,
+                raw_url=raw_url,
+                normalized_url=normalized_url,
+                source_workbook=source_workbook,
+                worker_id="hash-admit",
+                status="admitted",
+            )
             await url_queue.put(raw_url)
         for _ in range(BROWSER_SHARDS * SCRAPER_PAGE_CONCURRENCY):
             await url_queue.put(None)
@@ -8734,6 +9474,9 @@ async def run_hashing_shortlist_streaming(
                         active_fetch_limiter,
                         aio_session,
                         scoring_config,
+                        None,
+                        run_context,
+                        checkpoint_store,
                     )
                 )
                 for i in range(BROWSER_SHARDS)
@@ -8748,6 +9491,8 @@ async def run_hashing_shortlist_streaming(
                     threshold,
                     scoring_config,
                     None,
+                    run_context,
+                    checkpoint_store,
                 )
             )
             hash_watchdog = StageWatchdog(

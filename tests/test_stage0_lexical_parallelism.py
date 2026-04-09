@@ -118,6 +118,38 @@ class Stage0LexicalParallelismTests(unittest.TestCase):
                 actual_map[normalized_url],
             )
 
+    def test_stage0_thread_executor_keeps_prefetch_logic_unchanged(self):
+        normalized_urls = [comparison.normalize_url(url) for url in self.urls]
+        expected_map = {
+            normalized_url: comparison._compute_prefetch_lexical_state(url, self.scoring_config)
+            for url, normalized_url in zip(self.urls, normalized_urls)
+        }
+
+        with (
+            mock.patch.object(comparison, "_resolve_shortlist_cpu_executor_mode", return_value="thread"),
+            mock.patch.object(comparison, "ProcessPoolExecutor", side_effect=AssertionError("process pool should not be used")),
+            mock.patch.object(comparison, "LEXICAL_WORKERS", 2),
+            mock.patch.object(comparison, "LEXICAL_BATCH_SIZE", 2),
+            mock.patch.object(comparison, "LEXICAL_INFLIGHT_BATCHES", 2),
+            mock.patch.object(comparison, "LEXICAL_PROGRESS_INTERVAL_S", 60.0),
+        ):
+            actual_map, stats = comparison._compute_stage0_prefetch_metrics_parallel(
+                normalized_urls,
+                self.scoring_config,
+                original_count=len(normalized_urls),
+                metric_input_counts={url: 1 for url in normalized_urls},
+            )
+
+        self.assertEqual(stats["metric_urls_total"], len(normalized_urls))
+        self.assertEqual(stats["metric_urls_completed"], len(normalized_urls))
+        self.assertEqual(stats["batches_completed"], stats["batches_total"])
+
+        for normalized_url in normalized_urls:
+            self._assert_prefetch_state_equal(
+                expected_map[normalized_url],
+                actual_map[normalized_url],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

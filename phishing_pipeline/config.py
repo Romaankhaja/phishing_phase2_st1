@@ -62,18 +62,22 @@ STAGE1_HTTP_CONFIG = {
     "stage1_enable_tiered_fast_path": True,
     "stage1_fetch_concurrency_start": 200,
     "stage1_fetch_concurrency_max": 400,
+    "stage1_fetch_concurrency_floor": 64,
     "stage1_http_connection_limit": 400,
     "stage1_http_keepalive_limit": 200,
     "stage1_per_host_limit": 4,
+    "stage1_cpu_workers": 4,
     "stage1_parse_workers": 4,
     "stage1_enrich_dns_concurrency": 200,
     "stage1_enrich_rdap_concurrency": 10,
     "stage1_enrich_tls_concurrency": 32,
     "stage1_fetch_queue_max": 8000,
+    "stage1_cpu_queue_max": 4000,
     "stage1_parse_queue_max": 4000,
     "stage1_score_queue_max": 4000,
     "stage1_enrich_queue_max": 4000,
     "stage1_result_queue_max": 4000,
+    "stage1_control_interval_seconds": 2.0,
     "stage1_progress_log_interval_seconds": 10,
     "stage1_target_urls_per_sec": 500,
     "connect_timeout": 3.0,
@@ -125,6 +129,17 @@ def resolve_stage1_http_config(overrides: dict | None = None) -> dict:
         if value is None:
             continue
         config[key] = value
+    if config.get("stage1_cpu_workers") is None:
+        config["stage1_cpu_workers"] = int(config.get("stage1_parse_workers", 4) or 4)
+    if config.get("stage1_parse_workers") is None:
+        config["stage1_parse_workers"] = int(config.get("stage1_cpu_workers", 4) or 4)
+    if config.get("stage1_cpu_queue_max") is None:
+        parse_queue_max = int(config.get("stage1_parse_queue_max", 0) or 0)
+        score_queue_max = int(config.get("stage1_score_queue_max", 0) or 0)
+        config["stage1_cpu_queue_max"] = max(1, parse_queue_max, score_queue_max)
+    if config.get("stage1_fetch_concurrency_floor") is None:
+        fetch_start = int(config.get("stage1_fetch_concurrency_start", config.get("concurrency", 1)) or 1)
+        config["stage1_fetch_concurrency_floor"] = max(1, min(fetch_start, 64))
     return config
 
 
