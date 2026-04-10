@@ -241,6 +241,82 @@ class ReliabilityContractTests(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(ctx.latest_output_dir, "events", "stall_events.csv")))
             store.close()
 
+    def test_checkpoint_store_hot_path_updates_stay_buffered_until_export(self):
+        with self._tempdir() as temp_dir:
+            ctx = build_run_context(
+                output_dir=temp_dir,
+                run_id="test_run",
+                metadata={"shortlisting": "demo"},
+            )
+            store = CheckpointStore(ctx)
+            store.upsert_url_result(
+                stage_result_patch(
+                    run_id=ctx.run_id,
+                    raw_url="https://example.com",
+                    normalized_url="https://example.com",
+                    source_workbook="demo.xlsx",
+                    stage_name="stage0",
+                    stage_status="lexical_hit",
+                    current_stage="stage0",
+                )
+            )
+            store.append_stage_event(
+                {
+                    "run_id": ctx.run_id,
+                    "record_key": make_record_key("https://example.com", "demo.xlsx"),
+                    "source_workbook": "demo.xlsx",
+                    "normalized_url": "https://example.com",
+                    "stage_name": "stage0",
+                    "attempt_index": 1,
+                    "worker_id": "test-worker",
+                    "started_at": "2026-04-06T00:00:00+00:00",
+                    "finished_at": "2026-04-06T00:00:01+00:00",
+                    "duration_ms": 1000,
+                    "status": "lexical_hit",
+                    "error_type": "",
+                    "error_message": "",
+                    "retry_count": 0,
+                    "timeout_flag": 0,
+                    "fallback_taken": "",
+                }
+            )
+            store.update_worker_heartbeat(
+                stage_name="stage1",
+                worker_id="worker-1",
+                record_key="rk-1",
+                state="running",
+                task_kind="stage1_fetch",
+                item_age_s=2.0,
+                details={"url": "https://example.com"},
+            )
+            store.append_stage_metric(
+                {
+                    "label": "shortlist",
+                    "stage_name": "shortlist",
+                    "metric_kind": "snapshot",
+                    "counters": {"processed": 1},
+                    "gauges": {"pending": 1},
+                }
+            )
+
+            self.assertFalse(os.path.exists(ctx.run_results_csv))
+            self.assertFalse(os.path.exists(ctx.stage_events_csv))
+            self.assertFalse(os.path.exists(ctx.worker_heartbeats_csv))
+            self.assertFalse(os.path.exists(ctx.stage_metrics_csv))
+
+            backlog = store.snapshot_backlog()
+            self.assertGreaterEqual(backlog["pending_rows_total"], 1)
+            self.assertTrue(backlog["append_dirty"])
+            self.assertTrue(backlog["snapshot_dirty"])
+
+            store.export_all()
+
+            self.assertTrue(os.path.exists(ctx.run_results_csv))
+            self.assertTrue(os.path.exists(ctx.stage_events_csv))
+            self.assertTrue(os.path.exists(ctx.worker_heartbeats_csv))
+            self.assertTrue(os.path.exists(ctx.stage_metrics_csv))
+            store.close()
+
     def test_mark_completed_clears_stale_fatal_fields(self):
         with self._tempdir() as temp_dir:
             ctx = build_run_context(

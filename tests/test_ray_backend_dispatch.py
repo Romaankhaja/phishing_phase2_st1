@@ -151,14 +151,15 @@ class RayBackendDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config["hash_tabs_per_actor"], 1)
         self.assertEqual(config["classify_actors"], 1)
 
-    def test_auto_runtime_profile_resolves_server_throughput_for_large_host(self):
+    def test_auto_runtime_profile_resolves_server_balanced_for_large_host(self):
         settings = main_controller._resolve_runtime_profile_settings(
             "auto",
             resource_info={"cpu_cores": 48, "ram_gb": 250.0, "vram_gb": 80.0, "platform": "linux"},
         )
 
-        self.assertEqual("server-throughput", settings["resolved_profile"])
+        self.assertEqual("server-balanced", settings["resolved_profile"])
         self.assertEqual(10, settings["reliability"]["append_flush_interval_seconds"])
+        self.assertEqual("staged", settings["env"]["PHISHING_RAY_PREWARM_MODE"])
         self.assertEqual("true", settings["env"]["PHISHING_RAY_PREWARM_ACTORS"])
 
     def test_cpu_recall_alias_resolves_to_server_throughput(self):
@@ -187,25 +188,26 @@ class RayBackendDispatchTests(unittest.IsolatedAsyncioTestCase):
             config = resolve_ray_runtime_config()
 
         self.assertTrue(config["server_mode"])
-        self.assertEqual(config["stage0_batch_size"], 2048)
-        self.assertEqual(config["stage0_inflight"], 16)
-        self.assertEqual(config["stage1_fetch_actors"], 24)
-        self.assertEqual(config["stage1_enrich_actors"], 12)
-        self.assertEqual(config["hash_browser_actors"], 12)
-        self.assertEqual(config["hash_tabs_per_actor"], 4)
-        self.assertEqual(config["hash_finalize_batch"], 64)
-        self.assertEqual(config["classify_actors"], 16)
-        self.assertEqual(config["classify_inflight"], 64)
+        self.assertEqual(config["stage0_batch_size"], 1024)
+        self.assertEqual(config["stage0_inflight"], 4)
+        self.assertEqual(config["stage1_fetch_actors"], 12)
+        self.assertEqual(config["stage1_enrich_actors"], 6)
+        self.assertEqual(config["hash_browser_actors"], 8)
+        self.assertEqual(config["hash_tabs_per_actor"], 2)
+        self.assertEqual(config["hash_finalize_batch"], 32)
+        self.assertEqual(config["classify_actors"], 8)
+        self.assertEqual(config["classify_inflight"], 8)
         self.assertEqual(config["ocr_actors"], 1)
         self.assertEqual(config["ocr_batch_size"], 32)
         self.assertEqual(config["ocr_batch_delay_ms"], 25)
-        self.assertEqual(config["stage1_fetch_actor_max_concurrency"], 8)
-        self.assertEqual(config["stage1_enrich_actor_max_concurrency"], 6)
-        self.assertEqual(config["stage1_pending_cap"], 384)
-        self.assertEqual(config["hash_pending_cap"], 96)
-        self.assertEqual(config["stage1_http_connection_cap"], 1536)
-        self.assertEqual(config["stage1_http_keepalive_cap"], 768)
+        self.assertEqual(config["stage1_fetch_actor_max_concurrency"], 4)
+        self.assertEqual(config["stage1_enrich_actor_max_concurrency"], 2)
+        self.assertEqual(config["stage1_pending_cap"], 48)
+        self.assertEqual(config["hash_pending_cap"], 16)
+        self.assertEqual(config["stage1_http_connection_cap"], 192)
+        self.assertEqual(config["stage1_http_keepalive_cap"], 96)
         self.assertTrue(config["prewarm_actors"])
+        self.assertEqual(config["prewarm_mode"], "staged")
 
     def test_effective_detection_target_promotes_cross_domain_final_url(self):
         target = pipeline._resolve_effective_detection_target(

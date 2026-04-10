@@ -205,6 +205,7 @@ async def run_hashing_shortlist_with_ray_impl(
     stage1_enrich_actors: list[Any] = []
     hash_browser_actors: list[Any] = []
     prewarm_actors = bool(runtime_config.get("prewarm_actors", False))
+    prewarm_mode = str(runtime_config.get("prewarm_mode", "full") or "full").strip().lower()
     logger.info("Ray shortlist control actors created | checkpoint=%s", bool(checkpoint_actor))
 
     input_urls = list(url_list)
@@ -301,6 +302,23 @@ async def run_hashing_shortlist_with_ray_impl(
     hash_pending_cap = int(runtime_config.get("hash_pending_cap", max(1, int(runtime_config["hash_browser_actors"]))))
     stage1_fetch_actor_max_concurrency = int(runtime_config.get("stage1_fetch_actor_max_concurrency", 4) or 4)
     stage1_enrich_actor_max_concurrency = int(runtime_config.get("stage1_enrich_actor_max_concurrency", 4) or 4)
+    dynamic_control_enabled = bool(runtime_config.get("enable_dynamic_control", True))
+    target_cpu_utilization = float(runtime_config.get("target_cpu_utilization", 0.82) or 0.82)
+    cpu_headroom_cores = max(1, int(runtime_config.get("cpu_headroom_cores", 6) or 6))
+    severe_available_cpu_floor = max(1.0, float(max(1, cpu_headroom_cores - 2)))
+    healthy_available_cpu_floor = float(cpu_headroom_cores + 2)
+    control_interval_seconds = 2.0
+    stage0_inflight_floor = min(stage0_inflight, 4 if runtime_config.get("server_mode") and not runtime_config.get("low_memory_mode") else 1)
+    stage1_fetch_limit_cap = max(1, int(runtime_config["stage1_fetch_actors"]) * stage1_fetch_actor_max_concurrency)
+    stage1_fetch_limit_floor = min(
+        stage1_fetch_limit_cap,
+        24 if runtime_config.get("server_mode") and not runtime_config.get("low_memory_mode") else max(1, int(runtime_config["stage1_fetch_actors"])),
+    )
+    hash_active_pages_cap = max(1, int(runtime_config["hash_browser_actors"]) * int(runtime_config["hash_tabs_per_actor"]))
+    hash_active_pages_floor = min(
+        hash_active_pages_cap,
+        4 if runtime_config.get("server_mode") and not runtime_config.get("low_memory_mode") else max(1, int(runtime_config["hash_tabs_per_actor"])),
+    )
     pending: dict[Any, tuple[str, Any]] = {}
     stage1_backlog: deque[dict[str, Any]] = deque()
     hash_backlog: deque[tuple[str, str, str, str]] = deque()
@@ -320,6 +338,32 @@ async def run_hashing_shortlist_with_ray_impl(
     _debug_stall_warning_threshold = 6  # ~60s of consecutive empty waits
     _debug_last_stall_event = 0.0
     progress_stop = asyncio.Event()
+    controller_state: dict[str, Any] = {
+        "enabled": dynamic_control_enabled,
+        "stage0_live_inflight": stage0_inflight,
+        "stage0_inflight_floor": stage0_inflight_floor,
+        "stage0_inflight_cap": stage0_inflight,
+        "stage1_live_fetch_limit": min(stage1_fetch_limit_cap, max(stage1_fetch_limit_floor, stage1_pending_cap)),
+        "stage1_fetch_limit_floor": stage1_fetch_limit_floor,
+        "stage1_fetch_limit_cap": stage1_fetch_limit_cap,
+        "hash_live_active_pages": hash_active_pages_cap,
+        "hash_active_pages_floor": hash_active_pages_floor,
+        "hash_active_pages_cap": hash_active_pages_cap,
+        "action": "init",
+        "reason": "startup",
+        "available_cpu": 0.0,
+        "cpu_utilization": 0.0,
+        "event_loop_lag_ms": 0.0,
+        "checkpoint_pending_rows": 0,
+        "healthy_streak": 0,
+        "timeout_ratio": 0.0,
+        "stage1_pressure_ratio": 0.0,
+        "hash_pressure_ratio": 0.0,
+        "progress_completed": 0,
+        "target_cpu_utilization": target_cpu_utilization,
+        "cpu_headroom_cores": cpu_headroom_cores,
+    }
+    metrics["active_fetch_limit"] = int(controller_state["hash_live_active_pages"])
 
     def _should_capture_render_trace(artifact: dict[str, Any], render_payload: dict[str, Any] | None = None) -> bool:
         if capture_full_render_trace:
@@ -452,15 +496,17 @@ async def run_hashing_shortlist_with_ray_impl(
         if not prewarm_actors:
             return
         _ensure_stage1_fetch_actors()
-        _ensure_stage1_enrich_actors()
-        _ensure_hash_browser_actors()
         warm_refs = [actor.warm.remote() for actor in stage1_fetch_actors]
-        warm_refs.extend(actor.warm.remote() for actor in stage1_enrich_actors)
-        warm_refs.extend(actor.warm.remote() for actor in hash_browser_actors)
+        if prewarm_mode == "full":
+            _ensure_stage1_enrich_actors()
+            _ensure_hash_browser_actors()
+            warm_refs.extend(actor.warm.remote() for actor in stage1_enrich_actors)
+            warm_refs.extend(actor.warm.remote() for actor in hash_browser_actors)
         if not warm_refs:
             return
         logger.info(
-            "Ray shortlist prewarming actors | fetch=%d | enrich=%d | browser=%d",
+            "Ray shortlist prewarming actors | mode=%s | fetch=%d | enrich=%d | browser=%d",
+            prewarm_mode,
             len(stage1_fetch_actors),
             len(stage1_enrich_actors),
             len(hash_browser_actors),
@@ -523,6 +569,28 @@ async def run_hashing_shortlist_with_ray_impl(
             checkpoint_actor=checkpoint_actor,
             stage_name="shortlist",
             details_getter=lambda: {
+                "controller": {
+                    "enabled": bool(controller_state.get("enabled", False)),
+                    "stage0_live_inflight": int(controller_state.get("stage0_live_inflight", 0) or 0),
+                    "stage0_inflight_cap": int(controller_state.get("stage0_inflight_cap", 0) or 0),
+                    "stage1_live_fetch_limit": int(controller_state.get("stage1_live_fetch_limit", 0) or 0),
+                    "stage1_fetch_limit_cap": int(controller_state.get("stage1_fetch_limit_cap", 0) or 0),
+                    "hash_live_active_pages": int(controller_state.get("hash_live_active_pages", 0) or 0),
+                    "hash_active_pages_cap": int(controller_state.get("hash_active_pages_cap", 0) or 0),
+                    "available_cpu": float(controller_state.get("available_cpu", 0.0) or 0.0),
+                    "cpu_utilization": float(controller_state.get("cpu_utilization", 0.0) or 0.0),
+                    "event_loop_lag_ms": float(controller_state.get("event_loop_lag_ms", 0.0) or 0.0),
+                    "checkpoint_pending_rows": int(controller_state.get("checkpoint_pending_rows", 0) or 0),
+                    "action": str(controller_state.get("action", "") or ""),
+                    "reason": str(controller_state.get("reason", "") or ""),
+                    "healthy_streak": int(controller_state.get("healthy_streak", 0) or 0),
+                    "timeout_ratio": float(controller_state.get("timeout_ratio", 0.0) or 0.0),
+                    "stage1_pressure_ratio": float(controller_state.get("stage1_pressure_ratio", 0.0) or 0.0),
+                    "hash_pressure_ratio": float(controller_state.get("hash_pressure_ratio", 0.0) or 0.0),
+                    "completed": int(shortlist_progress.completed),
+                    "target_cpu_utilization": float(controller_state.get("target_cpu_utilization", 0.0) or 0.0),
+                    "cpu_headroom_cores": int(controller_state.get("cpu_headroom_cores", 0) or 0),
+                },
                 "stage0": {
                     "hits": stage0_hits,
                     "misses": stage0_misses,
@@ -621,10 +689,18 @@ async def run_hashing_shortlist_with_ray_impl(
         stage1_backlog.append(dict(record))
 
     async def _drain_backlogs() -> None:
-        while hash_backlog and _pending_count("hash_render", "hash_enrich", "hash_finalize") < hash_pending_cap:
+        while (
+            hash_backlog
+            and _pending_count("hash_render", "hash_enrich", "hash_finalize") < hash_pending_cap
+            and _pending_count("hash_render") < int(controller_state.get("hash_live_active_pages", hash_active_pages_cap) or hash_active_pages_cap)
+        ):
             raw_url, normalized_url, source_workbook, progress_key = hash_backlog.popleft()
             await _schedule_hash_admission(raw_url, normalized_url, source_workbook, progress_key)
-        while stage1_backlog and _pending_count("stage1_fetch", "stage1_parse", "stage1_enrich") < stage1_pending_cap:
+        while (
+            stage1_backlog
+            and _pending_count("stage1_fetch", "stage1_parse", "stage1_enrich") < stage1_pending_cap
+            and _pending_count("stage1_fetch") < int(controller_state.get("stage1_live_fetch_limit", stage1_fetch_limit_cap) or stage1_fetch_limit_cap)
+        ):
             await _schedule_stage1_fetch(stage1_backlog.popleft())
 
     async def _record_hash_fetch_outcome(payload_outcome: dict[str, Any], artifact: dict[str, Any] | None = None) -> None:
@@ -796,7 +872,7 @@ async def run_hashing_shortlist_with_ray_impl(
                 render_queue_depth=render_queue_depth,
                 aux_queue_depth=aux_queue_depth,
                 finalize_queue_depth=finalize_queue_depth,
-                active_hash_concurrency=int(runtime_config["hash_tabs_per_actor"]) * len(hash_browser_actors),
+                active_hash_concurrency=int(controller_state.get("hash_live_active_pages", 0) or 0),
                 match_count=int(metrics.get("final_matches_above_threshold", 0) or 0),
                 phase=str(metrics.get("phase", "running") or "running"),
             ),
@@ -816,6 +892,7 @@ async def run_hashing_shortlist_with_ray_impl(
 
     heartbeat_stop = asyncio.Event()
     heartbeat_workers: set[tuple[str, str]] = set()
+    controller_stop = asyncio.Event()
 
     async def _heartbeat_monitor() -> None:
         nonlocal heartbeat_workers
@@ -860,6 +937,137 @@ async def run_hashing_shortlist_with_ray_impl(
     progress_bar = progress_bar_ctx.__enter__()
     progress_task = asyncio.create_task(_progress_monitor(progress_bar)) if progress_bar is not None else None
     heartbeat_task = asyncio.create_task(_heartbeat_monitor()) if checkpoint_actor is not None else None
+
+    async def _control_monitor() -> None:
+        if not dynamic_control_enabled and checkpoint_actor is None:
+            return
+        last_tick = time.perf_counter()
+        last_checkpoint_flush = last_tick
+        last_completed = shortlist_progress.completed
+        last_timeout_count = int(stage1_progress.get("timeout", 0) or 0) + int(metrics.get("fetch_timed_out", 0) or 0)
+        while not controller_stop.is_set():
+            try:
+                await asyncio.wait_for(controller_stop.wait(), timeout=control_interval_seconds)
+                break
+            except asyncio.TimeoutError:
+                pass
+            now = time.perf_counter()
+            expected_tick = last_tick + control_interval_seconds
+            event_loop_lag_ms = max(0.0, (now - expected_tick) * 1000.0)
+            last_tick = now
+            resource_snapshot = debug_ray_resource_snapshot()
+            available_cpu = float(resource_snapshot.get("available_cpu", 0.0) or 0.0)
+            cluster_cpu = float(resource_snapshot.get("cluster_cpu", 0.0) or 0.0)
+            used_cpu = float(resource_snapshot.get("used_cpu", 0.0) or 0.0)
+            cpu_utilization = max(0.0, min(1.0, used_cpu / cluster_cpu)) if cluster_cpu > 0 else 0.0
+            stage1_pending = _pending_count("stage1_fetch", "stage1_parse", "stage1_enrich")
+            hash_pending = _pending_count("hash_render", "hash_enrich", "hash_finalize")
+            stage1_pressure_ratio = max(
+                stage1_pending / max(1, stage1_pending_cap),
+                len(stage1_backlog) / max(1, stage1_pending_cap),
+            )
+            hash_pressure_ratio = max(
+                hash_pending / max(1, hash_pending_cap),
+                len(hash_backlog) / max(1, hash_pending_cap),
+            )
+            completed_now = shortlist_progress.completed
+            completed_delta = max(0, completed_now - last_completed)
+            last_completed = completed_now
+            timeout_count = int(stage1_progress.get("timeout", 0) or 0) + int(metrics.get("fetch_timed_out", 0) or 0)
+            timeout_delta = max(0, timeout_count - last_timeout_count)
+            last_timeout_count = timeout_count
+            timeout_ratio = float(timeout_delta / max(1, completed_delta)) if completed_delta or timeout_delta else 0.0
+            checkpoint_backlog: dict[str, Any] = {}
+            if checkpoint_actor is not None:
+                try:
+                    checkpoint_backlog = dict(await _ray_get(checkpoint_actor.get_backlog_snapshot.remote()) or {})
+                except Exception:
+                    logger.exception("Failed to snapshot checkpoint backlog for shortlist controller")
+                if (now - last_checkpoint_flush) >= 10.0:
+                    checkpoint_actor.export_all.remote()
+                    last_checkpoint_flush = now
+            checkpoint_pending_rows = int(checkpoint_backlog.get("pending_rows_total", 0) or 0)
+            severe_reasons: list[str] = []
+            if available_cpu < severe_available_cpu_floor:
+                severe_reasons.append("cpu_headroom_low")
+            if available_cpu < float(cpu_headroom_cores) and cpu_utilization > min(0.99, target_cpu_utilization + 0.12):
+                severe_reasons.append("cpu_utilization")
+            if event_loop_lag_ms > 250.0:
+                severe_reasons.append("event_loop_lag")
+            if stage1_pressure_ratio > 0.75:
+                severe_reasons.append("stage1_pressure")
+            if len(finalize_buffer) > (2 * max(1, int(runtime_config["hash_finalize_batch"]))):
+                severe_reasons.append("hash_finalize_backlog")
+            if timeout_ratio > 0.25:
+                severe_reasons.append("timeout_ratio")
+            if checkpoint_pending_rows > 20000:
+                severe_reasons.append("checkpoint_backlog")
+            healthy_window = (
+                available_cpu > healthy_available_cpu_floor
+                and cpu_utilization < min(0.99, target_cpu_utilization + 0.05)
+                and event_loop_lag_ms < 100.0
+                and stage1_pressure_ratio < 0.50
+                and hash_pressure_ratio < 0.50
+                and timeout_ratio < 0.10
+                and checkpoint_pending_rows < 5000
+            )
+            action = "hold"
+            reason = "steady"
+            if dynamic_control_enabled and severe_reasons:
+                controller_state["healthy_streak"] = 0
+                changed = False
+                if int(controller_state["stage0_live_inflight"]) > stage0_inflight_floor:
+                    controller_state["stage0_live_inflight"] = max(stage0_inflight_floor, int(controller_state["stage0_live_inflight"]) - 1)
+                    changed = True
+                if int(controller_state["stage1_live_fetch_limit"]) > stage1_fetch_limit_floor:
+                    controller_state["stage1_live_fetch_limit"] = max(stage1_fetch_limit_floor, int(controller_state["stage1_live_fetch_limit"]) - 8)
+                    changed = True
+                if int(controller_state["hash_live_active_pages"]) > hash_active_pages_floor:
+                    controller_state["hash_live_active_pages"] = max(hash_active_pages_floor, int(controller_state["hash_live_active_pages"]) - 2)
+                    changed = True
+                action = "downshift" if changed else "hold"
+                reason = ",".join(severe_reasons[:3])
+            elif dynamic_control_enabled and healthy_window:
+                controller_state["healthy_streak"] = int(controller_state.get("healthy_streak", 0) or 0) + 1
+                if int(controller_state["healthy_streak"]) >= 2:
+                    controller_state["healthy_streak"] = 0
+                    changed = False
+                    if int(controller_state["stage0_live_inflight"]) < stage0_inflight:
+                        controller_state["stage0_live_inflight"] = min(stage0_inflight, int(controller_state["stage0_live_inflight"]) + 1)
+                        changed = True
+                    if int(controller_state["stage1_live_fetch_limit"]) < stage1_fetch_limit_cap:
+                        controller_state["stage1_live_fetch_limit"] = min(stage1_fetch_limit_cap, int(controller_state["stage1_live_fetch_limit"]) + 8)
+                        changed = True
+                    if int(controller_state["hash_live_active_pages"]) < hash_active_pages_cap:
+                        controller_state["hash_live_active_pages"] = min(hash_active_pages_cap, int(controller_state["hash_live_active_pages"]) + 2)
+                        changed = True
+                    action = "upshift" if changed else "hold"
+                    reason = "healthy_window"
+                else:
+                    action = "hold"
+                    reason = "healthy_window_pending"
+            elif dynamic_control_enabled:
+                controller_state["healthy_streak"] = 0
+            else:
+                action = "hold"
+                reason = "dynamic_control_disabled"
+            controller_state.update(
+                {
+                    "action": action,
+                    "reason": reason,
+                    "available_cpu": round(available_cpu, 3),
+                    "cpu_utilization": round(cpu_utilization, 3),
+                    "event_loop_lag_ms": round(event_loop_lag_ms, 3),
+                    "checkpoint_pending_rows": checkpoint_pending_rows,
+                    "timeout_ratio": round(timeout_ratio, 3),
+                    "stage1_pressure_ratio": round(stage1_pressure_ratio, 3),
+                    "hash_pressure_ratio": round(hash_pressure_ratio, 3),
+                    "progress_completed": int(completed_now),
+                }
+            )
+            metrics["active_fetch_limit"] = int(controller_state.get("hash_live_active_pages", hash_active_pages_cap) or hash_active_pages_cap)
+
+    control_task = asyncio.create_task(_control_monitor()) if (checkpoint_actor is not None or dynamic_control_enabled) else None
     _refresh_progress_bar(progress_bar)
 
     try:
@@ -867,11 +1075,15 @@ async def run_hashing_shortlist_with_ray_impl(
             await _drain_backlogs()
             while remaining_stage0_urls:
                 inflight_stage0 = sum(1 for kind, _ in pending.values() if kind == "stage0_batch")
-                if inflight_stage0 >= stage0_inflight:
+                if inflight_stage0 >= int(controller_state.get("stage0_live_inflight", stage0_inflight) or stage0_inflight):
                     break
                 if _pending_count("stage1_fetch", "stage1_parse", "stage1_enrich") >= stage1_pending_cap:
                     break
                 if _pending_count("hash_render", "hash_enrich", "hash_finalize") >= hash_pending_cap:
+                    break
+                if _pending_count("stage1_fetch") >= int(controller_state.get("stage1_live_fetch_limit", stage1_fetch_limit_cap) or stage1_fetch_limit_cap):
+                    break
+                if _pending_count("hash_render") >= int(controller_state.get("hash_live_active_pages", hash_active_pages_cap) or hash_active_pages_cap):
                     break
                 # NOTE: We intentionally do NOT block stage0 on hash_backlog size.
                 # hash_backlog is a lightweight FIFO queue; blocking stage0 (cheap
@@ -892,7 +1104,7 @@ async def run_hashing_shortlist_with_ray_impl(
                 if not stage0_warmup_logged:
                     logger.info(
                         "Ray shortlist Stage0 warmup | submitted initial lexical batches=%d | batch_size=%d | first completion can take a while on Windows due to worker import cost",
-                        min(stage0_inflight, max(1, (len(metric_urls) + stage0_batch_size - 1) // stage0_batch_size)),
+                        min(int(controller_state.get("stage0_live_inflight", stage0_inflight) or stage0_inflight), max(1, (len(metric_urls) + stage0_batch_size - 1) // stage0_batch_size)),
                         stage0_batch_size,
                     )
                     stage0_warmup_logged = True
@@ -1199,6 +1411,9 @@ async def run_hashing_shortlist_with_ray_impl(
         progress_stop.set()
         if progress_task is not None:
             await asyncio.gather(progress_task, return_exceptions=True)
+        controller_stop.set()
+        if control_task is not None:
+            await asyncio.gather(control_task, return_exceptions=True)
         heartbeat_stop.set()
         if heartbeat_task is not None:
             await asyncio.gather(heartbeat_task, return_exceptions=True)

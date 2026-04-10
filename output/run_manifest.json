@@ -1,7 +1,7 @@
 {
   "checkpoint_dir": "",
   "checkpoints_csv": "c:\\Users\\SATWIK\\Documents\\Phishing\\output\\runs\\run_20260410T134544Z\\events\\checkpoints.csv",
-  "completed_at": "",
+  "completed_at": "2026-04-10T14:45:10+00:00",
   "fatal_error_message": "",
   "fatal_error_type": "",
   "fatal_stage": "",
@@ -106,9 +106,9 @@
   "stage_metrics_csv": "c:\\Users\\SATWIK\\Documents\\Phishing\\output\\runs\\run_20260410T134544Z\\events\\stage_metrics.csv",
   "stall_events_csv": "c:\\Users\\SATWIK\\Documents\\Phishing\\output\\runs\\run_20260410T134544Z\\events\\stall_events.csv",
   "started_at": "2026-04-10T13:45:44+00:00",
-  "status": "running",
+  "status": "completed",
   "telemetry_mode": "sampled",
-  "updated_at": "2026-04-10T13:46:01+00:00",
+  "updated_at": "2026-04-10T14:45:10+00:00",
   "url_result_events_csv": "c:\\Users\\SATWIK\\Documents\\Phishing\\output\\runs\\run_20260410T134544Z\\events\\checkpoints.csv",
   "worker_heartbeats_csv": "c:\\Users\\SATWIK\\Documents\\Phishing\\output\\runs\\run_20260410T134544Z\\events\\worker_heartbeats.csv"
 }

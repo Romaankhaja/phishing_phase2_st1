@@ -297,7 +297,6 @@ class _CheckpointWriterActorImpl:
                 normalized_url=str(record.get("normalized_url", "") or ""),
                 source_workbook=str(record.get("source_workbook", "") or ""),
             )
-        self._store.maybe_export()
 
     def upsert_url_result(self, patch: dict[str, Any]) -> None:
         self._store.upsert_url_result(patch)
@@ -340,6 +339,9 @@ class _CheckpointWriterActorImpl:
 
     def get_terminal_submission_records(self) -> list[dict[str, Any]]:
         return self._store.get_terminal_submission_records()
+
+    def get_backlog_snapshot(self) -> dict[str, Any]:
+        return self._store.snapshot_backlog()
 
     def export_all(self) -> None:
         self._store.export_all(best_effort=True)
@@ -943,7 +945,7 @@ def _get_ray_primitives() -> dict[str, Any]:
     _RAY_PRIMITIVES = {
         "ray": ray,
         "MetricsActor": ray.remote(num_cpus=0, max_concurrency=64)(_MetricsActorImpl),
-        "CheckpointWriterActor": ray.remote(num_cpus=0, max_concurrency=32)(_CheckpointWriterActorImpl),
+        "CheckpointWriterActor": ray.remote(num_cpus=0, max_concurrency=8)(_CheckpointWriterActorImpl),
         "LookupCacheActor": ray.remote(num_cpus=0, max_concurrency=32)(_LookupCacheActorImpl),
         "WhoisCoordinatorActor": ray.remote(num_cpus=0, max_concurrency=32)(_WhoisCoordinatorActorImpl),
         "Stage1FetchActor": ray.remote(_Stage1FetchActorImpl),

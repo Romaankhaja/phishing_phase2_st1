@@ -119,7 +119,15 @@ def _stage_smoke_mode(value: str) -> str:
 
 def _runtime_profile(value: str) -> str:
     normalized = str(value).strip().lower()
-    allowed = {"auto", "default", "cpu-safe", "cpu-recall", "cpu-fast", "server-throughput"}
+    allowed = {
+        "auto",
+        "default",
+        "cpu-safe",
+        "cpu-recall",
+        "cpu-fast",
+        "server-balanced",
+        "server-throughput",
+    }
     if normalized not in allowed:
         raise argparse.ArgumentTypeError(f"runtime profile must be one of {sorted(allowed)}")
     return normalized
@@ -176,7 +184,7 @@ def _resolve_auto_runtime_profile(resource_info: dict[str, Any] | None = None) -
     vram_gb = float(resource_info.get("vram_gb", 0.0) or 0.0)
 
     if cpu_cores >= 32 and ram_gb >= 128.0:
-        return "server-throughput"
+        return "server-balanced"
     if cpu_cores <= 16 or ram_gb < 16.0 or (0.0 < vram_gb <= 6.0):
         return "cpu-safe"
     return "cpu-fast"
@@ -238,6 +246,76 @@ def _resolve_runtime_profile_settings(
                 "stage1_control_interval_seconds": 2.0,
             },
             "reliability": {},
+        },
+        "server-balanced": {
+            "env": {
+                "PHISHING_HASH_PAGES": 16,
+                "PHISHING_HASH_PAGE_CONCURRENCY": 2,
+                "PHISHING_HASH_HTTP_LIMIT": 192,
+                "PHISHING_HASH_AUX_NET_LIMIT": 96,
+                "PHISHING_HASH_ACTIVE_PAGES_FLOOR": 4,
+                "PHISHING_LEXICAL_WORKERS": 16,
+                "PHISHING_LEXICAL_BATCH_SIZE": 1024,
+                "PHISHING_LEXICAL_INFLIGHT_BATCHES": 8,
+                "PHISHING_SHORTLIST_EXECUTION_MODE": "streaming-concurrent",
+                "PHISHING_HASH_PROGRESS_LOG_INTERVAL_SECONDS": 10,
+                "PHISHING_HASH_ADAPTIVE_DOWNSHIFT": "true",
+                "PHISHING_RAY_STAGE0_BATCH_SIZE": 1024,
+                "PHISHING_RAY_STAGE0_INFLIGHT": 4,
+                "PHISHING_RAY_STAGE1_FETCH_ACTORS": 12,
+                "PHISHING_RAY_STAGE1_ENRICH_ACTORS": 6,
+                "PHISHING_RAY_HASH_BROWSER_ACTORS": 8,
+                "PHISHING_RAY_HASH_TABS_PER_ACTOR": 2,
+                "PHISHING_RAY_HASH_FINALIZE_BATCH": 32,
+                "PHISHING_RAY_CLASSIFY_ACTORS": 8,
+                "PHISHING_RAY_CLASSIFY_INFLIGHT": 8,
+                "PHISHING_RAY_OCR_ACTORS": 1,
+                "PHISHING_RAY_STAGE1_FETCH_ACTOR_MAX_CONCURRENCY": 4,
+                "PHISHING_RAY_STAGE1_ENRICH_ACTOR_MAX_CONCURRENCY": 2,
+                "PHISHING_RAY_STAGE1_PENDING_CAP": 48,
+                "PHISHING_RAY_HASH_PENDING_CAP": 16,
+                "PHISHING_RAY_STAGE1_HTTP_CONNECTION_CAP": 192,
+                "PHISHING_RAY_STAGE1_HTTP_KEEPALIVE_CAP": 96,
+                "PHISHING_RAY_OCR_BATCH_SIZE": 32,
+                "PHISHING_RAY_OCR_BATCH_DELAY_MS": 25,
+                "PHISHING_RAY_PREWARM_MODE": "staged",
+                "PHISHING_RAY_PREWARM_ACTORS": "true",
+                "PHISHING_RAY_ENABLE_DYNAMIC_CONTROL": "true",
+                "PHISHING_RAY_TARGET_CPU_UTILIZATION": "0.82",
+                "PHISHING_RAY_CPU_HEADROOM_CORES": "6",
+            },
+            "stage1_http": {
+                "concurrency": 96,
+                "http_concurrency": 192,
+                "dns_concurrency": 192,
+                "rdap_concurrency": 16,
+                "tls_concurrency": 64,
+                "stage1_target_urls_per_sec": 1200,
+                "stage1_fetch_concurrency_start": 48,
+                "stage1_fetch_concurrency_max": 192,
+                "stage1_fetch_concurrency_floor": 24,
+                "stage1_http_connection_limit": 192,
+                "stage1_http_keepalive_limit": 96,
+                "stage1_per_host_limit": 4,
+                "stage1_cpu_workers": 12,
+                "stage1_parse_workers": 12,
+                "stage1_enrich_dns_concurrency": 192,
+                "stage1_enrich_rdap_concurrency": 16,
+                "stage1_enrich_tls_concurrency": 64,
+                "stage1_fetch_queue_max": 4000,
+                "stage1_cpu_queue_max": 2000,
+                "stage1_parse_queue_max": 2000,
+                "stage1_score_queue_max": 2000,
+                "stage1_enrich_queue_max": 2000,
+                "stage1_result_queue_max": 4000,
+                "stage1_control_interval_seconds": 2.0,
+            },
+            "reliability": {
+                "append_flush_interval_seconds": 10,
+                "append_flush_row_interval": 10000,
+                "snapshot_flush_interval_seconds": 60,
+                "snapshot_flush_row_interval": 50000,
+            },
         },
         "server-throughput": {
             "env": {

@@ -133,8 +133,12 @@ RAY_RUNTIME_CONFIG = {
     "stage1_http_connection_cap": max(4, int(os.getenv("PHISHING_RAY_STAGE1_HTTP_CONNECTION_CAP", "64"))),
     "stage1_http_keepalive_cap": max(2, int(os.getenv("PHISHING_RAY_STAGE1_HTTP_KEEPALIVE_CAP", "32"))),
     "prewarm_actors": os.getenv("PHISHING_RAY_PREWARM_ACTORS", "").strip().lower() in {"1", "true", "yes", "on"},
+    "prewarm_mode": str(os.getenv("PHISHING_RAY_PREWARM_MODE", "full") or "full").strip().lower(),
     "browser_hardened_flags": os.getenv("PHISHING_RAY_BROWSER_HARDENED_FLAGS", "").strip().lower() in {"1", "true", "yes", "on"},
     "metrics_interval_seconds": max(1.0, float(os.getenv("PHISHING_RAY_METRICS_INTERVAL_SECONDS", "5"))),
+    "enable_dynamic_control": str(os.getenv("PHISHING_RAY_ENABLE_DYNAMIC_CONTROL", "true") or "true").strip().lower() in {"1", "true", "yes", "on"},
+    "target_cpu_utilization": max(0.1, min(float(os.getenv("PHISHING_RAY_TARGET_CPU_UTILIZATION", "0.82") or "0.82"), 0.98)),
+    "cpu_headroom_cores": max(1, int(os.getenv("PHISHING_RAY_CPU_HEADROOM_CORES", "6"))),
 }
 
 RAY_ENV_TO_CONFIG_KEY = {
@@ -159,8 +163,12 @@ RAY_ENV_TO_CONFIG_KEY = {
     "PHISHING_RAY_STAGE1_HTTP_CONNECTION_CAP": "stage1_http_connection_cap",
     "PHISHING_RAY_STAGE1_HTTP_KEEPALIVE_CAP": "stage1_http_keepalive_cap",
     "PHISHING_RAY_PREWARM_ACTORS": "prewarm_actors",
+    "PHISHING_RAY_PREWARM_MODE": "prewarm_mode",
     "PHISHING_RAY_BROWSER_HARDENED_FLAGS": "browser_hardened_flags",
     "PHISHING_RAY_METRICS_INTERVAL_SECONDS": "metrics_interval_seconds",
+    "PHISHING_RAY_ENABLE_DYNAMIC_CONTROL": "enable_dynamic_control",
+    "PHISHING_RAY_TARGET_CPU_UTILIZATION": "target_cpu_utilization",
+    "PHISHING_RAY_CPU_HEADROOM_CORES": "cpu_headroom_cores",
 }
 
 # Debug mode for Ray pipeline stall diagnostics
@@ -214,6 +222,181 @@ def resolve_hash_stage_config(overrides: dict | None = None) -> dict:
     return config
 
 
+def _estimate_ray_cpu_budget(config: dict[str, object]) -> tuple[float, float, float]:
+    stage1_fetch_actors = max(1, int(config.get("stage1_fetch_actors", 1) or 1))
+    stage1_enrich_actors = max(1, int(config.get("stage1_enrich_actors", 1) or 1))
+    hash_browser_actors = max(1, int(config.get("hash_browser_actors", 1) or 1))
+    classify_actors = max(1, int(config.get("classify_actors", 1) or 1))
+    ocr_actors = max(1, int(config.get("ocr_actors", 1) or 1))
+    stage1_pending_cap = max(1, int(config.get("stage1_pending_cap", 1) or 1))
+    hash_pending_cap = max(1, int(config.get("hash_pending_cap", 1) or 1))
+    stage0_inflight = max(1, int(config.get("stage0_inflight", 1) or 1))
+    hash_finalize_batch = max(1, int(config.get("hash_finalize_batch", 1) or 1))
+    actor_cpu_demand = (
+        stage1_fetch_actors * 0.25
+        + stage1_enrich_actors * 0.25
+        + hash_browser_actors * (1.0 if bool(config.get("server_mode")) else 0.5)
+        + classify_actors * 1.0
+        + ocr_actors * 1.0
+    )
+    stage0_task_cpu = 1.0
+    light_task_cpu = 0.5
+    finalize_task_cpu = 1.0
+    estimated_stage1_task_parallelism = min(stage1_pending_cap, stage1_fetch_actors)
+    estimated_hash_task_parallelism = min(hash_pending_cap, hash_browser_actors)
+    estimated_finalize_parallelism = min(
+        2 if bool(config.get("server_mode")) else 1,
+        hash_browser_actors,
+        hash_finalize_batch,
+    )
+    worst_case_task_cpus = (
+        stage0_inflight * stage0_task_cpu
+        + estimated_stage1_task_parallelism * light_task_cpu
+        + estimated_hash_task_parallelism * light_task_cpu
+        + estimated_finalize_parallelism * finalize_task_cpu
+    )
+    return actor_cpu_demand, worst_case_task_cpus, actor_cpu_demand + worst_case_task_cpus
+
+
+def _clamp_ray_budget(config: dict[str, object], *, cpu_cores: int) -> dict[str, object]:
+    actor_cpu_target = max(1.0, float(cpu_cores) * 0.60)
+    total_cpu_target = max(actor_cpu_target, float(cpu_cores) * 0.85)
+    adjustments: list[str] = []
+    server_mode = bool(config.get("server_mode"))
+    low_memory_mode = bool(config.get("low_memory_mode"))
+    very_low_memory_mode = bool(config.get("very_low_memory_mode"))
+
+    min_stage0_inflight = 1
+    min_stage1_fetch_actors = 1 if very_low_memory_mode else 2 if low_memory_mode else 4
+    min_stage1_enrich_actors = 1
+    min_hash_browser_actors = 1
+    min_classify_actors = 1 if low_memory_mode else 2
+    min_stage1_pending_cap = 24 if server_mode and cpu_cores >= 32 else min_stage1_fetch_actors
+    min_hash_pending_cap = 4 if server_mode and cpu_cores >= 32 else min_hash_browser_actors
+    min_classify_inflight = max(
+        1,
+        min(
+            int(config.get("classify_inflight", 1) or 1),
+            8 if server_mode and cpu_cores >= 32 and not low_memory_mode else 1,
+        ),
+    )
+
+    def _reduce_value(key: str, *, minimum: int, step: int = 1, reason: str) -> bool:
+        current = int(config.get(key, minimum) or minimum)
+        updated = max(minimum, current - step)
+        if updated == current:
+            return False
+        config[key] = updated
+        adjustments.append(f"{key}:{current}->{updated} ({reason})")
+        return True
+
+    for _ in range(256):
+        actor_cpu_demand, worst_case_task_cpus, total_demand = _estimate_ray_cpu_budget(config)
+        if actor_cpu_demand <= actor_cpu_target and total_demand <= total_cpu_target:
+            break
+
+        changed = False
+        if total_demand > total_cpu_target:
+            changed = _reduce_value(
+                "classify_inflight",
+                minimum=min_classify_inflight,
+                step=4,
+                reason="total_cpu_budget",
+            ) or changed
+            changed = _reduce_value(
+                "stage1_pending_cap",
+                minimum=min_stage1_pending_cap,
+                step=8,
+                reason="total_cpu_budget",
+            ) or changed
+            changed = _reduce_value(
+                "hash_pending_cap",
+                minimum=min_hash_pending_cap,
+                step=4,
+                reason="total_cpu_budget",
+            ) or changed
+            changed = _reduce_value(
+                "stage0_inflight",
+                minimum=min_stage0_inflight,
+                step=1,
+                reason="total_cpu_budget",
+            ) or changed
+            changed = _reduce_value(
+                "stage1_fetch_actor_max_concurrency",
+                minimum=1,
+                step=1,
+                reason="total_cpu_budget",
+            ) or changed
+            changed = _reduce_value(
+                "stage1_enrich_actor_max_concurrency",
+                minimum=1,
+                step=1,
+                reason="total_cpu_budget",
+            ) or changed
+            changed = _reduce_value(
+                "hash_tabs_per_actor",
+                minimum=1,
+                step=1,
+                reason="total_cpu_budget",
+            ) or changed
+
+        actor_cpu_demand, worst_case_task_cpus, total_demand = _estimate_ray_cpu_budget(config)
+        if actor_cpu_demand > actor_cpu_target or total_demand > total_cpu_target:
+            changed = _reduce_value(
+                "stage1_fetch_actors",
+                minimum=min_stage1_fetch_actors,
+                step=1,
+                reason="actor_cpu_budget",
+            ) or changed
+            changed = _reduce_value(
+                "stage1_enrich_actors",
+                minimum=min_stage1_enrich_actors,
+                step=1,
+                reason="actor_cpu_budget",
+            ) or changed
+            changed = _reduce_value(
+                "hash_browser_actors",
+                minimum=min_hash_browser_actors,
+                step=1,
+                reason="actor_cpu_budget",
+            ) or changed
+            changed = _reduce_value(
+                "classify_actors",
+                minimum=min_classify_actors,
+                step=1,
+                reason="actor_cpu_budget",
+            ) or changed
+
+        if not changed:
+            break
+
+    config["classify_inflight"] = max(
+        min_classify_inflight,
+        min(
+            int(config.get("classify_inflight", min_classify_inflight) or min_classify_inflight),
+            max(1, int(config.get("classify_actors", 1) or 1) * 2),
+        ),
+    )
+    config["stage1_pending_cap"] = max(
+        max(int(config.get("stage1_fetch_actors", 1) or 1), min_stage1_pending_cap),
+        int(config.get("stage1_pending_cap", min_stage1_pending_cap) or min_stage1_pending_cap),
+    )
+    config["hash_pending_cap"] = max(
+        max(int(config.get("hash_browser_actors", 1) or 1), min_hash_pending_cap),
+        int(config.get("hash_pending_cap", min_hash_pending_cap) or min_hash_pending_cap),
+    )
+    actor_cpu_demand, worst_case_task_cpus, total_demand = _estimate_ray_cpu_budget(config)
+    return {
+        "actor_cpu_target": round(actor_cpu_target, 2),
+        "total_cpu_target": round(total_cpu_target, 2),
+        "actor_cpu_demand": round(actor_cpu_demand, 2),
+        "worst_case_task_cpus": round(worst_case_task_cpus, 2),
+        "total_demand": round(total_demand, 2),
+        "clamped": bool(adjustments),
+        "adjustments": adjustments,
+    }
+
+
 def resolve_ray_runtime_config(overrides: dict | None = None) -> dict:
     cpu_cores = os.cpu_count() or 4
     hash_pages = max(1, int(os.getenv("PHISHING_HASH_PAGES", HASH_STAGE_CONFIG["hash_pages"])))
@@ -252,25 +435,29 @@ def resolve_ray_runtime_config(overrides: dict | None = None) -> dict:
     server_mode = bool(cpu_cores >= 32 and total_ram_gb >= 128.0 and not critical_memory_mode)
 
     server_defaults = {
-        "stage0_batch_size": 2048,
-        "stage0_inflight": 16,
-        "stage1_fetch_actors": 24,
-        "stage1_enrich_actors": 12,
-        "hash_browser_actors": 12,
-        "hash_tabs_per_actor": 4,
-        "hash_finalize_batch": 64,
-        "classify_actors": 16,
-        "classify_inflight": 64,
+        "stage0_batch_size": 1024,
+        "stage0_inflight": 4,
+        "stage1_fetch_actors": 12,
+        "stage1_enrich_actors": 6,
+        "hash_browser_actors": 8,
+        "hash_tabs_per_actor": 2,
+        "hash_finalize_batch": 32,
+        "classify_actors": 8,
+        "classify_inflight": 8,
         "ocr_actors": 1,
         "ocr_batch_size": 32,
         "ocr_batch_delay_ms": 25,
-        "stage1_fetch_actor_max_concurrency": 8,
-        "stage1_enrich_actor_max_concurrency": 6,
-        "stage1_pending_cap": 384,
-        "hash_pending_cap": 96,
-        "stage1_http_connection_cap": 1536,
-        "stage1_http_keepalive_cap": 768,
+        "stage1_fetch_actor_max_concurrency": 4,
+        "stage1_enrich_actor_max_concurrency": 2,
+        "stage1_pending_cap": 48,
+        "hash_pending_cap": 16,
+        "stage1_http_connection_cap": 192,
+        "stage1_http_keepalive_cap": 96,
         "prewarm_actors": True,
+        "prewarm_mode": "staged",
+        "enable_dynamic_control": True,
+        "target_cpu_utilization": 0.82,
+        "cpu_headroom_cores": 6,
     }
     if server_mode:
         for key, value in server_defaults.items():
@@ -437,6 +624,7 @@ def resolve_ray_runtime_config(overrides: dict | None = None) -> dict:
             "hash_pending_cap": max(1, min(int(config.get("hash_pending_cap", default_hash_pending_cap) or 1), hash_pending_cap)),
             "stage1_http_connection_cap": max(4, min(int(config.get("stage1_http_connection_cap", default_stage1_connection_cap) or 4), stage1_connection_cap)),
             "stage1_http_keepalive_cap": max(2, min(int(config.get("stage1_http_keepalive_cap", default_stage1_keepalive_cap) or 2), stage1_keepalive_cap)),
+            "prewarm_mode": str(config.get("prewarm_mode", "staged" if server_mode and not low_memory_mode else "full") or "full").strip().lower(),
             "prewarm_actors": bool(config.get("prewarm_actors", server_mode and not low_memory_mode)),
             "local_mode": bool(local_mode),
             "low_memory_mode": bool(low_memory_mode),
@@ -446,50 +634,48 @@ def resolve_ray_runtime_config(overrides: dict | None = None) -> dict:
             "detected_total_ram_gb": round(total_ram_gb, 2),
             "detected_available_ram_gb": round(available_ram_gb, 2),
             "debug_mode": bool(RAY_DEBUG_MODE),
+            "enable_dynamic_control": bool(config.get("enable_dynamic_control", True)),
+            "target_cpu_utilization": max(0.1, min(float(config.get("target_cpu_utilization", 0.82) or 0.82), 0.98)),
+            "cpu_headroom_cores": max(1, int(config.get("cpu_headroom_cores", 6) or 6)),
         }
     )
+    if str(config.get("prewarm_mode", "full") or "full").strip().lower() not in {"off", "staged", "full"}:
+        config["prewarm_mode"] = "full"
+    if str(config.get("prewarm_mode", "full") or "full").strip().lower() == "off":
+        config["prewarm_actors"] = False
+    elif not bool(config.get("prewarm_actors", False)):
+        config["prewarm_mode"] = "off"
+
+    budget_info = _clamp_ray_budget(config, cpu_cores=cpu_cores)
+    config["actor_cpu_budget"] = float(budget_info["actor_cpu_target"])
+    config["planned_total_cpu_budget"] = float(budget_info["total_cpu_target"])
+    config["actor_cpu_demand"] = float(budget_info["actor_cpu_demand"])
+    config["worst_case_task_cpus"] = float(budget_info["worst_case_task_cpus"])
+    config["total_cpu_demand"] = float(budget_info["total_demand"])
+    config["budget_clamped"] = bool(budget_info["clamped"])
+    config["budget_adjustments"] = list(budget_info["adjustments"])
 
     # --- Resource budget validation ---
-    actor_cpu_demand = (
-        stage1_fetch_actors * 0.25
-        + stage1_enrich_actors * 0.25
-        + hash_browser_actors * (1.0 if config.get("server_mode") else 0.5)
-        + classify_actors * 1.0
-        + int(config.get("ocr_actors", 1)) * 1.0
-    )
-    stage0_task_cpu = 1.0
-    light_task_cpu = 0.5
-    finalize_task_cpu = 1.0
-    estimated_stage1_task_parallelism = min(
-        int(config.get("stage1_pending_cap", stage1_pending_cap) or stage1_pending_cap),
-        stage1_fetch_actors * max(1, int(config.get("stage1_fetch_actor_max_concurrency", 1) or 1)),
-    )
-    estimated_hash_task_parallelism = min(
-        int(config.get("hash_pending_cap", hash_pending_cap) or hash_pending_cap),
-        hash_browser_actors * max(1, int(config.get("hash_tabs_per_actor", 1) or 1)),
-    )
-    worst_case_task_cpus = (
-        int(config.get("stage0_inflight", 1)) * stage0_task_cpu
-        + estimated_stage1_task_parallelism * light_task_cpu
-        + estimated_hash_task_parallelism * light_task_cpu
-        + min(hash_browser_actors, int(config.get("hash_finalize_batch", 1) or 1)) * finalize_task_cpu
-    )
-    total_demand = actor_cpu_demand + worst_case_task_cpus
     import logging as _cfg_logging
     _cfg_logger = _cfg_logging.getLogger(__name__)
+    actor_cpu_demand = float(config.get("actor_cpu_demand", 0.0) or 0.0)
+    worst_case_task_cpus = float(config.get("worst_case_task_cpus", 0.0) or 0.0)
+    total_demand = float(config.get("total_cpu_demand", 0.0) or 0.0)
     _cfg_logger.info(
-        "Ray resource budget | cpu_cores=%d | actor_cpu_demand=%.1f | worst_case_task_cpus=%.1f | total_demand=%.1f | headroom=%.1f",
-        cpu_cores, actor_cpu_demand, worst_case_task_cpus, total_demand, cpu_cores - total_demand,
+        "Ray resource budget | cpu_cores=%d | actor_cpu_demand=%.1f/%.1f | worst_case_task_cpus=%.1f | total_demand=%.1f/%.1f | headroom=%.1f | clamped=%s",
+        cpu_cores,
+        actor_cpu_demand,
+        float(config.get("actor_cpu_budget", 0.0) or 0.0),
+        worst_case_task_cpus,
+        total_demand,
+        float(config.get("planned_total_cpu_budget", 0.0) or 0.0),
+        cpu_cores - total_demand,
+        bool(config.get("budget_clamped", False)),
     )
-    if actor_cpu_demand > cpu_cores:
+    if bool(config.get("budget_clamped", False)):
         _cfg_logger.warning(
-            "Actor CPU reservations exceed available cores | actor_cpu_demand=%.1f | cpu_cores=%d. Reduce actor counts for this profile.",
-            actor_cpu_demand, cpu_cores,
-        )
-    elif total_demand > cpu_cores:
-        _cfg_logger.info(
-            "Ray task oversubscription will queue under load by design | total_demand=%.1f | cpu_cores=%d | actor_cpu_demand=%.1f",
-            total_demand, cpu_cores, actor_cpu_demand,
+            "Ray runtime clamp applied | adjustments=%s",
+            ", ".join(str(item) for item in list(config.get("budget_adjustments") or [])),
         )
 
     return config

@@ -1078,7 +1078,6 @@ class CheckpointStore:
             self._append_dirty = True
             self._snapshot_dirty = True
             self._dirty_snapshot_updates += 1
-        self.maybe_export()
         return dict(merged)
 
     def ensure_url_result(
@@ -1108,7 +1107,6 @@ class CheckpointStore:
             self._stage_events.append(dict(normalized))
             self._dirty_snapshot_updates += 1
             self._snapshot_dirty = True
-        self.maybe_export()
 
     def update_worker_heartbeat(
         self,
@@ -1136,7 +1134,6 @@ class CheckpointStore:
             self._heartbeat_dirty = True
             self._snapshot_dirty = True
             self._dirty_snapshot_updates += 1
-        self.maybe_export()
 
     def clear_worker_heartbeat(self, *, stage_name: str, worker_id: str) -> None:
         with self._lock:
@@ -1144,7 +1141,6 @@ class CheckpointStore:
             self._heartbeat_dirty = True
             self._snapshot_dirty = True
             self._dirty_snapshot_updates += 1
-        self.maybe_export()
 
     def append_stage_metric(self, snapshot: dict[str, Any]) -> None:
         item = {
@@ -1164,7 +1160,6 @@ class CheckpointStore:
             self._stage_metrics.append(item)
             self._snapshot_dirty = True
             self._dirty_snapshot_updates += 1
-        self.maybe_export()
 
     def append_stall_event(self, event: dict[str, Any]) -> None:
         item = {
@@ -1181,7 +1176,27 @@ class CheckpointStore:
             self._stall_events.append(item)
             self._snapshot_dirty = True
             self._dirty_snapshot_updates += 1
-        self.maybe_export()
+
+    def snapshot_backlog(self) -> dict[str, Any]:
+        with self._lock:
+            pending_result_events = len(self._pending_result_events)
+            stage_event_rows = len(self._stage_events)
+            worker_heartbeats = len(self._worker_heartbeats)
+            stage_metric_rows = len(self._stage_metrics)
+            stall_event_rows = len(self._stall_events)
+            snapshot_dirty_updates = int(self._dirty_snapshot_updates)
+            return {
+                "append_dirty": bool(self._append_dirty),
+                "snapshot_dirty": bool(self._snapshot_dirty),
+                "heartbeat_dirty": bool(self._heartbeat_dirty),
+                "pending_result_events": pending_result_events,
+                "stage_event_rows": stage_event_rows,
+                "worker_heartbeats": worker_heartbeats,
+                "stage_metric_rows": stage_metric_rows,
+                "stall_event_rows": stall_event_rows,
+                "snapshot_dirty_updates": snapshot_dirty_updates,
+                "pending_rows_total": pending_result_events + snapshot_dirty_updates,
+            }
 
     def list_worker_heartbeats(self, *, stage_name: str | None = None) -> list[dict[str, Any]]:
         with self._lock:

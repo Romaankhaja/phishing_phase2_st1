@@ -38,6 +38,7 @@ from .ray_runtime import (
     _ray_context_dict,
     _ray_get,
     _ray_wait,
+    debug_ray_resource_snapshot,
     ensure_ray_initialized,
 )
 
@@ -856,6 +857,40 @@ async def run_hash_only_pipeline_with_ray_impl(
     pending: dict[Any, dict[str, Any]] = {}
     failed_classifications = 0
     ocr_progress_stats: dict[str, Any] = {}
+    dynamic_control_enabled = bool(runtime_config.get("enable_dynamic_control", True))
+    target_cpu_utilization = float(runtime_config.get("target_cpu_utilization", 0.82) or 0.82)
+    cpu_headroom_cores = max(1, int(runtime_config.get("cpu_headroom_cores", 6) or 6))
+    severe_available_cpu_floor = max(1.0, float(max(1, cpu_headroom_cores - 2)))
+    healthy_available_cpu_floor = float(cpu_headroom_cores + 2)
+    control_interval_seconds = 2.0
+    classify_inflight_cap = max(
+        1,
+        min(
+            int(runtime_config.get("classify_inflight", max(1, len(classifier_actors))) or max(1, len(classifier_actors))),
+            max(1, len(classifier_actors) * 2),
+        ),
+    )
+    classify_inflight_floor = min(
+        classify_inflight_cap,
+        8 if runtime_config.get("server_mode") and not runtime_config.get("low_memory_mode") else 1,
+    )
+    controller_state: dict[str, Any] = {
+        "enabled": dynamic_control_enabled,
+        "classify_live_inflight": min(max(1, len(classifier_actors)), classify_inflight_cap),
+        "classify_inflight_floor": classify_inflight_floor,
+        "classify_inflight_cap": classify_inflight_cap,
+        "action": "init",
+        "reason": "startup",
+        "available_cpu": 0.0,
+        "cpu_utilization": 0.0,
+        "event_loop_lag_ms": 0.0,
+        "checkpoint_pending_rows": 0,
+        "healthy_streak": 0,
+        "ocr_queue_depth": 0,
+        "progress_completed": 0,
+        "target_cpu_utilization": target_cpu_utilization,
+        "cpu_headroom_cores": cpu_headroom_cores,
+    }
     stop_metrics = asyncio.Event()
     metrics_task = asyncio.create_task(
         _log_metrics_periodically(
@@ -866,6 +901,22 @@ async def run_hash_only_pipeline_with_ray_impl(
             checkpoint_actor=checkpoint_actor,
             stage_name="classify",
             details_getter=lambda: {
+                "controller": {
+                    "enabled": bool(controller_state.get("enabled", False)),
+                    "classify_live_inflight": int(controller_state.get("classify_live_inflight", 0) or 0),
+                    "classify_inflight_floor": int(controller_state.get("classify_inflight_floor", 0) or 0),
+                    "classify_inflight_cap": int(controller_state.get("classify_inflight_cap", 0) or 0),
+                    "available_cpu": float(controller_state.get("available_cpu", 0.0) or 0.0),
+                    "cpu_utilization": float(controller_state.get("cpu_utilization", 0.0) or 0.0),
+                    "event_loop_lag_ms": float(controller_state.get("event_loop_lag_ms", 0.0) or 0.0),
+                    "checkpoint_pending_rows": int(controller_state.get("checkpoint_pending_rows", 0) or 0),
+                    "action": str(controller_state.get("action", "") or ""),
+                    "reason": str(controller_state.get("reason", "") or ""),
+                    "healthy_streak": int(controller_state.get("healthy_streak", 0) or 0),
+                    "progress_completed": int(controller_state.get("progress_completed", 0) or 0),
+                    "target_cpu_utilization": float(controller_state.get("target_cpu_utilization", 0.0) or 0.0),
+                    "cpu_headroom_cores": int(controller_state.get("cpu_headroom_cores", 0) or 0),
+                },
                 "inflight": len(pending),
                 "flagged": len(output_records),
                 "review": len(review_rows),
@@ -873,6 +924,7 @@ async def run_hash_only_pipeline_with_ray_impl(
                 "ocr": dict(ocr_progress_stats or {}),
                 "classify_actors": len(classifier_actors),
             },
+            resource_snapshot_getter=debug_ray_resource_snapshot,
             emit_logs=not progress_enabled,
         )
     )
@@ -945,12 +997,16 @@ async def run_hash_only_pipeline_with_ray_impl(
     classify_progress = ProgressTracker(total=len(rows_to_process))
     progress_stop = asyncio.Event()
     classify_started_monotonic = time.perf_counter()
-    classify_inflight = int(runtime_config.get("classify_inflight", max(1, len(classifier_actors))))
+    controller_state["classify_live_inflight"] = min(
+        classify_inflight_cap,
+        max(classify_inflight_floor, int(controller_state.get("classify_live_inflight", classify_inflight_floor) or classify_inflight_floor)),
+    )
     next_row_index = 0
 
     def _submit_until_cap() -> None:
         nonlocal next_row_index
-        while next_row_index < len(rows_to_process) and len(pending) < classify_inflight:
+        live_cap = int(controller_state.get("classify_live_inflight", classify_inflight_cap) or classify_inflight_cap)
+        while next_row_index < len(rows_to_process) and len(pending) < live_cap:
             row = rows_to_process[next_row_index]
             sequence_number = next_row_index + 1
             actor_slot = next_row_index % len(classifier_actors)
@@ -1023,6 +1079,7 @@ async def run_hash_only_pipeline_with_ray_impl(
 
     heartbeat_stop = asyncio.Event()
     heartbeat_workers: set[str] = set()
+    controller_stop = asyncio.Event()
 
     async def _heartbeat_monitor() -> None:
         nonlocal heartbeat_workers
@@ -1068,6 +1125,106 @@ async def run_hash_only_pipeline_with_ray_impl(
     progress_bar = progress_bar_ctx.__enter__()
     progress_task = asyncio.create_task(_progress_monitor(progress_bar, classify_started_monotonic)) if progress_bar is not None else None
     heartbeat_task = asyncio.create_task(_heartbeat_monitor()) if checkpoint_actor is not None and run_context is not None else None
+
+    async def _control_monitor() -> None:
+        if not dynamic_control_enabled and checkpoint_actor is None:
+            return
+        last_tick = time.perf_counter()
+        last_checkpoint_flush = last_tick
+        last_completed = classify_progress.completed
+        while not controller_stop.is_set():
+            try:
+                await asyncio.wait_for(controller_stop.wait(), timeout=control_interval_seconds)
+                break
+            except asyncio.TimeoutError:
+                pass
+            now = time.perf_counter()
+            expected_tick = last_tick + control_interval_seconds
+            event_loop_lag_ms = max(0.0, (now - expected_tick) * 1000.0)
+            last_tick = now
+            resource_snapshot = debug_ray_resource_snapshot()
+            available_cpu = float(resource_snapshot.get("available_cpu", 0.0) or 0.0)
+            cluster_cpu = float(resource_snapshot.get("cluster_cpu", 0.0) or 0.0)
+            used_cpu = float(resource_snapshot.get("used_cpu", 0.0) or 0.0)
+            cpu_utilization = max(0.0, min(1.0, used_cpu / cluster_cpu)) if cluster_cpu > 0 else 0.0
+            checkpoint_backlog: dict[str, Any] = {}
+            if checkpoint_actor is not None:
+                try:
+                    checkpoint_backlog = dict(await _ray_get(checkpoint_actor.get_backlog_snapshot.remote()) or {})
+                except Exception:
+                    logger.exception("Failed to snapshot checkpoint backlog for classify controller")
+                if (now - last_checkpoint_flush) >= 10.0:
+                    checkpoint_actor.export_all.remote()
+                    last_checkpoint_flush = now
+            checkpoint_pending_rows = int(checkpoint_backlog.get("pending_rows_total", 0) or 0)
+            ocr_queue_depth = int(ocr_progress_stats.get("queue_depth", 0) or 0)
+            completed_now = classify_progress.completed
+            completed_delta = max(0, completed_now - last_completed)
+            last_completed = completed_now
+            severe_reasons: list[str] = []
+            if available_cpu < severe_available_cpu_floor:
+                severe_reasons.append("cpu_headroom_low")
+            if available_cpu < float(cpu_headroom_cores) and cpu_utilization > min(0.99, target_cpu_utilization + 0.12):
+                severe_reasons.append("cpu_utilization")
+            if event_loop_lag_ms > 250.0:
+                severe_reasons.append("event_loop_lag")
+            if checkpoint_pending_rows > 20000:
+                severe_reasons.append("checkpoint_backlog")
+            if ocr_queue_depth > max(32, len(pending) * 2):
+                severe_reasons.append("ocr_backlog")
+            if dynamic_control_enabled and severe_reasons:
+                controller_state["healthy_streak"] = 0
+                if int(controller_state["classify_live_inflight"]) > classify_inflight_floor:
+                    controller_state["classify_live_inflight"] = max(
+                        classify_inflight_floor,
+                        int(controller_state["classify_live_inflight"]) - 4,
+                    )
+                    controller_state["action"] = "downshift"
+                else:
+                    controller_state["action"] = "hold"
+                controller_state["reason"] = ",".join(severe_reasons[:3])
+            else:
+                healthy_window = (
+                    available_cpu > healthy_available_cpu_floor
+                    and cpu_utilization < min(0.99, target_cpu_utilization + 0.05)
+                    and event_loop_lag_ms < 100.0
+                    and checkpoint_pending_rows < 5000
+                    and ocr_queue_depth < max(8, len(ocr_actors) * 8)
+                    and (completed_delta > 0 or not pending)
+                )
+                if dynamic_control_enabled and healthy_window:
+                    controller_state["healthy_streak"] = int(controller_state.get("healthy_streak", 0) or 0) + 1
+                    if int(controller_state["healthy_streak"]) >= 2:
+                        controller_state["healthy_streak"] = 0
+                        if int(controller_state["classify_live_inflight"]) < classify_inflight_cap:
+                            controller_state["classify_live_inflight"] = min(
+                                classify_inflight_cap,
+                                int(controller_state["classify_live_inflight"]) + 4,
+                            )
+                            controller_state["action"] = "upshift"
+                            controller_state["reason"] = "healthy_window"
+                        else:
+                            controller_state["action"] = "hold"
+                            controller_state["reason"] = "at_cap"
+                    else:
+                        controller_state["action"] = "hold"
+                        controller_state["reason"] = "healthy_window_pending"
+                else:
+                    controller_state["healthy_streak"] = 0
+                    controller_state["action"] = "hold"
+                    controller_state["reason"] = "dynamic_control_disabled" if not dynamic_control_enabled else "steady"
+            controller_state.update(
+                {
+                    "available_cpu": round(available_cpu, 3),
+                    "cpu_utilization": round(cpu_utilization, 3),
+                    "event_loop_lag_ms": round(event_loop_lag_ms, 3),
+                    "checkpoint_pending_rows": checkpoint_pending_rows,
+                    "ocr_queue_depth": ocr_queue_depth,
+                    "progress_completed": int(completed_now),
+                }
+            )
+
+    control_task = asyncio.create_task(_control_monitor()) if (checkpoint_actor is not None or dynamic_control_enabled) else None
 
     _submit_until_cap()
     _refresh_progress_bar(progress_bar)
@@ -1154,6 +1311,9 @@ async def run_hash_only_pipeline_with_ray_impl(
         progress_stop.set()
         if progress_task is not None:
             await asyncio.gather(progress_task, return_exceptions=True)
+        controller_stop.set()
+        if control_task is not None:
+            await asyncio.gather(control_task, return_exceptions=True)
         heartbeat_stop.set()
         if heartbeat_task is not None:
             await asyncio.gather(heartbeat_task, return_exceptions=True)
