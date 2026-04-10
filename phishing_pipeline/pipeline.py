@@ -74,6 +74,34 @@ from .utils import (
 )
 
 # ------------------------------------------------------------------
+def move_screenshot_to_evidence_from_path(screenshot_path: str, pdf_path: str) -> bool:
+    try:
+        source_screenshot_path = str(screenshot_path or "").strip()
+        if not source_screenshot_path or not os.path.exists(source_screenshot_path):
+            logger.warning("Screenshot file not found: %s", source_screenshot_path)
+            return False
+
+        pdf = FPDF()
+        pdf.add_page()
+
+        try:
+            with Image.open(source_screenshot_path) as img:
+                w, h = img.width, img.height
+                img_w = 190
+                img_h = (h * img_w) / w
+                pdf.image(source_screenshot_path, x=10, y=10, w=img_w, h=img_h)
+        except Exception as img_e:
+            logger.error("Error processing image for PDF: %s", img_e)
+            pdf.set_font("Arial", "B", 12)
+            pdf.text(10, 10, "Error: Could not embed screenshot.")
+
+        pdf.output(pdf_path, "F")
+        return True
+    except Exception as exc:
+        logger.error("Failed to move screenshot to evidence PDF from explicit path: %s", exc)
+        return False
+
+# ------------------------------------------------------------------
 # Direct RDAP URLs (bypass rdap.org bootstrap to avoid 10/10s limit)
 # ------------------------------------------------------------------
 RDAP_DIRECT_URLS = {
@@ -917,6 +945,51 @@ def _normalize_replayed_columns(df: pd.DataFrame, columns: list[str]) -> pd.Data
     return df
 
 
+def _normalize_host_value(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    if parsed.hostname:
+        return parsed.hostname.strip().lower()
+    return text.split("/")[0].split(":")[0].strip().lower()
+
+
+def _registered_domain_value(host: str) -> str:
+    normalized_host = _normalize_host_value(host)
+    if not normalized_host:
+        return ""
+    ext = tldextract.extract(normalized_host)
+    registered = ".".join(part for part in [ext.domain, ext.suffix] if part).strip().lower()
+    return registered or normalized_host
+
+
+def _resolve_effective_detection_target(row: dict) -> dict[str, str | bool]:
+    original_url = str(row.get("Identified Phishing/Suspected Domain Name", "") or "").strip()
+    final_landing_url = str(row.get("final_landing_url", "") or "").strip()
+    fetch_status = str(row.get("fetch_status", "") or "").strip().lower()
+    original_host = _normalize_host_value(original_url)
+    final_host = _normalize_host_value(final_landing_url)
+    redirect_promoted = bool(
+        fetch_status in {"fetched", "fetched_visual_missing"}
+        and final_landing_url
+        and final_host
+        and final_host != original_host
+        and _registered_domain_value(final_host) != _registered_domain_value(original_host)
+    )
+    effective_url = final_landing_url if redirect_promoted else (original_url or final_landing_url)
+    effective_host = final_host if redirect_promoted else (original_host or final_host)
+    return {
+        "original_url": original_url,
+        "original_host": original_host,
+        "final_landing_url": final_landing_url,
+        "final_host": final_host,
+        "redirect_promoted": redirect_promoted,
+        "effective_url": str(effective_url or ""),
+        "effective_host": str(effective_host or ""),
+    }
+
+
 _REVIEW_QUEUE_KEY_COLUMNS = [
     "Identified Phishing/Suspected Domain Name",
     "Cooresponding CSE",
@@ -1565,11 +1638,12 @@ async def _run_hash_only_pipeline(
         return RDAP_DIRECT_URLS.get(tld, RDAP_FALLBACK_URL)
 
     async def _process_hash_row(row: dict, client: httpx.AsyncClient, worker_id: str = ""):
-        domain_url = str(row.get("Identified Phishing/Suspected Domain Name", "")).strip()
+        target_info = _resolve_effective_detection_target(row)
+        input_domain_url = str(target_info["original_url"] or row.get("Identified Phishing/Suspected Domain Name", "") or "").strip()
+        domain_url = str(target_info["effective_url"] or input_domain_url).strip()
         stage_started_at = utc_now_iso()
         stage_started_monotonic = time.perf_counter()
-        host = urlparse(domain_url).hostname or domain_url
-        host = host.split(":")[0]
+        host = str(target_info["effective_host"] or (urlparse(domain_url).hostname or domain_url)).split(":")[0]
         screenshot_path = str(row.get("screenshot_path", "") or "").strip()
         fetch_status = str(row.get("fetch_status", "fetched") or "fetched").strip().lower()
         source_workbook = str(row.get("source_workbook", "") or "")
@@ -2097,7 +2171,7 @@ async def _run_hash_only_pipeline(
                 serial_no,
                 application_id=APPLICATION_ID,
             )
-            await asyncio.to_thread(move_screenshot_to_evidence, domain_url, evidence_path)
+            await asyncio.to_thread(move_screenshot_to_evidence_from_path, screenshot_path, evidence_path)
 
         detection_date = datetime.now().strftime("%d-%m-%Y")
         detection_time_str = datetime.now().strftime("%H:%M:%S")
@@ -2479,6 +2553,7 @@ async def run_pipeline(
     checkpoint_store: CheckpointStore | None = None,
     resume: bool = False,
     force_reprocess: bool = False,
+    execution_backend: str = "auto",
 ):
     import time
     from tqdm import tqdm as tqdm_sync
@@ -2488,6 +2563,11 @@ async def run_pipeline(
     pipeline_mode = str(pipeline_mode or "hash_only").strip().lower()
     if pipeline_mode not in {"hash_only", "legacy_ocr"}:
         raise ValueError(f"Unsupported pipeline_mode '{pipeline_mode}'. Use 'hash_only' or 'legacy_ocr'.")
+    resolved_backend = str(execution_backend or "auto").strip().lower()
+    if pipeline_mode == "legacy_ocr":
+        resolved_backend = "legacy"
+    elif resolved_backend == "auto":
+        resolved_backend = "ray"
     if high_confidence_threshold < medium_confidence_threshold:
         raise ValueError("high_confidence_threshold must be >= medium_confidence_threshold")
     logger.info(
@@ -2565,6 +2645,7 @@ async def run_pipeline(
                 checkpoint_store=checkpoint_store,
                 resume=resume,
                 force_reprocess=force_reprocess,
+                execution_backend=resolved_backend,
             )
             
             os.makedirs(os.path.dirname(holdout_csv_path), exist_ok=True)
@@ -2620,18 +2701,33 @@ async def run_pipeline(
         logger.info("%d domains remaining after legacy checkpoint resume", len(df_filtered))
 
     if pipeline_mode == "hash_only":
-        df_out = await _run_hash_only_pipeline(
-            df_filtered=df_filtered,
-            whois_rate_limiter=whois_rate_limiter,
-            high_confidence_threshold=high_confidence_threshold,
-            medium_confidence_threshold=medium_confidence_threshold,
-            failed_fetch_suspected_min=failed_fetch_suspected_min,
-            failed_fetch_review_min=failed_fetch_review_min,
-            run_context=run_context,
-            checkpoint_store=checkpoint_store,
-            resume=resume,
-            force_reprocess=force_reprocess,
-        )
+        if resolved_backend == "ray":
+            from .ray_runtime import run_hash_only_pipeline_with_ray
+
+            df_out = await run_hash_only_pipeline_with_ray(
+                df_filtered=df_filtered,
+                high_confidence_threshold=high_confidence_threshold,
+                medium_confidence_threshold=medium_confidence_threshold,
+                failed_fetch_suspected_min=failed_fetch_suspected_min,
+                failed_fetch_review_min=failed_fetch_review_min,
+                run_context=run_context,
+                checkpoint_store=checkpoint_store,
+                resume=resume,
+                force_reprocess=force_reprocess,
+            )
+        else:
+            df_out = await _run_hash_only_pipeline(
+                df_filtered=df_filtered,
+                whois_rate_limiter=whois_rate_limiter,
+                high_confidence_threshold=high_confidence_threshold,
+                medium_confidence_threshold=medium_confidence_threshold,
+                failed_fetch_suspected_min=failed_fetch_suspected_min,
+                failed_fetch_review_min=failed_fetch_review_min,
+                run_context=run_context,
+                checkpoint_store=checkpoint_store,
+                resume=resume,
+                force_reprocess=force_reprocess,
+            )
         pipeline_time = time.time() - start_time
         logger.info(
             "✅ Hash-only pipeline complete in %.1fs (%d records)",

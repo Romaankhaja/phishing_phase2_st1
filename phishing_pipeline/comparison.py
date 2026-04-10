@@ -9901,8 +9901,39 @@ async def run_hashing_shortlist_async(
     checkpoint_store: CheckpointStore | None = None,
     resume: bool = False,
     force_reprocess: bool = False,
+    execution_backend: str = "auto",
 ):
     """Async entry point for hashing shortlist."""
+    resolved_backend = str(execution_backend or "auto").strip().lower()
+    if resolved_backend == "auto":
+        resolved_backend = "legacy"
+    if resolved_backend == "ray":
+        from .ray_runtime import run_hashing_shortlist_with_ray
+
+        return await run_hashing_shortlist_with_ray(
+            url_list,
+            threshold=threshold,
+            domain_similarity_threshold=domain_similarity_threshold,
+            high_confidence_threshold=high_confidence_threshold,
+            medium_confidence_threshold=medium_confidence_threshold,
+            typo_top_k=typo_top_k,
+            typo_min_score=typo_min_score,
+            lexical_pass_min_score=lexical_pass_min_score,
+            weights=weights,
+            shortlist_debug_csv=shortlist_debug_csv,
+            url_sources=url_sources,
+            keep_stage1_suspected=keep_stage1_suspected,
+            keep_fetch_failed_strict_lexical=keep_fetch_failed_strict_lexical,
+            stage1_escalate_total_threshold=stage1_escalate_total_threshold,
+            stage1_brand_min=stage1_brand_min,
+            stage1_credential_min=stage1_credential_min,
+            stage1_low_band_min=stage1_low_band_min,
+            stage1_hard_trigger_brand_min=stage1_hard_trigger_brand_min,
+            run_context=run_context,
+            checkpoint_store=checkpoint_store,
+            resume=resume,
+            force_reprocess=force_reprocess,
+        )
     return await run_hashing_shortlist_streaming(
         url_list,
         threshold=threshold,

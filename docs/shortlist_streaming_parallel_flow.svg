@@ -1,0 +1,180 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="980" viewBox="0 0 1600 980" role="img" aria-labelledby="title desc">
+  <title id="title">Streaming shortlist parallel flow</title>
+  <desc id="desc">System flow diagram showing how 1000 URLs move concurrently through Stage0 lexical gate, Stage1 cheap HTTP, and Hash pipeline.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#355c7d"/>
+    </marker>
+    <style>
+      .bg { fill: #f7f5ef; }
+      .title { font: 700 28px 'Segoe UI', Arial, sans-serif; fill: #132238; }
+      .subtitle { font: 400 15px 'Segoe UI', Arial, sans-serif; fill: #425466; }
+      .lane-title { font: 700 18px 'Segoe UI', Arial, sans-serif; fill: #17324d; }
+      .label { font: 600 15px 'Segoe UI', Arial, sans-serif; fill: #17324d; }
+      .small { font: 400 13px 'Segoe UI', Arial, sans-serif; fill: #4e5d6c; }
+      .tiny { font: 400 12px 'Segoe UI', Arial, sans-serif; fill: #5a6877; }
+      .count { font: 700 14px 'Segoe UI', Arial, sans-serif; fill: #7a2518; }
+      .box { rx: 18; ry: 18; stroke-width: 2; }
+      .input { fill: #fff8e8; stroke: #c9951a; }
+      .stage0 { fill: #e9f4ff; stroke: #5796d1; }
+      .queue { fill: #f3f0ff; stroke: #7b68cc; }
+      .stage1 { fill: #edf9ee; stroke: #4c9f61; }
+      .hash { fill: #fff0f3; stroke: #c55d7d; }
+      .out { fill: #fff7ea; stroke: #c98424; }
+      .drop { fill: #f2f4f6; stroke: #8a99a8; }
+      .group { fill: none; stroke-width: 2.5; stroke-dasharray: 9 7; }
+      .arrow { fill: none; stroke: #355c7d; stroke-width: 3; marker-end: url(#arrow); }
+      .soft-arrow { fill: none; stroke: #4c9f61; stroke-width: 3; marker-end: url(#arrow); }
+      .hash-arrow { fill: none; stroke: #b84568; stroke-width: 3; marker-end: url(#arrow); }
+      .note { fill: #ffffff; stroke: #d6dde5; stroke-width: 1.5; }
+      .timeline { fill: #ffffff; stroke: #b9c5d1; stroke-width: 1.5; }
+      .tick { stroke: #8ca0b3; stroke-width: 2; }
+      .parallel-bar { fill: #d8ecff; stroke: #5796d1; stroke-width: 1.5; }
+      .parallel-bar2 { fill: #dff3e3; stroke: #4c9f61; stroke-width: 1.5; }
+      .parallel-bar3 { fill: #ffe0e7; stroke: #c55d7d; stroke-width: 1.5; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1600" height="980"/>
+
+  <text class="title" x="56" y="56">Concurrent Shortlist Flow: 1000-URL Example</text>
+  <text class="subtitle" x="56" y="84">This is the streaming-concurrent server flow: Stage0 keeps producing while Stage1 routes misses and Hash processes admitted URLs in parallel.</text>
+
+  <rect class="note" x="1110" y="28" width="430" height="88" rx="16" ry="16"/>
+  <text class="label" x="1134" y="58">What the progress bars mean</text>
+  <text class="small" x="1134" y="84">Stage0 bar = all input URLs</text>
+  <text class="small" x="1328" y="84">Stage1 bar = lexical misses only</text>
+  <text class="small" x="1134" y="106">Hash bar = URLs admitted to hash so far</text>
+
+  <rect x="40" y="140" width="1520" height="180" rx="24" ry="24" fill="#fcfeff" stroke="#d7e1ea" stroke-width="2"/>
+  <text class="lane-title" x="64" y="172">1. Intake and Stage0 lexical gate</text>
+
+  <rect class="box input" x="66" y="205" width="220" height="82"/>
+  <text class="label" x="90" y="238">1000 raw URL rows</text>
+  <text class="small" x="90" y="262">Loaded from Excel inputs</text>
+
+  <rect class="box input" x="344" y="205" width="258" height="82"/>
+  <text class="label" x="368" y="238">Normalize + deduplicate</text>
+  <text class="small" x="368" y="262">Example: 960 unique URLs + 40 duplicate mappings</text>
+
+  <rect class="box stage0" x="670" y="190" width="340" height="112"/>
+  <text class="label" x="694" y="224">Stage0 lexical gate producer</text>
+  <text class="small" x="694" y="248">Batched lexical scoring on unique normalized URLs</text>
+  <text class="small" x="694" y="270">As each batch finishes, URLs are routed immediately</text>
+
+  <rect class="box queue" x="1098" y="170" width="186" height="70"/>
+  <text class="label" x="1120" y="200">Hash ingress queue</text>
+  <text class="count" x="1120" y="222">540 direct lexical hits</text>
+
+  <rect class="box queue" x="1098" y="252" width="186" height="70"/>
+  <text class="label" x="1120" y="282">Stage1 ingress queue</text>
+  <text class="count" x="1120" y="304">420 lexical misses</text>
+
+  <path class="arrow" d="M 286 246 L 344 246"/>
+  <path class="arrow" d="M 602 246 L 670 246"/>
+  <path class="arrow" d="M 1010 216 C 1045 216, 1060 205, 1098 205"/>
+  <path class="soft-arrow" d="M 1010 276 C 1045 286, 1060 286, 1098 286"/>
+
+  <rect x="40" y="348" width="1520" height="240" rx="24" ry="24" fill="#fcfffc" stroke="#d7e1ea" stroke-width="2"/>
+  <text class="lane-title" x="64" y="380">2. Stage1 cheap HTTP pipeline for lexical misses</text>
+  <rect class="group" x="210" y="408" width="1120" height="126" rx="24" ry="24" stroke="#5baf72"/>
+
+  <rect class="box stage1" x="236" y="434" width="158" height="74"/>
+  <text class="label" x="284" y="464">Fetch</text>
+  <text class="small" x="255" y="488">HEAD / GET / redirect info</text>
+
+  <rect class="box stage1" x="448" y="434" width="158" height="74"/>
+  <text class="label" x="495" y="464">Parse</text>
+  <text class="small" x="470" y="488">HTML, title, forms, cues</text>
+
+  <rect class="box stage1" x="660" y="434" width="158" height="74"/>
+  <text class="label" x="708" y="464">Score</text>
+  <text class="small" x="684" y="488">Apply Stage1 rules</text>
+
+  <rect class="box stage1" x="872" y="434" width="158" height="74"/>
+  <text class="label" x="914" y="464">Enrich</text>
+  <text class="small" x="888" y="488">DNS / TLS / RDAP if needed</text>
+
+  <rect class="box stage1" x="1084" y="434" width="214" height="74"/>
+  <text class="label" x="1144" y="464">Finalize</text>
+  <text class="small" x="1108" y="488">Single writer updates results + checkpoints</text>
+
+  <path class="soft-arrow" d="M 1284 287 C 1230 320, 1170 365, 1170 434"/>
+  <path class="soft-arrow" d="M 394 471 L 448 471"/>
+  <path class="soft-arrow" d="M 606 471 L 660 471"/>
+  <path class="soft-arrow" d="M 818 471 L 872 471"/>
+  <path class="soft-arrow" d="M 1030 471 L 1084 471"/>
+
+  <rect class="box queue" x="1360" y="420" width="154" height="86"/>
+  <text class="label" x="1386" y="450">To Hash</text>
+  <text class="count" x="1386" y="474">80 rescued URLs</text>
+  <text class="small" x="1386" y="496">Escalated by Stage1</text>
+
+  <rect class="box drop" x="1360" y="520" width="154" height="86"/>
+  <text class="label" x="1386" y="550">Filtered out</text>
+  <text class="count" x="1386" y="574">340 rejected</text>
+  <text class="small" x="1386" y="596">Do not enter hash</text>
+
+  <path class="soft-arrow" d="M 1298 458 C 1322 458, 1330 463, 1360 463"/>
+  <path class="arrow" d="M 1298 492 C 1322 520, 1330 548, 1360 563"/>
+
+  <path class="hash-arrow" d="M 1514 463 C 1538 463, 1544 205, 1284 205"/>
+
+  <rect x="40" y="614" width="1520" height="214" rx="24" ry="24" fill="#fffdfd" stroke="#d7e1ea" stroke-width="2"/>
+  <text class="lane-title" x="64" y="646">3. Hash pipeline for admitted URLs</text>
+  <rect class="group" x="200" y="674" width="1055" height="108" rx="24" ry="24" stroke="#cd6d86"/>
+
+  <rect class="box hash" x="228" y="694" width="214" height="70"/>
+  <text class="label" x="256" y="724">Render / browser workers</text>
+  <text class="small" x="256" y="748">Playwright page fetch + screenshot</text>
+
+  <rect class="box hash" x="500" y="694" width="214" height="70"/>
+  <text class="label" x="557" y="724">Aux lane</text>
+  <text class="small" x="524" y="748">favicon, SSL, domain side fetches</text>
+
+  <rect class="box hash" x="772" y="694" width="214" height="70"/>
+  <text class="label" x="824" y="724">GPU / final scorer</text>
+  <text class="small" x="794" y="748">hash scoring + shortlist decision</text>
+
+  <rect class="box out" x="1060" y="680" width="208" height="84"/>
+  <text class="label" x="1108" y="712">holdout.csv</text>
+  <text class="count" x="1084" y="736">Example: 120 shortlisted</text>
+  <text class="small" x="1084" y="758">Main output for classifier</text>
+
+  <rect class="box drop" x="1304" y="680" width="208" height="84"/>
+  <text class="label" x="1344" y="712">review / filtered</text>
+  <text class="count" x="1328" y="736">Example: 500 not shortlisted</text>
+  <text class="small" x="1328" y="758">Debug or review outputs</text>
+
+  <path class="hash-arrow" d="M 442 729 L 500 729"/>
+  <path class="hash-arrow" d="M 714 729 L 772 729"/>
+  <path class="hash-arrow" d="M 986 716 L 1060 716"/>
+  <path class="arrow" d="M 986 744 C 1030 760, 1160 796, 1304 724"/>
+
+  <rect class="timeline" x="40" y="852" width="1520" height="94" rx="20" ry="20"/>
+  <text class="lane-title" x="64" y="882">Overlap in time</text>
+
+  <line class="tick" x1="210" y1="904" x2="210" y2="930"/>
+  <line class="tick" x1="492" y1="904" x2="492" y2="930"/>
+  <line class="tick" x1="792" y1="904" x2="792" y2="930"/>
+  <line class="tick" x1="1092" y1="904" x2="1092" y2="930"/>
+  <line class="tick" x1="1392" y1="904" x2="1392" y2="930"/>
+
+  <text class="small" x="196" y="899">t0</text>
+  <text class="small" x="478" y="899">t1</text>
+  <text class="small" x="778" y="899">t2</text>
+  <text class="small" x="1078" y="899">t3</text>
+  <text class="small" x="1378" y="899">t4</text>
+
+  <text class="tiny" x="64" y="916">Stage0</text>
+  <rect class="parallel-bar" x="210" y="902" width="952" height="12" rx="6" ry="6"/>
+  <text class="tiny" x="1180" y="914">Keeps producing lexical batches</text>
+
+  <text class="tiny" x="64" y="934">Stage1</text>
+  <rect class="parallel-bar2" x="492" y="920" width="560" height="12" rx="6" ry="6"/>
+  <text class="tiny" x="1070" y="932">Starts as soon as first lexical misses arrive</text>
+
+  <text class="tiny" x="64" y="952">Hash</text>
+  <rect class="parallel-bar3" x="492" y="938" width="760" height="12" rx="6" ry="6"/>
+  <text class="tiny" x="1270" y="950">Starts while Stage0 and Stage1 are still running</text>
+</svg>

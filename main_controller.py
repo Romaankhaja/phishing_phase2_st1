@@ -117,7 +117,7 @@ def _stage_smoke_mode(value: str) -> str:
 
 def _runtime_profile(value: str) -> str:
     normalized = str(value).strip().lower()
-    allowed = {"auto", "default", "cpu-safe", "cpu-recall", "cpu-fast"}
+    allowed = {"auto", "default", "cpu-safe", "cpu-recall", "cpu-fast", "server-throughput"}
     if normalized not in allowed:
         raise argparse.ArgumentTypeError(f"runtime profile must be one of {sorted(allowed)}")
     return normalized
@@ -165,8 +165,8 @@ def _resolve_auto_runtime_profile(resource_info: dict[str, Any] | None = None) -
     ram_gb = float(resource_info.get("ram_gb", 0.0) or 0.0)
     vram_gb = float(resource_info.get("vram_gb", 0.0) or 0.0)
 
-    if cpu_cores >= 32 and ram_gb >= 96.0:
-        return "cpu-recall"
+    if cpu_cores >= 32 and ram_gb >= 128.0:
+        return "server-throughput"
     if cpu_cores <= 16 or ram_gb < 16.0 or (0.0 < vram_gb <= 6.0):
         return "cpu-safe"
     return "cpu-fast"
@@ -184,6 +184,8 @@ def _resolve_runtime_profile_settings(
         if requested_profile in {"auto", "default"}
         else requested_profile
     )
+    if resolved_profile == "cpu-recall":
+        resolved_profile = "server-throughput"
 
     profiles: dict[str, dict[str, Any]] = {
         "cpu-safe": {
@@ -225,46 +227,72 @@ def _resolve_runtime_profile_settings(
                 "stage1_result_queue_max": 2000,
                 "stage1_control_interval_seconds": 2.0,
             },
+            "reliability": {},
         },
-        "cpu-recall": {
+        "server-throughput": {
             "env": {
-                "PHISHING_HASH_PAGES": 64,
-                "PHISHING_HASH_PAGE_CONCURRENCY": 8,
-                "PHISHING_HASH_HTTP_LIMIT": 256,
-                "PHISHING_HASH_AUX_NET_LIMIT": 128,
-                "PHISHING_HASH_ACTIVE_PAGES_FLOOR": 8,
-                "PHISHING_LEXICAL_WORKERS": 16,
-                "PHISHING_LEXICAL_BATCH_SIZE": 512,
+                "PHISHING_HASH_PAGES": 48,
+                "PHISHING_HASH_PAGE_CONCURRENCY": 4,
+                "PHISHING_HASH_HTTP_LIMIT": 384,
+                "PHISHING_HASH_AUX_NET_LIMIT": 192,
+                "PHISHING_HASH_ACTIVE_PAGES_FLOOR": 16,
+                "PHISHING_LEXICAL_WORKERS": 32,
+                "PHISHING_LEXICAL_BATCH_SIZE": 2048,
                 "PHISHING_LEXICAL_INFLIGHT_BATCHES": 16,
                 "PHISHING_SHORTLIST_EXECUTION_MODE": "streaming-concurrent",
                 "PHISHING_HASH_PROGRESS_LOG_INTERVAL_SECONDS": 10,
                 "PHISHING_HASH_ADAPTIVE_DOWNSHIFT": "true",
+                "PHISHING_RAY_STAGE0_BATCH_SIZE": 2048,
+                "PHISHING_RAY_STAGE0_INFLIGHT": 16,
+                "PHISHING_RAY_STAGE1_FETCH_ACTORS": 24,
+                "PHISHING_RAY_STAGE1_ENRICH_ACTORS": 12,
+                "PHISHING_RAY_HASH_BROWSER_ACTORS": 12,
+                "PHISHING_RAY_HASH_TABS_PER_ACTOR": 4,
+                "PHISHING_RAY_HASH_FINALIZE_BATCH": 64,
+                "PHISHING_RAY_CLASSIFY_ACTORS": 16,
+                "PHISHING_RAY_CLASSIFY_INFLIGHT": 64,
+                "PHISHING_RAY_OCR_ACTORS": 1,
+                "PHISHING_RAY_STAGE1_FETCH_ACTOR_MAX_CONCURRENCY": 8,
+                "PHISHING_RAY_STAGE1_ENRICH_ACTOR_MAX_CONCURRENCY": 6,
+                "PHISHING_RAY_STAGE1_PENDING_CAP": 384,
+                "PHISHING_RAY_HASH_PENDING_CAP": 96,
+                "PHISHING_RAY_STAGE1_HTTP_CONNECTION_CAP": 1536,
+                "PHISHING_RAY_STAGE1_HTTP_KEEPALIVE_CAP": 768,
+                "PHISHING_RAY_OCR_BATCH_SIZE": 32,
+                "PHISHING_RAY_OCR_BATCH_DELAY_MS": 25,
+                "PHISHING_RAY_PREWARM_ACTORS": "true",
             },
             "stage1_http": {
-                "concurrency": 192,
-                "http_concurrency": 512,
-                "dns_concurrency": 256,
-                "rdap_concurrency": 24,
-                "tls_concurrency": 64,
-                "stage1_target_urls_per_sec": 1500,
-                "stage1_fetch_concurrency_start": 192,
-                "stage1_fetch_concurrency_max": 512,
-                "stage1_fetch_concurrency_floor": 64,
-                "stage1_http_connection_limit": 512,
-                "stage1_http_keepalive_limit": 256,
+                "concurrency": 384,
+                "http_concurrency": 1536,
+                "dns_concurrency": 512,
+                "rdap_concurrency": 32,
+                "tls_concurrency": 128,
+                "stage1_target_urls_per_sec": 2500,
+                "stage1_fetch_concurrency_start": 384,
+                "stage1_fetch_concurrency_max": 1536,
+                "stage1_fetch_concurrency_floor": 96,
+                "stage1_http_connection_limit": 1536,
+                "stage1_http_keepalive_limit": 768,
                 "stage1_per_host_limit": 4,
                 "stage1_cpu_workers": 24,
                 "stage1_parse_workers": 24,
-                "stage1_enrich_dns_concurrency": 256,
-                "stage1_enrich_rdap_concurrency": 24,
-                "stage1_enrich_tls_concurrency": 64,
-                "stage1_fetch_queue_max": 4096,
-                "stage1_cpu_queue_max": 2048,
-                "stage1_parse_queue_max": 1536,
-                "stage1_score_queue_max": 512,
-                "stage1_enrich_queue_max": 1024,
-                "stage1_result_queue_max": 4096,
+                "stage1_enrich_dns_concurrency": 512,
+                "stage1_enrich_rdap_concurrency": 32,
+                "stage1_enrich_tls_concurrency": 128,
+                "stage1_fetch_queue_max": 12000,
+                "stage1_cpu_queue_max": 8000,
+                "stage1_parse_queue_max": 8000,
+                "stage1_score_queue_max": 6000,
+                "stage1_enrich_queue_max": 8000,
+                "stage1_result_queue_max": 12000,
                 "stage1_control_interval_seconds": 2.0,
+            },
+            "reliability": {
+                "append_flush_interval_seconds": 10,
+                "append_flush_row_interval": 10000,
+                "snapshot_flush_interval_seconds": 60,
+                "snapshot_flush_row_interval": 50000,
             },
         },
         "cpu-fast": {
@@ -306,6 +334,7 @@ def _resolve_runtime_profile_settings(
                 "stage1_result_queue_max": 3000,
                 "stage1_control_interval_seconds": 2.0,
             },
+            "reliability": {},
         },
     }
     selected = profiles[resolved_profile]
@@ -316,6 +345,7 @@ def _resolve_runtime_profile_settings(
         "resource_info": resource_info,
         "env": dict(selected["env"]),
         "stage1_http": dict(selected["stage1_http"]),
+        "reliability": dict(selected.get("reliability") or {}),
     }
 
 
@@ -327,6 +357,11 @@ def _apply_runtime_profile_env(settings: dict[str, Any]) -> None:
 def _apply_stage1_http_runtime_profile(stage1_http_config: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
     stage1_http_config.update(settings.get("stage1_http") or {})
     return stage1_http_config
+
+
+def _apply_reliability_runtime_profile(reliability_config: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
+    reliability_config.update(settings.get("reliability") or {})
+    return reliability_config
 
 
 def _load_runtime_components() -> dict[str, Any]:
@@ -506,10 +541,24 @@ async def main():
                         help="Routing policy when cheap Stage1 HTTP analysis fails for lexical misses")
     parser.add_argument("--stall-threshold-seconds", type=_positive_int, default=180,
                         help="Watchdog threshold for no-progress detection in long-running stages (default=180)")
+    parser.add_argument("--ray-debug", action="store_true",
+                        help="Enable deep Ray debug logging: resource snapshots, task age tracking, stall detection heartbeats")
     args = parser.parse_args()
+
+    # --- Activate Ray debug mode if requested ---
+    if args.ray_debug:
+        os.environ["PHISHING_RAY_DEBUG"] = "1"
+        logger.info("\n" + "=" * 80)
+        logger.info("🔍  RAY DEBUG MODE ENABLED")
+        logger.info("    Verbose resource snapshots, pending task age tracking, and stall")
+        logger.info("    heartbeats will be logged with [RAY-DEBUG] prefix.")
+        logger.info("=" * 80 + "\n")
 
     from phishing_pipeline.config import OUTPUT_DIR, RELIABILITY_CONFIG, RUN_MANIFEST_CSV
     from phishing_pipeline.reliability import CheckpointStore, build_run_context
+
+    runtime_profile_settings = _resolve_runtime_profile_settings(args.runtime_profile)
+    reliability_config = _apply_reliability_runtime_profile(dict(RELIABILITY_CONFIG), runtime_profile_settings)
 
     reliability_metadata = {
         "shortlisting": os.path.abspath(args.shortlisting),
@@ -542,18 +591,19 @@ async def main():
         output_dir=OUTPUT_DIR,
         run_id=resolved_run_id,
         stall_threshold_seconds=args.stall_threshold_seconds,
-        watchdog_warning_seconds=int(RELIABILITY_CONFIG.get("watchdog_warning_seconds", 60)),
-        append_flush_interval_seconds=int(RELIABILITY_CONFIG.get("append_flush_interval_seconds", 5)),
-        append_flush_row_interval=int(RELIABILITY_CONFIG.get("append_flush_row_interval", 2000)),
-        snapshot_flush_interval_seconds=int(RELIABILITY_CONFIG.get("snapshot_flush_interval_seconds", 30)),
-        snapshot_flush_row_interval=int(RELIABILITY_CONFIG.get("snapshot_flush_row_interval", 5000)),
-        stage0_progress_log_interval_seconds=int(RELIABILITY_CONFIG.get("stage0_progress_log_interval_seconds", 10)),
+        watchdog_warning_seconds=int(reliability_config.get("watchdog_warning_seconds", 60)),
+        append_flush_interval_seconds=int(reliability_config.get("append_flush_interval_seconds", 5)),
+        append_flush_row_interval=int(reliability_config.get("append_flush_row_interval", 2000)),
+        snapshot_flush_interval_seconds=int(reliability_config.get("snapshot_flush_interval_seconds", 30)),
+        snapshot_flush_row_interval=int(reliability_config.get("snapshot_flush_row_interval", 5000)),
+        stage0_progress_log_interval_seconds=int(reliability_config.get("stage0_progress_log_interval_seconds", 10)),
         stage1_failure_policy=args.stage1_failure_policy,
-        max_worker_restarts=int(RELIABILITY_CONFIG.get("max_worker_restarts", 2)),
+        max_worker_restarts=int(reliability_config.get("max_worker_restarts", 2)),
         metadata=reliability_metadata,
     )
     checkpoint_store = CheckpointStore(run_context)
     checkpoint_store.update_manifest(status="running", metadata_json=reliability_metadata)
+    execution_backend = "ray" if args.pipeline_mode == "hash_only" else "legacy"
     logger.info(
         "Reliability run context | run_id=%s | resume=%s | force_reprocess=%s | manifest=%s | checkpoints=%s | stage1_failure_policy=%s | stall_threshold_seconds=%d",
         run_context.run_id,
@@ -564,8 +614,17 @@ async def main():
         run_context.stage1_failure_policy,
         run_context.stall_threshold_seconds,
     )
+    if execution_backend == "ray":
+        checkpoint_store.close()
+        checkpoint_store = None
 
-    runtime_profile_settings = _resolve_runtime_profile_settings(args.runtime_profile)
+    def _load_checkpoint_store_for_finalize():
+        store = checkpoint_store
+        if store is not None:
+            return store, False
+        store = CheckpointStore(run_context)
+        return store, True
+
     _apply_runtime_profile_env(runtime_profile_settings)
 
     components = _load_runtime_components()
@@ -577,6 +636,46 @@ async def main():
     run_hashing_shortlist_async = components["run_hashing_shortlist_async"]
     stage1_http_config = components["STAGE1_HTTP_CONFIG"] or {}
     _apply_stage1_http_runtime_profile(stage1_http_config, runtime_profile_settings)
+    ray_runtime = None
+    if execution_backend == "ray":
+        from phishing_pipeline import ray_runtime as ray_runtime
+
+    # --- Ray debug startup diagnostic ---
+    if getattr(args, "ray_debug", False) and execution_backend == "ray":
+        resource_info = _probe_runtime_resources()
+        from phishing_pipeline.config import resolve_ray_runtime_config
+        ray_cfg = resolve_ray_runtime_config()
+        actor_cpu_total = (
+            ray_cfg["stage1_fetch_actors"] * 0.25
+            + ray_cfg["stage1_enrich_actors"] * 0.25
+            + ray_cfg["hash_browser_actors"] * 0.5
+            + ray_cfg["classify_actors"] * 1.0
+            + ray_cfg.get("ocr_actors", 1) * 1.0
+        )
+        logger.info("\n" + "-" * 70)
+        logger.info("[RAY-DEBUG] STARTUP DIAGNOSTIC")
+        logger.info("  Physical CPUs:     %d", resource_info["cpu_cores"])
+        logger.info("  System RAM:        %.1f GB", resource_info["ram_gb"])
+        logger.info("  GPU VRAM:          %.1f GB", resource_info["vram_gb"])
+        logger.info("  Actor CPU demand:  %.1f  (fetch=%d*0.25 + enrich=%d*0.25 + browser=%d*0.5 + classify=%d*1.0 + ocr=%d*1.0)",
+            actor_cpu_total,
+            ray_cfg["stage1_fetch_actors"],
+            ray_cfg["stage1_enrich_actors"],
+            ray_cfg["hash_browser_actors"],
+            ray_cfg["classify_actors"],
+            ray_cfg.get("ocr_actors", 1),
+        )
+        logger.info("  Task CPU per call: 0.5  (stage0_batch, stage1_parse, hash_enrich, hash_finalize)")
+        logger.info("  Headroom:          %.1f CPUs  (%s)",
+            resource_info["cpu_cores"] - actor_cpu_total,
+            "✅ OK" if resource_info["cpu_cores"] > actor_cpu_total else "🛑 RISK OF DEADLOCK",
+        )
+        logger.info("  Memory mode:       %s",
+            "very_low" if ray_cfg.get("very_low_memory_mode") else
+            "low" if ray_cfg.get("low_memory_mode") else
+            "critical" if ray_cfg.get("critical_memory_mode") else "normal",
+        )
+        logger.info("-" * 70 + "\n")
 
     if args.high_confidence_threshold < args.medium_confidence_threshold:
         raise ValueError("high-confidence-threshold must be >= medium-confidence-threshold")
@@ -662,6 +761,8 @@ async def main():
 
     try:
         # 🧹 Clear GPU memory at the start of every run
+        if execution_backend == "ray" and ray_runtime is not None:
+            ray_runtime.ensure_ray_initialized()
         clear_gpu_memory()
 
         if resuming_existing_run:
@@ -824,6 +925,7 @@ async def main():
                     checkpoint_store=checkpoint_store,
                     resume=args.resume,
                     force_reprocess=args.force_reprocess,
+                    execution_backend=execution_backend,
                 )
                 logger.info("--- Finished Stage Smoke Test classify ---")
             else:
@@ -871,6 +973,7 @@ async def main():
                     checkpoint_store=checkpoint_store,
                     resume=args.resume,
                     force_reprocess=args.force_reprocess,
+                    execution_backend=execution_backend,
                 )
                 
                 # Save output to holdout.csv
@@ -882,8 +985,11 @@ async def main():
                 if args.stage_smoke_test in {"fetch", "lexical", "score"}:
                     logger.info("Stage smoke test '%s' requested. Stopping after Step 1.", args.stage_smoke_test)
                     df_out = holdout_df
-                    checkpoint_store.mark_completed()
-                    checkpoint_store.export_all()
+                    finalize_store, should_close_finalize_store = _load_checkpoint_store_for_finalize()
+                    finalize_store.mark_completed()
+                    finalize_store.export_all()
+                    if should_close_finalize_store:
+                        finalize_store.close()
                     return
                 
                 # 2. Run Pipeline
@@ -918,6 +1024,7 @@ async def main():
                     checkpoint_store=checkpoint_store,
                     resume=args.resume,
                     force_reprocess=args.force_reprocess,
+                    execution_backend=execution_backend,
                 )
                 
                 logger.info("--- Finished Step 2: Main Pipeline Complete ---")
@@ -954,6 +1061,7 @@ async def main():
                     checkpoint_store=checkpoint_store,
                     resume=args.resume,
                     force_reprocess=args.force_reprocess,
+                    execution_backend=execution_backend,
                 )
             except TypeError:
                 df_out = await run_pipeline(args.shortlisting, args.whitelist, args.limit)
@@ -980,12 +1088,18 @@ async def main():
                 print(df_out.head(10))
             except Exception:
                 logger.info("Output is not a pandas DataFrame or cannot be printed.")
-        checkpoint_store.mark_completed()
-        checkpoint_store.export_all()
+        finalize_store, should_close_finalize_store = _load_checkpoint_store_for_finalize()
+        finalize_store.mark_completed()
+        finalize_store.export_all()
+        if should_close_finalize_store:
+            finalize_store.close()
 
     except Exception as exc:
-        checkpoint_store.mark_failed(stage=fatal_stage, exc=exc)
-        checkpoint_store.export_all()
+        finalize_store, should_close_finalize_store = _load_checkpoint_store_for_finalize()
+        finalize_store.mark_failed(stage=fatal_stage, exc=exc)
+        finalize_store.export_all()
+        if should_close_finalize_store:
+            finalize_store.close()
         raise
 
     finally:
@@ -1005,9 +1119,15 @@ async def main():
         except Exception:
             pass  # Expected to fail on Windows
         try:
-            checkpoint_store.close()
+            if checkpoint_store is not None:
+                checkpoint_store.close()
         except Exception as exc:
             logger.warning("Checkpoint store close failed: %s", exc)
+        if execution_backend == "ray" and ray_runtime is not None:
+            try:
+                ray_runtime.shutdown_ray_runtime()
+            except Exception as exc:
+                logger.warning("Ray shutdown failed: %s", exc)
 
 
 if __name__ == "__main__":

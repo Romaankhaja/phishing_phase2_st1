@@ -1,4 +1,10 @@
 import os
+import sys
+
+try:
+    import psutil  # type: ignore
+except Exception:  # pragma: no cover
+    psutil = None
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
@@ -105,6 +111,60 @@ HASH_STAGE_CONFIG = {
     "hash_target_urls_per_sec": 24,
 }
 
+RAY_RUNTIME_CONFIG = {
+    "address": os.getenv("PHISHING_RAY_ADDRESS", "").strip(),
+    "local_mode": os.getenv("PHISHING_RAY_LOCAL_MODE", "").strip().lower() in {"1", "true", "yes", "on"},
+    "stage0_batch_size": max(64, int(os.getenv("PHISHING_RAY_STAGE0_BATCH_SIZE", os.getenv("PHISHING_LEXICAL_BATCH_SIZE", "512")))),
+    "stage0_inflight": max(1, int(os.getenv("PHISHING_RAY_STAGE0_INFLIGHT", "8"))),
+    "stage1_fetch_actors": max(1, int(os.getenv("PHISHING_RAY_STAGE1_FETCH_ACTORS", "24"))),
+    "stage1_enrich_actors": max(1, int(os.getenv("PHISHING_RAY_STAGE1_ENRICH_ACTORS", "12"))),
+    "hash_browser_actors": max(1, int(os.getenv("PHISHING_RAY_HASH_BROWSER_ACTORS", "6"))),
+    "hash_tabs_per_actor": max(1, int(os.getenv("PHISHING_RAY_HASH_TABS_PER_ACTOR", os.getenv("PHISHING_HASH_PAGE_CONCURRENCY", "4")))),
+    "hash_finalize_batch": max(1, int(os.getenv("PHISHING_RAY_HASH_FINALIZE_BATCH", "16"))),
+    "classify_actors": max(1, int(os.getenv("PHISHING_RAY_CLASSIFY_ACTORS", "12"))),
+    "classify_inflight": max(1, int(os.getenv("PHISHING_RAY_CLASSIFY_INFLIGHT", "24"))),
+    "ocr_actors": max(1, int(os.getenv("PHISHING_RAY_OCR_ACTORS", "1"))),
+    "ocr_batch_size": max(1, int(os.getenv("PHISHING_RAY_OCR_BATCH_SIZE", "32"))),
+    "ocr_batch_delay_ms": max(1, int(os.getenv("PHISHING_RAY_OCR_BATCH_DELAY_MS", "25"))),
+    "stage1_fetch_actor_max_concurrency": max(1, int(os.getenv("PHISHING_RAY_STAGE1_FETCH_ACTOR_MAX_CONCURRENCY", "4"))),
+    "stage1_enrich_actor_max_concurrency": max(1, int(os.getenv("PHISHING_RAY_STAGE1_ENRICH_ACTOR_MAX_CONCURRENCY", "4"))),
+    "stage1_pending_cap": max(1, int(os.getenv("PHISHING_RAY_STAGE1_PENDING_CAP", "48"))),
+    "hash_pending_cap": max(1, int(os.getenv("PHISHING_RAY_HASH_PENDING_CAP", "16"))),
+    "stage1_http_connection_cap": max(4, int(os.getenv("PHISHING_RAY_STAGE1_HTTP_CONNECTION_CAP", "64"))),
+    "stage1_http_keepalive_cap": max(2, int(os.getenv("PHISHING_RAY_STAGE1_HTTP_KEEPALIVE_CAP", "32"))),
+    "prewarm_actors": os.getenv("PHISHING_RAY_PREWARM_ACTORS", "").strip().lower() in {"1", "true", "yes", "on"},
+    "metrics_interval_seconds": max(1.0, float(os.getenv("PHISHING_RAY_METRICS_INTERVAL_SECONDS", "5"))),
+}
+
+RAY_ENV_TO_CONFIG_KEY = {
+    "PHISHING_RAY_ADDRESS": "address",
+    "PHISHING_RAY_LOCAL_MODE": "local_mode",
+    "PHISHING_RAY_STAGE0_BATCH_SIZE": "stage0_batch_size",
+    "PHISHING_RAY_STAGE0_INFLIGHT": "stage0_inflight",
+    "PHISHING_RAY_STAGE1_FETCH_ACTORS": "stage1_fetch_actors",
+    "PHISHING_RAY_STAGE1_ENRICH_ACTORS": "stage1_enrich_actors",
+    "PHISHING_RAY_HASH_BROWSER_ACTORS": "hash_browser_actors",
+    "PHISHING_RAY_HASH_TABS_PER_ACTOR": "hash_tabs_per_actor",
+    "PHISHING_RAY_HASH_FINALIZE_BATCH": "hash_finalize_batch",
+    "PHISHING_RAY_CLASSIFY_ACTORS": "classify_actors",
+    "PHISHING_RAY_CLASSIFY_INFLIGHT": "classify_inflight",
+    "PHISHING_RAY_OCR_ACTORS": "ocr_actors",
+    "PHISHING_RAY_OCR_BATCH_SIZE": "ocr_batch_size",
+    "PHISHING_RAY_OCR_BATCH_DELAY_MS": "ocr_batch_delay_ms",
+    "PHISHING_RAY_STAGE1_FETCH_ACTOR_MAX_CONCURRENCY": "stage1_fetch_actor_max_concurrency",
+    "PHISHING_RAY_STAGE1_ENRICH_ACTOR_MAX_CONCURRENCY": "stage1_enrich_actor_max_concurrency",
+    "PHISHING_RAY_STAGE1_PENDING_CAP": "stage1_pending_cap",
+    "PHISHING_RAY_HASH_PENDING_CAP": "hash_pending_cap",
+    "PHISHING_RAY_STAGE1_HTTP_CONNECTION_CAP": "stage1_http_connection_cap",
+    "PHISHING_RAY_STAGE1_HTTP_KEEPALIVE_CAP": "stage1_http_keepalive_cap",
+    "PHISHING_RAY_PREWARM_ACTORS": "prewarm_actors",
+    "PHISHING_RAY_METRICS_INTERVAL_SECONDS": "metrics_interval_seconds",
+}
+
+# Debug mode for Ray pipeline stall diagnostics
+RAY_DEBUG_MODE = os.getenv("PHISHING_RAY_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 STAGE3_RECALL_RESCUE_CONFIG = {
     "failed_fetch_suspected_min": None,
     "failed_fetch_review_min": None,
@@ -149,6 +209,287 @@ def resolve_hash_stage_config(overrides: dict | None = None) -> dict:
         if value is None:
             continue
         config[key] = value
+    return config
+
+
+def resolve_ray_runtime_config(overrides: dict | None = None) -> dict:
+    cpu_cores = os.cpu_count() or 4
+    hash_pages = max(1, int(os.getenv("PHISHING_HASH_PAGES", HASH_STAGE_CONFIG["hash_pages"])))
+    local_mode_env = os.getenv("PHISHING_RAY_LOCAL_MODE", "").strip().lower()
+    explicit_local_mode = (
+        local_mode_env in {"1", "true", "yes", "on"}
+        if local_mode_env
+        else None
+    )
+    total_ram_gb = 0.0
+    available_ram_gb = 0.0
+    if psutil is not None:
+        try:
+            vm = psutil.virtual_memory()
+            total_ram_gb = float(vm.total / (1024 ** 3))
+            available_ram_gb = float(vm.available / (1024 ** 3))
+        except Exception:
+            total_ram_gb = 0.0
+            available_ram_gb = 0.0
+    config = dict(RAY_RUNTIME_CONFIG)
+    overrides = dict(overrides or {})
+    explicit_keys = {key for key, value in overrides.items() if value is not None}
+    explicit_env_keys = {
+        config_key
+        for env_name, config_key in RAY_ENV_TO_CONFIG_KEY.items()
+        if os.getenv(env_name) is not None
+    }
+    for key, value in overrides.items():
+        if value is None:
+            continue
+        config[key] = value
+
+    low_memory_mode = bool((total_ram_gb and total_ram_gb <= 16.5) or (available_ram_gb and available_ram_gb < 4.0))
+    very_low_memory_mode = bool((total_ram_gb and total_ram_gb <= 8.5) or (available_ram_gb and available_ram_gb < 2.5))
+    critical_memory_mode = bool(available_ram_gb and available_ram_gb < 1.25)
+    server_mode = bool(cpu_cores >= 32 and total_ram_gb >= 128.0 and not critical_memory_mode)
+
+    server_defaults = {
+        "stage0_batch_size": 2048,
+        "stage0_inflight": 16,
+        "stage1_fetch_actors": 24,
+        "stage1_enrich_actors": 12,
+        "hash_browser_actors": 12,
+        "hash_tabs_per_actor": 4,
+        "hash_finalize_batch": 64,
+        "classify_actors": 16,
+        "classify_inflight": 64,
+        "ocr_actors": 1,
+        "ocr_batch_size": 32,
+        "ocr_batch_delay_ms": 25,
+        "stage1_fetch_actor_max_concurrency": 8,
+        "stage1_enrich_actor_max_concurrency": 6,
+        "stage1_pending_cap": 384,
+        "hash_pending_cap": 96,
+        "stage1_http_connection_cap": 1536,
+        "stage1_http_keepalive_cap": 768,
+        "prewarm_actors": True,
+    }
+    if server_mode:
+        for key, value in server_defaults.items():
+            if key not in explicit_keys and key not in explicit_env_keys:
+                config[key] = value
+
+    if very_low_memory_mode:
+        fetch_actor_cap = 1
+        enrich_actor_cap = 1
+        browser_actor_cap = 1
+        classify_actor_cap = 1
+        stage0_inflight_cap = 1
+        finalize_batch_cap = 2
+        stage0_batch_size_cap = 64
+        tabs_per_actor_cap = 1
+        fetch_actor_concurrency_cap = 1
+        enrich_actor_concurrency_cap = 1
+        classify_inflight_cap = 2
+        stage1_pending_cap = 8   # was 4 — too low, starves stage1 pipeline
+        hash_pending_cap = 4     # was 2 — too low, single browser actor needs work queued ahead
+        stage1_connection_cap = 8
+        stage1_keepalive_cap = 4
+    elif server_mode:
+        fetch_actor_cap = max(24, cpu_cores)
+        enrich_actor_cap = max(12, max(1, cpu_cores // 2))
+        browser_actor_cap = max(12, max(1, cpu_cores // 4))
+        classify_actor_cap = max(16, max(1, cpu_cores // 2))
+        stage0_inflight_cap = max(16, max(1, cpu_cores // 2))
+        finalize_batch_cap = 128
+        stage0_batch_size_cap = 4096
+        tabs_per_actor_cap = 4
+        fetch_actor_concurrency_cap = 8
+        enrich_actor_concurrency_cap = 6
+        classify_inflight_cap = max(64, cpu_cores * 4)
+        stage1_pending_cap = max(384, fetch_actor_cap * fetch_actor_concurrency_cap * 2)
+        hash_pending_cap = max(96, browser_actor_cap * tabs_per_actor_cap * 2)
+        stage1_connection_cap = max(1536, fetch_actor_cap * 64)
+        stage1_keepalive_cap = max(768, fetch_actor_cap * 32)
+    elif low_memory_mode:
+        fetch_actor_cap = 4
+        enrich_actor_cap = 2
+        browser_actor_cap = 2
+        classify_actor_cap = 2
+        stage0_inflight_cap = 2
+        finalize_batch_cap = 8
+        stage0_batch_size_cap = 128
+        tabs_per_actor_cap = 2
+        fetch_actor_concurrency_cap = 2
+        enrich_actor_concurrency_cap = 2
+        classify_inflight_cap = 4
+        stage1_pending_cap = 12
+        hash_pending_cap = 6
+        stage1_connection_cap = 24
+        stage1_keepalive_cap = 12
+    else:
+        fetch_actor_cap = max(4, cpu_cores * 2)
+        enrich_actor_cap = max(2, cpu_cores)
+        browser_actor_cap = max(1, cpu_cores // 3)
+        classify_actor_cap = max(2, cpu_cores)
+        stage0_inflight_cap = 8
+        finalize_batch_cap = 16
+        stage0_batch_size_cap = 512
+        tabs_per_actor_cap = max(1, min(4, cpu_cores // 2))
+        fetch_actor_concurrency_cap = 4
+        enrich_actor_concurrency_cap = 4
+        classify_inflight_cap = max(8, min(64, cpu_cores * 4))
+        stage1_pending_cap = max(16, cpu_cores * 6)
+        hash_pending_cap = max(8, cpu_cores * 2)
+        stage1_connection_cap = 64
+        stage1_keepalive_cap = 32
+
+    if critical_memory_mode:
+        fetch_actor_cap = min(fetch_actor_cap, 1)
+        enrich_actor_cap = min(enrich_actor_cap, 1)
+        browser_actor_cap = min(browser_actor_cap, 1)
+        classify_actor_cap = min(classify_actor_cap, 1)
+        stage0_inflight_cap = min(stage0_inflight_cap, 1)
+        finalize_batch_cap = min(finalize_batch_cap, 2)
+        stage0_batch_size_cap = min(stage0_batch_size_cap, 64)
+        tabs_per_actor_cap = min(tabs_per_actor_cap, 1)
+        fetch_actor_concurrency_cap = min(fetch_actor_concurrency_cap, 1)
+        enrich_actor_concurrency_cap = min(enrich_actor_concurrency_cap, 1)
+        classify_inflight_cap = min(classify_inflight_cap, 1)
+        # Pending caps are lightweight queue depth limits (dict refs only), not
+        # heavy memory allocations.  Keep enough headroom so the single actor
+        # always has work queued and the pipeline doesn't stall.
+        stage1_pending_cap = min(stage1_pending_cap, 6)
+        hash_pending_cap = min(hash_pending_cap, 3)
+        stage1_connection_cap = min(stage1_connection_cap, 6)
+        stage1_keepalive_cap = min(stage1_keepalive_cap, 3)
+
+    min_stage1_fetch_actors = 1 if very_low_memory_mode else 2 if low_memory_mode else 4
+    min_stage1_enrich_actors = 1
+    min_classify_actors = 1 if low_memory_mode else 2
+    min_stage0_inflight = 1
+    tabs_per_actor = max(
+        1,
+        min(
+            int(config.get("hash_tabs_per_actor", RAY_RUNTIME_CONFIG["hash_tabs_per_actor"]) or 1),
+            tabs_per_actor_cap,
+        ),
+    )
+    address = str(config.get("address", "") or "").strip()
+    del address
+    local_mode = explicit_local_mode if explicit_local_mode is not None else False
+
+    stage1_fetch_actors = max(
+        min_stage1_fetch_actors,
+        min(int(config.get("stage1_fetch_actors", 24) or 24), fetch_actor_cap),
+    )
+    stage1_enrich_actors = max(
+        min_stage1_enrich_actors,
+        min(int(config.get("stage1_enrich_actors", 12) or 12), enrich_actor_cap),
+    )
+    hash_browser_actors = max(
+        1,
+        min(
+            int(config.get("hash_browser_actors", max(1, (hash_pages + tabs_per_actor - 1) // tabs_per_actor)) or 1),
+            browser_actor_cap,
+        ),
+    )
+    classify_actors = max(
+        min_classify_actors,
+        min(int(config.get("classify_actors", 12) or 12), classify_actor_cap),
+    )
+    fetch_actor_max_concurrency = max(
+        1,
+        min(
+            int(config.get("stage1_fetch_actor_max_concurrency", RAY_RUNTIME_CONFIG["stage1_fetch_actor_max_concurrency"]) or 1),
+            fetch_actor_concurrency_cap,
+        ),
+    )
+    enrich_actor_max_concurrency = max(
+        1,
+        min(
+            int(config.get("stage1_enrich_actor_max_concurrency", RAY_RUNTIME_CONFIG["stage1_enrich_actor_max_concurrency"]) or 1),
+            enrich_actor_concurrency_cap,
+        ),
+    )
+    default_classify_inflight = max(1, classify_actors * (4 if server_mode else 2))
+    default_stage1_pending_cap = max(1, stage1_fetch_actors * fetch_actor_max_concurrency * (2 if server_mode else 1))
+    default_hash_pending_cap = max(1, hash_browser_actors * tabs_per_actor * 2)
+    default_stage1_connection_cap = 1536 if server_mode else int(config.get("stage1_http_connection_cap", stage1_connection_cap) or stage1_connection_cap)
+    default_stage1_keepalive_cap = 768 if server_mode else int(config.get("stage1_http_keepalive_cap", stage1_keepalive_cap) or stage1_keepalive_cap)
+
+    config.update(
+        {
+            "stage0_batch_size": max(64, min(int(config.get("stage0_batch_size", 512) or 512), stage0_batch_size_cap)),
+            "stage0_inflight": max(min_stage0_inflight, min(int(config.get("stage0_inflight", 8) or 8), stage0_inflight_cap)),
+            "stage1_fetch_actors": stage1_fetch_actors,
+            "stage1_enrich_actors": stage1_enrich_actors,
+            "hash_tabs_per_actor": tabs_per_actor,
+            "hash_browser_actors": hash_browser_actors,
+            "hash_finalize_batch": max(1, min(int(config.get("hash_finalize_batch", 16) or 16), finalize_batch_cap)),
+            "classify_actors": classify_actors,
+            "classify_inflight": max(1, min(int(config.get("classify_inflight", default_classify_inflight) or 1), classify_inflight_cap)),
+            "ocr_actors": max(1, int(config.get("ocr_actors", 1) or 1)),
+            "ocr_batch_size": max(1, int(config.get("ocr_batch_size", RAY_RUNTIME_CONFIG["ocr_batch_size"]) or 1)),
+            "ocr_batch_delay_ms": max(1, int(config.get("ocr_batch_delay_ms", RAY_RUNTIME_CONFIG["ocr_batch_delay_ms"]) or 1)),
+            "metrics_interval_seconds": max(1.0, float(config.get("metrics_interval_seconds", 5.0) or 5.0)),
+            "stage1_fetch_actor_max_concurrency": fetch_actor_max_concurrency,
+            "stage1_enrich_actor_max_concurrency": enrich_actor_max_concurrency,
+            "stage1_pending_cap": max(1, min(int(config.get("stage1_pending_cap", default_stage1_pending_cap) or 1), stage1_pending_cap)),
+            "hash_pending_cap": max(1, min(int(config.get("hash_pending_cap", default_hash_pending_cap) or 1), hash_pending_cap)),
+            "stage1_http_connection_cap": max(4, min(int(config.get("stage1_http_connection_cap", default_stage1_connection_cap) or 4), stage1_connection_cap)),
+            "stage1_http_keepalive_cap": max(2, min(int(config.get("stage1_http_keepalive_cap", default_stage1_keepalive_cap) or 2), stage1_keepalive_cap)),
+            "prewarm_actors": bool(config.get("prewarm_actors", server_mode and not low_memory_mode)),
+            "local_mode": bool(local_mode),
+            "low_memory_mode": bool(low_memory_mode),
+            "very_low_memory_mode": bool(very_low_memory_mode),
+            "critical_memory_mode": bool(critical_memory_mode),
+            "server_mode": bool(server_mode),
+            "detected_total_ram_gb": round(total_ram_gb, 2),
+            "detected_available_ram_gb": round(available_ram_gb, 2),
+            "debug_mode": bool(RAY_DEBUG_MODE),
+        }
+    )
+
+    # --- Resource budget validation ---
+    actor_cpu_demand = (
+        stage1_fetch_actors * 0.25
+        + stage1_enrich_actors * 0.25
+        + hash_browser_actors * (1.0 if config.get("server_mode") else 0.5)
+        + classify_actors * 1.0
+        + int(config.get("ocr_actors", 1)) * 1.0
+    )
+    stage0_task_cpu = 1.0
+    light_task_cpu = 0.5
+    finalize_task_cpu = 1.0
+    estimated_stage1_task_parallelism = min(
+        int(config.get("stage1_pending_cap", stage1_pending_cap) or stage1_pending_cap),
+        stage1_fetch_actors * max(1, int(config.get("stage1_fetch_actor_max_concurrency", 1) or 1)),
+    )
+    estimated_hash_task_parallelism = min(
+        int(config.get("hash_pending_cap", hash_pending_cap) or hash_pending_cap),
+        hash_browser_actors * max(1, int(config.get("hash_tabs_per_actor", 1) or 1)),
+    )
+    worst_case_task_cpus = (
+        int(config.get("stage0_inflight", 1)) * stage0_task_cpu
+        + estimated_stage1_task_parallelism * light_task_cpu
+        + estimated_hash_task_parallelism * light_task_cpu
+        + min(hash_browser_actors, int(config.get("hash_finalize_batch", 1) or 1)) * finalize_task_cpu
+    )
+    total_demand = actor_cpu_demand + worst_case_task_cpus
+    import logging as _cfg_logging
+    _cfg_logger = _cfg_logging.getLogger(__name__)
+    _cfg_logger.info(
+        "Ray resource budget | cpu_cores=%d | actor_cpu_demand=%.1f | worst_case_task_cpus=%.1f | total_demand=%.1f | headroom=%.1f",
+        cpu_cores, actor_cpu_demand, worst_case_task_cpus, total_demand, cpu_cores - total_demand,
+    )
+    if actor_cpu_demand > cpu_cores:
+        _cfg_logger.warning(
+            "Actor CPU reservations exceed available cores | actor_cpu_demand=%.1f | cpu_cores=%d. Reduce actor counts for this profile.",
+            actor_cpu_demand, cpu_cores,
+        )
+    elif total_demand > cpu_cores:
+        _cfg_logger.info(
+            "Ray task oversubscription will queue under load by design | total_demand=%.1f | cpu_cores=%d | actor_cpu_demand=%.1f",
+            total_demand, cpu_cores, actor_cpu_demand,
+        )
+
     return config
 
 STAGE1_SCORE_WEIGHTS = {

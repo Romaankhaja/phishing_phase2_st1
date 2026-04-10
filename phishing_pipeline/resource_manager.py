@@ -4,8 +4,10 @@ import psutil
 
 try:
     import torch
-    TORCH_AVAILABLE = torch.cuda.is_available()
+    TORCH_AVAILABLE = bool(torch.cuda.is_available() and torch.cuda.device_count() > 0)
 except ImportError:
+    TORCH_AVAILABLE = False
+except Exception:
     TORCH_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
@@ -18,9 +20,15 @@ class ResourceMonitor:
         self.check_interval = check_interval
         self.gpu_available = TORCH_AVAILABLE
         if self.gpu_available:
-            self.device_name = torch.cuda.get_device_name(0)
-            logger.info(f"ResourceMonitor: GPU detected: {self.device_name}")
+            try:
+                self.device_name = torch.cuda.get_device_name(0)
+                logger.info(f"ResourceMonitor: GPU detected: {self.device_name}")
+            except Exception as exc:
+                self.gpu_available = False
+                self.device_name = "CPU-only"
+                logger.info("ResourceMonitor: GPU not visible in this process (%s). Running in CPU-only mode.", exc)
         else:
+            self.device_name = "CPU-only"
             logger.info("ResourceMonitor: No GPU detected. Running in CPU-only mode.")
 
     def check_resources(self) -> bool:

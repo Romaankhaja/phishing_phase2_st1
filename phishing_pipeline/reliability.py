@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import errno
 import hashlib
 import json
 import logging
@@ -16,6 +17,11 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
 logger = logging.getLogger(__name__)
+
+_CSV_WRITE_RETRY_ATTEMPTS = 12
+_CSV_WRITE_RETRY_BASE_SECONDS = 0.2
+_CSV_WRITE_RETRY_CAP_SECONDS = 2.0
+_EXPORT_WARNING_INTERVAL_SECONDS = 30.0
 
 RUN_RESULT_COLUMNS = (
     "run_id",
@@ -301,40 +307,120 @@ def build_run_context(
     )
 
 
+def _is_retryable_filesystem_error(exc: BaseException | None) -> bool:
+    if exc is None:
+        return False
+    if isinstance(exc, PermissionError):
+        return True
+    if not isinstance(exc, OSError):
+        return False
+    if getattr(exc, "winerror", None) in {5, 32}:
+        return True
+    return getattr(exc, "errno", None) in {errno.EACCES, errno.EPERM, errno.EBUSY}
+
+
+def _retryable_write_delay(attempt_index: int) -> float:
+    return min(
+        _CSV_WRITE_RETRY_CAP_SECONDS,
+        _CSV_WRITE_RETRY_BASE_SECONDS * (2 ** max(0, int(attempt_index))),
+    )
+
+
+def _replace_file_atomic(temp_path: str, path: str) -> None:
+    last_exc: BaseException | None = None
+    for attempt_index in range(_CSV_WRITE_RETRY_ATTEMPTS):
+        try:
+            os.replace(temp_path, path)
+            return
+        except Exception as exc:
+            last_exc = exc
+            if attempt_index >= (_CSV_WRITE_RETRY_ATTEMPTS - 1) or not _is_retryable_filesystem_error(exc):
+                raise
+            time.sleep(_retryable_write_delay(attempt_index))
+    if last_exc is not None:
+        raise last_exc
+
+
 def _write_csv_atomic(path: str, fieldnames: tuple[str, ...] | list[str], rows: list[dict[str, Any]]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    temp_path = f"{path}.tmp"
-    with open(temp_path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=list(fieldnames), extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({key: row.get(key, "") for key in fieldnames})
-    os.replace(temp_path, path)
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    last_exc: BaseException | None = None
+    for attempt_index in range(_CSV_WRITE_RETRY_ATTEMPTS):
+        temp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.{attempt_index}.tmp"
+        try:
+            with open(temp_path, "w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=list(fieldnames), extrasaction="ignore")
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow({key: row.get(key, "") for key in fieldnames})
+            _replace_file_atomic(temp_path, path)
+            return
+        except Exception as exc:
+            last_exc = exc
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+            if attempt_index >= (_CSV_WRITE_RETRY_ATTEMPTS - 1) or not _is_retryable_filesystem_error(exc):
+                raise
+            time.sleep(_retryable_write_delay(attempt_index))
+    if last_exc is not None:
+        raise last_exc
 
 
 def _append_csv_rows(path: str, fieldnames: tuple[str, ...] | list[str], rows: list[dict[str, Any]]) -> None:
     if not rows:
         return
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    file_exists = os.path.exists(path)
-    with open(path, "a", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=list(fieldnames), extrasaction="ignore")
-        if not file_exists:
-            writer.writeheader()
-        for row in rows:
-            writer.writerow({key: row.get(key, "") for key in fieldnames})
-        fh.flush()
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    last_exc: BaseException | None = None
+    for attempt_index in range(_CSV_WRITE_RETRY_ATTEMPTS):
+        file_exists = os.path.exists(path)
+        try:
+            with open(path, "a", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=list(fieldnames), extrasaction="ignore")
+                if not file_exists:
+                    writer.writeheader()
+                for row in rows:
+                    writer.writerow({key: row.get(key, "") for key in fieldnames})
+                fh.flush()
+            return
+        except Exception as exc:
+            last_exc = exc
+            if attempt_index >= (_CSV_WRITE_RETRY_ATTEMPTS - 1) or not _is_retryable_filesystem_error(exc):
+                raise
+            time.sleep(_retryable_write_delay(attempt_index))
+    if last_exc is not None:
+        raise last_exc
 
 
 def _copy_csv_atomic(src_path: str, dst_path: str, fieldnames: tuple[str, ...] | list[str]) -> None:
     if not os.path.exists(src_path):
         _write_csv_atomic(dst_path, fieldnames, [])
         return
-    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
-    temp_path = f"{dst_path}.tmp"
-    with open(src_path, "r", newline="", encoding="utf-8") as src, open(temp_path, "w", newline="", encoding="utf-8") as dst:
-        shutil.copyfileobj(src, dst)
-    os.replace(temp_path, dst_path)
+    directory = os.path.dirname(dst_path) or "."
+    os.makedirs(directory, exist_ok=True)
+    last_exc: BaseException | None = None
+    for attempt_index in range(_CSV_WRITE_RETRY_ATTEMPTS):
+        temp_path = f"{dst_path}.{os.getpid()}.{threading.get_ident()}.{attempt_index}.tmp"
+        try:
+            with open(src_path, "r", newline="", encoding="utf-8") as src, open(temp_path, "w", newline="", encoding="utf-8") as dst:
+                shutil.copyfileobj(src, dst)
+            _replace_file_atomic(temp_path, dst_path)
+            return
+        except Exception as exc:
+            last_exc = exc
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+            if attempt_index >= (_CSV_WRITE_RETRY_ATTEMPTS - 1) or not _is_retryable_filesystem_error(exc):
+                raise
+            time.sleep(_retryable_write_delay(attempt_index))
+    if last_exc is not None:
+        raise last_exc
 
 
 def _coerce_int_fields(row: dict[str, Any], fields: set[str]) -> dict[str, Any]:
@@ -394,8 +480,21 @@ class CheckpointStore:
         self._heartbeat_dirty = False
         self._last_append_flush_monotonic = time.monotonic()
         self._last_snapshot_flush_monotonic = time.monotonic()
+        self._last_export_warning_monotonic = 0.0
         self._load_existing_state()
         self.start_run(status="running", metadata=self.context.metadata)
+
+    def _log_deferred_export_warning(self, operation: str, exc: BaseException) -> None:
+        now = time.monotonic()
+        if (now - self._last_export_warning_monotonic) < _EXPORT_WARNING_INTERVAL_SECONDS:
+            return
+        self._last_export_warning_monotonic = now
+        logger.warning(
+            "Deferred checkpoint export due to transient file lock | run_id=%s | operation=%s | error=%s",
+            self.context.run_id,
+            operation,
+            exc,
+        )
 
     def _load_existing_state(self) -> None:
         with self._lock:
@@ -450,7 +549,7 @@ class CheckpointStore:
                     "stage_events_csv": self.context.stage_events_csv,
                 }
             )
-        self._write_manifest_files()
+        self._write_manifest_files(best_effort=True)
 
     def get_manifest(self) -> dict[str, Any]:
         with self._lock:
@@ -469,7 +568,7 @@ class CheckpointStore:
             if not isinstance(merged.get("metadata_json"), (dict, list)):
                 merged["metadata_json"] = _parse_json_field(merged.get("metadata_json"), {})
             self._manifest = merged
-        self._write_manifest_files()
+        self._write_manifest_files(best_effort=True)
 
     def mark_completed(self) -> None:
         self.update_manifest(status="completed", completed_at=utc_now_iso())
@@ -484,7 +583,7 @@ class CheckpointStore:
             fatal_error_message=error["error_message"],
         )
 
-    def _write_manifest_files(self) -> None:
+    def _write_manifest_files(self, *, best_effort: bool = False) -> None:
         manifest = self.get_manifest()
         manifest_row = {
             "run_id": manifest.get("run_id", self.context.run_id),
@@ -501,7 +600,13 @@ class CheckpointStore:
             "url_result_events_csv": manifest.get("url_result_events_csv", self.context.checkpoints_csv),
             "stage_events_csv": manifest.get("stage_events_csv", self.context.stage_events_csv),
         }
-        _write_csv_atomic(self.context.run_manifest_csv, RUN_MANIFEST_COLUMNS, [manifest_row])
+        try:
+            _write_csv_atomic(self.context.run_manifest_csv, RUN_MANIFEST_COLUMNS, [manifest_row])
+        except Exception as exc:
+            if best_effort and _is_retryable_filesystem_error(exc):
+                self._log_deferred_export_warning("manifest", exc)
+                return
+            raise
 
     def get_url_result(self, record_key: str) -> dict[str, Any] | None:
         with self._lock:
@@ -622,7 +727,7 @@ class CheckpointStore:
         output.sort(key=lambda item: (str(item.get("Identified Phishing/Suspected Domain Name", "")), str(item.get("Corresponding CSE Domain Name", ""))))
         return output
 
-    def flush_appends(self, *, force: bool = False) -> None:
+    def flush_appends(self, *, force: bool = False, best_effort: bool = False) -> None:
         with self._lock:
             now = time.monotonic()
             if not force:
@@ -634,16 +739,27 @@ class CheckpointStore:
                     return
 
             result_rows = list(self._pending_result_events)
-            self._pending_result_events.clear()
-            self._pending_event_count = 0
-            self._append_dirty = False
+            if not result_rows:
+                self._append_dirty = False
+                self._pending_event_count = 0
+                self._last_append_flush_monotonic = now
+                return
+            try:
+                _append_csv_rows(self.context.checkpoints_csv, RUN_RESULT_COLUMNS, result_rows)
+            except Exception as exc:
+                if best_effort and _is_retryable_filesystem_error(exc):
+                    self._append_dirty = True
+                    self._pending_event_count = len(self._pending_result_events)
+                    self._log_deferred_export_warning("append_checkpoints", exc)
+                    return
+                raise
+            del self._pending_result_events[: len(result_rows)]
+            self._pending_event_count = len(self._pending_result_events)
+            self._append_dirty = bool(self._pending_result_events)
             self._last_append_flush_monotonic = now
 
-        if result_rows:
-            _append_csv_rows(self.context.checkpoints_csv, RUN_RESULT_COLUMNS, result_rows)
-
     def maybe_export(self, *, force: bool = False) -> None:
-        self.flush_appends(force=force)
+        self.flush_appends(force=force, best_effort=True)
         now = time.monotonic()
         if not force:
             with self._lock:
@@ -653,10 +769,10 @@ class CheckpointStore:
                 )
                 if not due_by_rows and not due_by_time:
                     return
-        self.export_all()
+        self.export_all(best_effort=True)
 
-    def export_all(self) -> None:
-        self.flush_appends(force=True)
+    def export_all(self, *, best_effort: bool = False) -> None:
+        self.flush_appends(force=True, best_effort=best_effort)
         with self._lock:
             result_rows = [
                 dict(row)
@@ -670,16 +786,24 @@ class CheckpointStore:
                 )
             ]
             stage_rows = list(self._stage_events)
+        try:
+            _write_csv_atomic(self.context.run_results_csv, RUN_RESULT_COLUMNS, result_rows)
+            _write_csv_atomic(self.context.stage_events_csv, STAGE_EVENT_COLUMNS, stage_rows)
+            self._write_manifest_files(best_effort=best_effort)
+        except Exception as exc:
+            if best_effort and _is_retryable_filesystem_error(exc):
+                with self._lock:
+                    self._snapshot_dirty = True
+                self._log_deferred_export_warning("snapshot", exc)
+                return
+            raise
+        with self._lock:
             self._snapshot_dirty = False
             self._dirty_snapshot_updates = 0
             self._last_snapshot_flush_monotonic = time.monotonic()
 
-        _write_csv_atomic(self.context.run_results_csv, RUN_RESULT_COLUMNS, result_rows)
-        _write_csv_atomic(self.context.stage_events_csv, STAGE_EVENT_COLUMNS, stage_rows)
-        self._write_manifest_files()
-
     def close(self) -> None:
-        self.export_all()
+        self.export_all(best_effort=True)
 
 
 def stage_result_patch(
