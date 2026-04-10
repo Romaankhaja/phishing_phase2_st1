@@ -52,8 +52,10 @@ from .reliability import (
     RunContext,
     StageWatchdog,
     async_with_timeout_and_retry,
+    get_run_artifact_path,
     make_record_key,
     normalize_exception,
+    sync_run_artifact,
     stage_result_patch,
     utc_now_iso,
 )
@@ -1019,13 +1021,20 @@ def _merge_review_queue_frames(*frames: pd.DataFrame) -> pd.DataFrame:
     return merged
 
 
-def _write_hash_review_queue(review_df: pd.DataFrame) -> pd.DataFrame:
-    os.makedirs(os.path.dirname(HASH_REVIEW_QUEUE_PATH), exist_ok=True)
+def _write_hash_review_queue(
+    review_df: pd.DataFrame,
+    *,
+    run_context: RunContext | None = None,
+    output_path: str | None = None,
+) -> pd.DataFrame:
+    resolved_path = str(output_path or get_run_artifact_path(run_context, "hash_review_queue_csv", HASH_REVIEW_QUEUE_PATH))
+    os.makedirs(os.path.dirname(resolved_path), exist_ok=True)
     output_df = review_df.copy() if isinstance(review_df, pd.DataFrame) else pd.DataFrame()
     if output_df.empty and len(output_df.columns) == 0:
         output_df = pd.DataFrame(columns=[*_REVIEW_QUEUE_KEY_COLUMNS, "review_reason"])
-    output_df.to_csv(HASH_REVIEW_QUEUE_PATH, index=False, encoding="utf-8")
-    logger.info("Hash review queue written to %s (%d rows)", HASH_REVIEW_QUEUE_PATH, len(output_df))
+    output_df.to_csv(resolved_path, index=False, encoding="utf-8")
+    sync_run_artifact(run_context, "hash_review_queue_csv", src_path=resolved_path, best_effort=True)
+    logger.info("Hash review queue written to %s (%d rows)", resolved_path, len(output_df))
     return output_df
 
 
@@ -1095,10 +1104,18 @@ def _build_hash_only_model_frame(row: dict, network_feats: dict, geo_dict: dict,
     return pd.DataFrame([model_row], columns=feature_names)
 
 
-def _write_debug_csv(records: list[dict], output_path: str):
+def _write_debug_csv(
+    records: list[dict],
+    output_path: str,
+    *,
+    run_context: RunContext | None = None,
+    artifact_key: str | None = None,
+):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     df_debug = pd.DataFrame(records)
     df_debug.to_csv(output_path, index=False, encoding="utf-8")
+    if artifact_key:
+        sync_run_artifact(run_context, artifact_key, src_path=output_path, best_effort=True)
 
 
 async def _extract_hash_only_ocr_tvc(
@@ -1439,8 +1456,16 @@ async def _run_hash_only_pipeline(
         df_filtered,
         ["final_landing_url"],
     )
-    filtered_output_path = FINAL_OUTPUT.replace(".csv", "_filtered.csv")
-    existing_review_df = _read_existing_review_queue(HASH_REVIEW_QUEUE_PATH)
+    final_output_path = get_run_artifact_path(run_context, "final_output_csv", FINAL_OUTPUT)
+    filtered_output_path = get_run_artifact_path(
+        run_context,
+        "final_output_filtered_csv",
+        FINAL_OUTPUT.replace(".csv", "_filtered.csv"),
+    )
+    review_queue_path = get_run_artifact_path(run_context, "hash_review_queue_csv", HASH_REVIEW_QUEUE_PATH)
+    stage2_debug_path = get_run_artifact_path(run_context, "stage2_model_debug_csv", STAGE2_MODEL_DEBUG_PATH)
+    stage3_debug_path = get_run_artifact_path(run_context, "stage3_classification_debug_csv", STAGE3_CLASSIFICATION_DEBUG_PATH)
+    existing_review_df = _read_existing_review_queue(review_queue_path)
     eligible_fetch_statuses = {"fetched", "fetched_visual_missing"}
     logger.info("Hash-only input after whitelist filtering: %d shortlisted rows", len(df_filtered))
     if "hash_score" not in df_filtered.columns:
@@ -1512,11 +1537,13 @@ async def _run_hash_only_pipeline(
     if classified_df.empty:
         existing_records = checkpoint_store.get_terminal_submission_records() if checkpoint_store is not None else []
         empty_df = pd.DataFrame(existing_records, columns=_submission_record_columns()) if existing_records else pd.DataFrame(columns=_submission_record_columns())
-        empty_df.to_csv(FINAL_OUTPUT, index=False, encoding="utf-8")
+        empty_df.to_csv(final_output_path, index=False, encoding="utf-8")
         empty_df.to_csv(filtered_output_path, index=False, encoding="utf-8")
-        _write_debug_csv([], STAGE2_MODEL_DEBUG_PATH)
-        _write_debug_csv([], STAGE3_CLASSIFICATION_DEBUG_PATH)
-        _write_hash_review_queue(_merge_review_queue_frames(existing_review_df))
+        sync_run_artifact(run_context, "final_output_csv", src_path=final_output_path, best_effort=True)
+        sync_run_artifact(run_context, "final_output_filtered_csv", src_path=filtered_output_path, best_effort=True)
+        _write_debug_csv([], stage2_debug_path, run_context=run_context, artifact_key="stage2_model_debug_csv")
+        _write_debug_csv([], stage3_debug_path, run_context=run_context, artifact_key="stage3_classification_debug_csv")
+        _write_hash_review_queue(_merge_review_queue_frames(existing_review_df), run_context=run_context, output_path=review_queue_path)
         logger.info("No shortlisted rows to classify. Final output written as empty schema CSV.")
         return empty_df
 
@@ -1747,6 +1774,8 @@ async def _run_hash_only_pipeline(
                         "model_feature_status": non_fetched_model_feature_status,
                         "model_input_error": classification_gate_reason or fetch_status,
                         "model_usable": False,
+                        "decision_code": non_fetched_model_feature_status,
+                        "reason_code": classification_gate_reason or fetch_status,
                         **_stage1_debug_compat_payload(row),
                     }
                 )
@@ -1796,6 +1825,8 @@ async def _run_hash_only_pipeline(
                         "model_feature_status": non_fetched_model_feature_status,
                         "model_input_error": classification_gate_reason or fetch_status,
                         "model_usable": False,
+                        "decision_code": classification_gate_reason or classification or fetch_status,
+                        "reason_code": review_only_reason or classification_gate_reason or fetch_status,
                         "classification_gate_reason": classification_gate_reason,
                         "review_only_reason": review_only_reason,
                         "survival_path": classification_gate_reason if (flagged_output or review_sink) else "",
@@ -1962,6 +1993,8 @@ async def _run_hash_only_pipeline(
                         "model_feature_status": "skipped_not_registered_domain",
                         "model_input_error": "rdap_not_found",
                         "model_usable": False,
+                        "decision_code": "skipped_not_registered_domain",
+                        "reason_code": "rdap_not_found",
                         **_stage1_debug_compat_payload(row),
                     }
                 )
@@ -2014,6 +2047,8 @@ async def _run_hash_only_pipeline(
                         "model_feature_status": "skipped_not_registered_domain",
                         "model_input_error": "rdap_not_found",
                         "model_usable": False,
+                        "decision_code": "not_registered_domain_suspected",
+                        "reason_code": "not_registered_domain_suspected",
                         "classification_gate_reason": "not_registered_domain_suspected",
                         "review_only_reason": "",
                         "survival_path": "not_registered_domain",
@@ -2246,6 +2281,8 @@ async def _run_hash_only_pipeline(
                     "model_feature_status": model_feature_status,
                     "model_input_error": model_input_error,
                     "model_usable": model_usable,
+                    "decision_code": model_feature_status,
+                    "reason_code": model_input_error or classification_gate_reason,
                     **_stage1_debug_compat_payload(row),
                 }
             )
@@ -2295,6 +2332,8 @@ async def _run_hash_only_pipeline(
                     "model_feature_status": model_feature_status,
                     "model_input_error": model_input_error,
                     "model_usable": model_usable,
+                    "decision_code": classification_gate_reason or classification,
+                    "reason_code": review_only_reason or classification_gate_reason or classification,
                     "classification_gate_reason": classification_gate_reason,
                     "review_only_reason": review_only_reason,
                     "survival_path": classification_gate_reason if (flagged_output or review_sink) else "",
@@ -2497,7 +2536,7 @@ async def _run_hash_only_pipeline(
     )
     stage3_review_df = pd.DataFrame(review_queue_records)
     merged_review_df = _merge_review_queue_frames(existing_review_df, stage3_review_df)
-    _write_hash_review_queue(merged_review_df)
+    _write_hash_review_queue(merged_review_df, run_context=run_context, output_path=review_queue_path)
     logger.info(
         "Hash-only stage summary | input_after_whitelist=%d | processed_for_stage3=%d | non_fetched_candidates=%d | review_sink=%d | final_output_records=%d",
         len(df_filtered),
@@ -2507,18 +2546,20 @@ async def _run_hash_only_pipeline(
         len(records),
     )
     df_out = pd.DataFrame(records, columns=_submission_record_columns())
-    df_out.to_csv(FINAL_OUTPUT, index=False, encoding="utf-8")
+    df_out.to_csv(final_output_path, index=False, encoding="utf-8")
     flagged_df = df_out[
         df_out["Phishing/Suspected Domains (i.e. Class Label)"].isin(["Phishing", "Suspected"])
     ].copy()
     flagged_df.to_csv(filtered_output_path, index=False, encoding="utf-8")
-    _write_debug_csv(stage2_model_debug_records, STAGE2_MODEL_DEBUG_PATH)
-    _write_debug_csv(stage3_classification_debug_records, STAGE3_CLASSIFICATION_DEBUG_PATH)
+    sync_run_artifact(run_context, "final_output_csv", src_path=final_output_path, best_effort=True)
+    sync_run_artifact(run_context, "final_output_filtered_csv", src_path=filtered_output_path, best_effort=True)
+    _write_debug_csv(stage2_model_debug_records, stage2_debug_path, run_context=run_context, artifact_key="stage2_model_debug_csv")
+    _write_debug_csv(stage3_classification_debug_records, stage3_debug_path, run_context=run_context, artifact_key="stage3_classification_debug_csv")
     if checkpoint_store is not None:
         checkpoint_store.export_all()
-    logger.info("Stage2 model debug written to %s (%d rows)", STAGE2_MODEL_DEBUG_PATH, len(stage2_model_debug_records))
-    logger.info("Stage3 classification debug written to %s (%d rows)", STAGE3_CLASSIFICATION_DEBUG_PATH, len(stage3_classification_debug_records))
-    logger.info("Hash-only final output written to %s (%d records)", FINAL_OUTPUT, len(df_out))
+    logger.info("Stage2 model debug written to %s (%d rows)", stage2_debug_path, len(stage2_model_debug_records))
+    logger.info("Stage3 classification debug written to %s (%d rows)", stage3_debug_path, len(stage3_classification_debug_records))
+    logger.info("Hash-only final output written to %s (%d records)", final_output_path, len(df_out))
     logger.info("Flagged-only final output written to %s (%d records)", filtered_output_path, len(flagged_df))
     return df_out
 
@@ -2554,6 +2595,7 @@ async def run_pipeline(
     resume: bool = False,
     force_reprocess: bool = False,
     execution_backend: str = "auto",
+    progress_mode: str | None = None,
 ):
     import time
     from tqdm import tqdm as tqdm_sync
@@ -2646,6 +2688,7 @@ async def run_pipeline(
                 resume=resume,
                 force_reprocess=force_reprocess,
                 execution_backend=resolved_backend,
+                progress_mode=progress_mode,
             )
             
             os.makedirs(os.path.dirname(holdout_csv_path), exist_ok=True)
@@ -2714,6 +2757,7 @@ async def run_pipeline(
                 checkpoint_store=checkpoint_store,
                 resume=resume,
                 force_reprocess=force_reprocess,
+                progress_mode=progress_mode,
             )
         else:
             df_out = await _run_hash_only_pipeline(

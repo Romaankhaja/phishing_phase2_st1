@@ -13,10 +13,27 @@ import pandas as pd
 
 from .config import APPLICATION_ID, ASN_DB_PATH, CITY_DB_PATH, FINAL_OUTPUT, resolve_ray_runtime_config
 from .geoip_utils import enrich_with_geoip
-from .reliability import RunContext, make_record_key, stage_result_patch, utc_now_iso
+from .progress_display import (
+    build_compact_postfix,
+    build_timing_postfix,
+    managed_progress_bar,
+    progress_bars_enabled,
+    resolve_progress_mode,
+    tqdm_logging_redirect,
+)
+from .reliability import (
+    ProgressTracker,
+    RunContext,
+    get_run_artifact_path,
+    make_record_key,
+    stage_result_patch,
+    sync_run_artifact,
+    utc_now_iso,
+)
 from .ray_runtime import (
     ClassificationRecord,
     _get_ray_primitives,
+    _is_debug_mode,
     _log_metrics_periodically,
     _ray_context_dict,
     _ray_get,
@@ -25,6 +42,73 @@ from .ray_runtime import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _log_ray_classify_decision_inputs(
+    row: dict[str, Any],
+    *,
+    registrar: str,
+    hosting_isp: str,
+    dns_records: str,
+    tvc_brand_spoofed: bool,
+    tvc_brand_spoof_strong: bool,
+) -> None:
+    if not _is_debug_mode():
+        return
+    logger.info(
+        "[RAY-DEBUG] classify inputs | url=%s | fetch_status=%s | strict_lexical=%s | lexical_score_pass=%s | hash_anchor=%s | direct_brand_evidence_count=%s | content_spoof_strong=%s | signal_hit_keywords=%s | signal_hits={domain=%s,favicon=%s,ssl=%s,html=%s,domain_hash=%s} | tvc={spoofed=%s,strong=%s} | registrar=%s | hosting_isp=%s | dns_present=%s",
+        str(row.get("Identified Phishing/Suspected Domain Name", "") or row.get("url", "")),
+        str(row.get("fetch_status", "") or ""),
+        bool(row.get("strict_lexical_hit", False)),
+        bool(row.get("lexical_score_pass", False)),
+        bool(row.get("hash_anchor", False)),
+        int(row.get("direct_brand_evidence_count", 0) or 0),
+        bool(row.get("content_spoof_strong", False)),
+        bool(row.get("signal_hit_keywords", False)),
+        bool(row.get("signal_hit_domain", False)),
+        bool(row.get("signal_hit_favicon", False)),
+        bool(row.get("signal_hit_ssl_hash", False)),
+        bool(row.get("signal_hit_html_hash", False)),
+        bool(row.get("signal_hit_domain_hash", False)),
+        bool(tvc_brand_spoofed),
+        bool(tvc_brand_spoof_strong),
+        str(registrar or ""),
+        str(hosting_isp or ""),
+        bool(str(dns_records or "").strip() and str(dns_records or "").strip().upper() != "NA"),
+    )
+
+
+def _build_classify_progress_postfix(
+    *,
+    progress_tracker: ProgressTracker,
+    started_monotonic: float,
+    inflight: int,
+    flagged: int,
+    review: int,
+    failed: int,
+    ocr_stats: dict[str, Any] | None,
+    classify_actor_count: int,
+) -> dict[str, str]:
+    fields = build_timing_postfix(
+        completed=progress_tracker.completed,
+        total=progress_tracker.total,
+        started_monotonic=started_monotonic,
+        rate_key="rows/s",
+    )
+    stats = dict(ocr_stats or {})
+    fields.update(
+        {
+            "inflight": int(inflight),
+            "flagged": int(flagged),
+            "review": int(review),
+            "failed": int(failed),
+            "ocr_q": int(stats.get("queue_depth", 0) or 0),
+            "ocr_batch": int(stats.get("last_batch_size", 0) or 0),
+            "ocr_batches": int(stats.get("batches_processed", 0) or 0),
+            "classify_actors": int(classify_actor_count),
+        }
+    )
+    return build_compact_postfix(fields)
 
 
 async def classify_hash_only_row_impl(
@@ -133,6 +217,14 @@ async def classify_hash_only_row_impl(
         }
 
     if fetch_status not in eligible_fetch_statuses:
+        _log_ray_classify_decision_inputs(
+            row,
+            registrar="NA",
+            hosting_isp="NA",
+            dns_records="NA",
+            tvc_brand_spoofed=False,
+            tvc_brand_spoof_strong=False,
+        )
         decision = pipeline_module._hybrid_hash_decision(
             row,
             registrar="NA",
@@ -217,6 +309,8 @@ async def classify_hash_only_row_impl(
                     "model_feature_status": model_feature_status,
                     "model_input_error": classification_gate_reason or fetch_status,
                     "model_usable": False,
+                    "decision_code": model_feature_status,
+                    "reason_code": classification_gate_reason or fetch_status,
                     **pipeline_module._stage1_debug_compat_payload(row),
                 },
                 stage3_debug_row={
@@ -264,6 +358,8 @@ async def classify_hash_only_row_impl(
                     "model_feature_status": model_feature_status,
                     "model_input_error": classification_gate_reason or fetch_status,
                     "model_usable": False,
+                    "decision_code": classification_gate_reason or classification or fetch_status,
+                    "reason_code": review_only_reason or classification_gate_reason or fetch_status,
                     "classification_gate_reason": classification_gate_reason,
                     "review_only_reason": review_only_reason,
                     "survival_path": classification_gate_reason if (flagged_output or review_sink) else "",
@@ -379,6 +475,8 @@ async def classify_hash_only_row_impl(
                     "model_feature_status": "skipped_not_registered_domain",
                     "model_input_error": "rdap_not_found",
                     "model_usable": False,
+                    "decision_code": "skipped_not_registered_domain",
+                    "reason_code": "rdap_not_found",
                     **pipeline_module._stage1_debug_compat_payload(row),
                 },
                 stage3_debug_row={
@@ -426,6 +524,8 @@ async def classify_hash_only_row_impl(
                     "model_feature_status": "skipped_not_registered_domain",
                     "model_input_error": "rdap_not_found",
                     "model_usable": False,
+                    "decision_code": "not_registered_domain_suspected",
+                    "reason_code": "not_registered_domain_suspected",
                     "classification_gate_reason": "not_registered_domain_suspected",
                     "review_only_reason": "",
                     "survival_path": "not_registered_domain",
@@ -504,6 +604,14 @@ async def classify_hash_only_row_impl(
             model_feature_status = "feature_error"
             model_input_error = str(exc)
 
+    _log_ray_classify_decision_inputs(
+        row,
+        registrar=registrar,
+        hosting_isp=hosting_isp,
+        dns_records=dns_records,
+        tvc_brand_spoofed=bool(ocr_tvc.get("tvc_brand_spoofed", False)),
+        tvc_brand_spoof_strong=bool(ocr_tvc.get("tvc_spoof_strong", False)),
+    )
     decision = pipeline_module._hybrid_hash_decision(
         row,
         registrar=registrar,
@@ -610,6 +718,8 @@ async def classify_hash_only_row_impl(
                 "model_feature_status": model_feature_status,
                 "model_input_error": model_input_error,
                 "model_usable": model_usable,
+                "decision_code": model_feature_status,
+                "reason_code": model_input_error or classification_gate_reason,
                 **pipeline_module._stage1_debug_compat_payload(row),
             },
             stage3_debug_row={
@@ -657,6 +767,8 @@ async def classify_hash_only_row_impl(
                 "model_feature_status": model_feature_status,
                 "model_input_error": model_input_error,
                 "model_usable": model_usable,
+                "decision_code": classification_gate_reason or classification,
+                "reason_code": review_only_reason or classification_gate_reason or classification,
                 "classification_gate_reason": classification_gate_reason,
                 "review_only_reason": review_only_reason,
                 "survival_path": classification_gate_reason if (flagged_output or review_sink) else "",
@@ -684,6 +796,7 @@ async def run_hash_only_pipeline_with_ray_impl(
     checkpoint_store=None,
     resume: bool = False,
     force_reprocess: bool = False,
+    progress_mode: str | None = None,
 ) -> pd.DataFrame:
     del checkpoint_store
 
@@ -692,9 +805,12 @@ async def run_hash_only_pipeline_with_ray_impl(
     ensure_ray_initialized()
     primitives = _get_ray_primitives()
     runtime_config = resolve_ray_runtime_config()
+    progress_mode = resolve_progress_mode(progress_mode, execution_backend="ray")
+    progress_enabled = progress_bars_enabled(progress_mode)
     logger.info(
-        "Ray classify startup | rows=%d | local_mode=%s | low_memory=%s | server_mode=%s | prewarm=%s | classify_actors=%d | classify_inflight=%d | ocr_actors=%d | ocr_batch={size=%d,delay_ms=%d}",
+        "Ray classify startup | rows=%d | progress_mode=%s | local_mode=%s | low_memory=%s | server_mode=%s | prewarm=%s | classify_actors=%d | classify_inflight=%d | ocr_actors=%d | ocr_batch={size=%d,delay_ms=%d}",
         len(df_filtered),
+        progress_mode,
         bool(runtime_config.get("local_mode")),
         bool(runtime_config.get("low_memory_mode")),
         bool(runtime_config.get("server_mode")),
@@ -707,6 +823,15 @@ async def run_hash_only_pipeline_with_ray_impl(
     )
     checkpoint_actor = primitives["CheckpointWriterActor"].remote(_ray_context_dict(run_context)) if run_context is not None else None
     metrics_actor = primitives["MetricsActor"].remote()
+    final_output_path = get_run_artifact_path(run_context, "final_output_csv", FINAL_OUTPUT)
+    filtered_output_path = get_run_artifact_path(
+        run_context,
+        "final_output_filtered_csv",
+        FINAL_OUTPUT.replace(".csv", "_filtered.csv"),
+    )
+    review_queue_path = get_run_artifact_path(run_context, "hash_review_queue_csv", pipeline_module.HASH_REVIEW_QUEUE_PATH)
+    stage2_debug_path = get_run_artifact_path(run_context, "stage2_model_debug_csv", pipeline_module.STAGE2_MODEL_DEBUG_PATH)
+    stage3_debug_path = get_run_artifact_path(run_context, "stage3_classification_debug_csv", pipeline_module.STAGE3_CLASSIFICATION_DEBUG_PATH)
     whois_actor = primitives["WhoisCoordinatorActor"].options(num_cpus=0).remote(20)
     ocr_num_gpus = 0.0
     try:
@@ -726,8 +851,31 @@ async def run_hash_only_pipeline_with_ray_impl(
         for index in range(int(runtime_config["ocr_actors"]))
     ]
     classifier_actors = [primitives["HashOnlyClassifierActor"].options(num_cpus=1, max_concurrency=1).remote(failed_fetch_suspected_min, failed_fetch_review_min) for _ in range(int(runtime_config["classify_actors"]))]
+    output_records: list[dict[str, Any]] = []
+    review_rows: list[dict[str, Any]] = []
+    pending: dict[Any, dict[str, Any]] = {}
+    failed_classifications = 0
+    ocr_progress_stats: dict[str, Any] = {}
     stop_metrics = asyncio.Event()
-    metrics_task = asyncio.create_task(_log_metrics_periodically(metrics_actor, stop_metrics, "classify", float(runtime_config["metrics_interval_seconds"])))
+    metrics_task = asyncio.create_task(
+        _log_metrics_periodically(
+            metrics_actor,
+            stop_metrics,
+            "classify",
+            float(runtime_config["metrics_interval_seconds"]),
+            checkpoint_actor=checkpoint_actor,
+            stage_name="classify",
+            details_getter=lambda: {
+                "inflight": len(pending),
+                "flagged": len(output_records),
+                "review": len(review_rows),
+                "failed": failed_classifications,
+                "ocr": dict(ocr_progress_stats or {}),
+                "classify_actors": len(classifier_actors),
+            },
+            emit_logs=not progress_enabled,
+        )
+    )
     if bool(runtime_config.get("prewarm_actors")):
         warm_refs = [actor.warm.remote() for actor in classifier_actors]
         warm_refs.extend(actor.warm.remote() for actor in ocr_actors)
@@ -742,8 +890,7 @@ async def run_hash_only_pipeline_with_ray_impl(
 
     df_filtered = df_filtered.copy()
     df_filtered = pipeline_module._normalize_replayed_columns(df_filtered, ["final_landing_url"])
-    filtered_output_path = FINAL_OUTPUT.replace(".csv", "_filtered.csv")
-    existing_review_df = pipeline_module._read_existing_review_queue(pipeline_module.HASH_REVIEW_QUEUE_PATH)
+    existing_review_df = pipeline_module._read_existing_review_queue(review_queue_path)
     if "hash_score" not in df_filtered.columns:
         df_filtered["hash_score"] = 0.0
     df_filtered["hash_score"] = pd.to_numeric(df_filtered["hash_score"], errors="coerce").fillna(0.0)
@@ -779,19 +926,25 @@ async def run_hash_only_pipeline_with_ray_impl(
     if classified_df.empty:
         existing_records = await _ray_get(checkpoint_actor.get_terminal_submission_records.remote()) if checkpoint_actor is not None else []
         empty_df = pd.DataFrame(existing_records, columns=pipeline_module._submission_record_columns()) if existing_records else pd.DataFrame(columns=pipeline_module._submission_record_columns())
-        empty_df.to_csv(FINAL_OUTPUT, index=False, encoding="utf-8")
+        empty_df.to_csv(final_output_path, index=False, encoding="utf-8")
         empty_df.to_csv(filtered_output_path, index=False, encoding="utf-8")
-        pipeline_module._write_debug_csv([], pipeline_module.STAGE2_MODEL_DEBUG_PATH)
-        pipeline_module._write_debug_csv([], pipeline_module.STAGE3_CLASSIFICATION_DEBUG_PATH)
-        pipeline_module._write_hash_review_queue(pipeline_module._merge_review_queue_frames(existing_review_df))
+        sync_run_artifact(run_context, "final_output_csv", src_path=final_output_path, best_effort=True)
+        sync_run_artifact(run_context, "final_output_filtered_csv", src_path=filtered_output_path, best_effort=True)
+        pipeline_module._write_debug_csv([], stage2_debug_path, run_context=run_context, artifact_key="stage2_model_debug_csv")
+        pipeline_module._write_debug_csv([], stage3_debug_path, run_context=run_context, artifact_key="stage3_classification_debug_csv")
+        pipeline_module._write_hash_review_queue(
+            pipeline_module._merge_review_queue_frames(existing_review_df),
+            run_context=run_context,
+            output_path=review_queue_path,
+        )
         return empty_df
 
-    output_records: list[dict[str, Any]] = []
-    review_rows: list[dict[str, Any]] = []
     stage2_rows: list[dict[str, Any]] = []
     stage3_rows: list[dict[str, Any]] = []
-    pending: dict[Any, dict[str, Any]] = {}
     rows_to_process = classified_df.to_dict("records")
+    classify_progress = ProgressTracker(total=len(rows_to_process))
+    progress_stop = asyncio.Event()
+    classify_started_monotonic = time.perf_counter()
     classify_inflight = int(runtime_config.get("classify_inflight", max(1, len(classifier_actors))))
     next_row_index = 0
 
@@ -800,19 +953,135 @@ async def run_hash_only_pipeline_with_ray_impl(
         while next_row_index < len(rows_to_process) and len(pending) < classify_inflight:
             row = rows_to_process[next_row_index]
             sequence_number = next_row_index + 1
-            classifier = classifier_actors[next_row_index % len(classifier_actors)]
+            actor_slot = next_row_index % len(classifier_actors)
+            classifier = classifier_actors[actor_slot]
             ocr_actor = ocr_actors[next_row_index % len(ocr_actors)]
-            pending[classifier.classify_row.remote(row, sequence_number, ocr_actor, whois_actor)] = {"row": row}
+            domain_url = str(row.get("Identified Phishing/Suspected Domain Name", "")).strip()
+            normalized_url = domain_url.strip().lower()
+            source_workbook = str(row.get("source_workbook", "") or "")
+            record_key = make_record_key(normalized_url, source_workbook)
+            worker_id = f"classify-{actor_slot}"
+            pending[classifier.classify_row.remote(row, sequence_number, ocr_actor, whois_actor)] = {
+                "row": row,
+                "worker_id": worker_id,
+                "record_key": record_key,
+                "submitted_monotonic": time.perf_counter(),
+            }
             next_row_index += 1
 
+    def _refresh_progress_bar(progress_bar: Any | None) -> None:
+        if progress_bar is None:
+            return
+        completed = classify_progress.completed
+        if completed > progress_bar.n:
+            progress_bar.update(completed - progress_bar.n)
+        progress_bar.set_postfix(
+            _build_classify_progress_postfix(
+                progress_tracker=classify_progress,
+                started_monotonic=classify_started_monotonic,
+                inflight=len(pending),
+                flagged=len(output_records),
+                review=len(review_rows),
+                failed=failed_classifications,
+                ocr_stats=ocr_progress_stats,
+                classify_actor_count=len(classifier_actors),
+            ),
+            refresh=False,
+        )
+        progress_bar.refresh()
+
+    async def _progress_monitor(progress_bar: Any | None, started_monotonic: float) -> None:
+        nonlocal ocr_progress_stats
+        if progress_bar is None:
+            return
+        while not progress_stop.is_set():
+            if ocr_actors:
+                try:
+                    ocr_progress_stats = dict(await _ray_get(ocr_actors[0].stats.remote()) or {})
+                except Exception:
+                    ocr_progress_stats = {}
+            progress_bar.set_postfix(
+                _build_classify_progress_postfix(
+                    progress_tracker=classify_progress,
+                    started_monotonic=started_monotonic,
+                    inflight=len(pending),
+                    flagged=len(output_records),
+                    review=len(review_rows),
+                    failed=failed_classifications,
+                    ocr_stats=ocr_progress_stats,
+                    classify_actor_count=len(classifier_actors),
+                ),
+                refresh=False,
+            )
+            if classify_progress.completed > progress_bar.n:
+                progress_bar.update(classify_progress.completed - progress_bar.n)
+            progress_bar.refresh()
+            try:
+                await asyncio.wait_for(progress_stop.wait(), timeout=0.5)
+            except asyncio.TimeoutError:
+                pass
+
+    heartbeat_stop = asyncio.Event()
+    heartbeat_workers: set[str] = set()
+
+    async def _heartbeat_monitor() -> None:
+        nonlocal heartbeat_workers
+        if checkpoint_actor is None or run_context is None:
+            return
+        while not heartbeat_stop.is_set():
+            now = time.perf_counter()
+            active_workers: set[str] = set()
+            for context in list(pending.values()):
+                worker_id = str(context.get("worker_id", "") or "")
+                record_key = str(context.get("record_key", "") or "")
+                row = dict(context.get("row") or {})
+                normalized_url = str(row.get("Identified Phishing/Suspected Domain Name", "") or "").strip().lower()
+                if not worker_id:
+                    continue
+                active_workers.add(worker_id)
+                checkpoint_actor.update_worker_heartbeat.remote(
+                    stage_name="classify",
+                    worker_id=worker_id,
+                    record_key=record_key,
+                    state="running",
+                    task_kind="classify_row",
+                    item_age_s=max(0.0, now - float(context.get("submitted_monotonic", now) or now)),
+                    details={"url": normalized_url, "inflight": len(pending)},
+                )
+            for worker_id in sorted(heartbeat_workers - active_workers):
+                checkpoint_actor.clear_worker_heartbeat.remote(stage_name="classify", worker_id=worker_id)
+            heartbeat_workers = active_workers
+            try:
+                await asyncio.wait_for(heartbeat_stop.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                pass
+
+    logging_redirect_ctx = tqdm_logging_redirect(progress_enabled)
+    progress_bar_ctx = managed_progress_bar(
+        enabled=progress_enabled,
+        desc="Ray classify",
+        total=len(rows_to_process),
+        unit="row",
+        position=0,
+    )
+    logging_redirect_ctx.__enter__()
+    progress_bar = progress_bar_ctx.__enter__()
+    progress_task = asyncio.create_task(_progress_monitor(progress_bar, classify_started_monotonic)) if progress_bar is not None else None
+    heartbeat_task = asyncio.create_task(_heartbeat_monitor()) if checkpoint_actor is not None and run_context is not None else None
+
     _submit_until_cap()
+    _refresh_progress_bar(progress_bar)
     try:
         while pending:
             ready, _ = await _ray_wait(list(pending.keys()), num_returns=min(16, len(pending)), timeout=1.0)
             if not ready:
+                _refresh_progress_bar(progress_bar)
                 continue
             for ref in ready:
                 context = pending.pop(ref)
+                worker_id = str(context.get("worker_id", "") or "")
+                if checkpoint_actor is not None and worker_id:
+                    checkpoint_actor.clear_worker_heartbeat.remote(stage_name="classify", worker_id=worker_id)
                 row = dict(context["row"])
                 domain_url = str(row.get("Identified Phishing/Suspected Domain Name", "")).strip()
                 normalized_url = domain_url.strip().lower()
@@ -822,6 +1091,9 @@ async def run_hash_only_pipeline_with_ray_impl(
                 except Exception as exc:
                     error_type = type(exc).__name__
                     error_message = str(exc)
+                    failed_classifications += 1
+                    classify_progress.mark_completed(final_status="classification_failed")
+                    metrics_actor.increment.remote("classify.failed", 1.0)
                     if checkpoint_actor is not None and run_context is not None:
                         checkpoint_actor.upsert_url_result.remote(stage_result_patch(run_id=run_context.run_id, raw_url=domain_url, normalized_url=normalized_url, source_workbook=source_workbook, stage_name="classify", stage_status="failed", current_stage="classify", worker_id="ray-classify", error_type=error_type, error_message=error_message, final_pipeline_status="classification_failed", final_decision="UNCLASSIFIED", failure_reason=error_message))
                     continue
@@ -845,19 +1117,52 @@ async def run_hash_only_pipeline_with_ray_impl(
                     if event:
                         checkpoint_actor.append_stage_event.remote(event)
                 metrics_actor.increment.remote("classify.completed", 1.0)
+                classify_progress.mark_completed(
+                    final_status="review_only" if bool(result.get("review_sink")) else "completed"
+                )
             _submit_until_cap()
+            _refresh_progress_bar(progress_bar)
         merged_review_df = pipeline_module._merge_review_queue_frames(existing_review_df, pd.DataFrame(review_rows))
-        pipeline_module._write_hash_review_queue(merged_review_df)
+        pipeline_module._write_hash_review_queue(
+            merged_review_df,
+            run_context=run_context,
+            output_path=review_queue_path,
+        )
         df_out = pd.DataFrame(output_records, columns=pipeline_module._submission_record_columns())
-        df_out.to_csv(FINAL_OUTPUT, index=False, encoding="utf-8")
+        df_out.to_csv(final_output_path, index=False, encoding="utf-8")
         flagged_df = df_out[df_out["Phishing/Suspected Domains (i.e. Class Label)"].isin(["Phishing", "Suspected"])].copy()
         flagged_df.to_csv(filtered_output_path, index=False, encoding="utf-8")
-        pipeline_module._write_debug_csv(stage2_rows, pipeline_module.STAGE2_MODEL_DEBUG_PATH)
-        pipeline_module._write_debug_csv(stage3_rows, pipeline_module.STAGE3_CLASSIFICATION_DEBUG_PATH)
+        sync_run_artifact(run_context, "final_output_csv", src_path=final_output_path, best_effort=True)
+        sync_run_artifact(run_context, "final_output_filtered_csv", src_path=filtered_output_path, best_effort=True)
+        pipeline_module._write_debug_csv(
+            stage2_rows,
+            stage2_debug_path,
+            run_context=run_context,
+            artifact_key="stage2_model_debug_csv",
+        )
+        pipeline_module._write_debug_csv(
+            stage3_rows,
+            stage3_debug_path,
+            run_context=run_context,
+            artifact_key="stage3_classification_debug_csv",
+        )
         if checkpoint_actor is not None:
             checkpoint_actor.export_all.remote()
+        _refresh_progress_bar(progress_bar)
         return df_out
     finally:
+        progress_stop.set()
+        if progress_task is not None:
+            await asyncio.gather(progress_task, return_exceptions=True)
+        heartbeat_stop.set()
+        if heartbeat_task is not None:
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+        if checkpoint_actor is not None:
+            for worker_id in sorted(heartbeat_workers):
+                checkpoint_actor.clear_worker_heartbeat.remote(stage_name="classify", worker_id=worker_id)
+        _refresh_progress_bar(progress_bar)
+        progress_bar_ctx.__exit__(None, None, None)
+        logging_redirect_ctx.__exit__(None, None, None)
         stop_metrics.set()
         await asyncio.gather(metrics_task, return_exceptions=True)
         close_refs = [actor.close.remote() for actor in classifier_actors]

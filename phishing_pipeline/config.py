@@ -133,6 +133,7 @@ RAY_RUNTIME_CONFIG = {
     "stage1_http_connection_cap": max(4, int(os.getenv("PHISHING_RAY_STAGE1_HTTP_CONNECTION_CAP", "64"))),
     "stage1_http_keepalive_cap": max(2, int(os.getenv("PHISHING_RAY_STAGE1_HTTP_KEEPALIVE_CAP", "32"))),
     "prewarm_actors": os.getenv("PHISHING_RAY_PREWARM_ACTORS", "").strip().lower() in {"1", "true", "yes", "on"},
+    "browser_hardened_flags": os.getenv("PHISHING_RAY_BROWSER_HARDENED_FLAGS", "").strip().lower() in {"1", "true", "yes", "on"},
     "metrics_interval_seconds": max(1.0, float(os.getenv("PHISHING_RAY_METRICS_INTERVAL_SECONDS", "5"))),
 }
 
@@ -158,6 +159,7 @@ RAY_ENV_TO_CONFIG_KEY = {
     "PHISHING_RAY_STAGE1_HTTP_CONNECTION_CAP": "stage1_http_connection_cap",
     "PHISHING_RAY_STAGE1_HTTP_KEEPALIVE_CAP": "stage1_http_keepalive_cap",
     "PHISHING_RAY_PREWARM_ACTORS": "prewarm_actors",
+    "PHISHING_RAY_BROWSER_HARDENED_FLAGS": "browser_hardened_flags",
     "PHISHING_RAY_METRICS_INTERVAL_SECONDS": "metrics_interval_seconds",
 }
 

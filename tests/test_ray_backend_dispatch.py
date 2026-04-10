@@ -19,10 +19,12 @@ class RayBackendDispatchTests(unittest.IsolatedAsyncioTestCase):
             result = await comparison.run_hashing_shortlist_async(
                 ["https://example.com"],
                 execution_backend="ray",
+                progress_mode="compact",
             )
 
         self.assertIs(result, sentinel)
         ray_impl.assert_awaited_once()
+        self.assertEqual("compact", ray_impl.await_args.kwargs.get("progress_mode"))
         legacy_impl.assert_not_awaited()
 
     async def test_pipeline_hash_only_auto_uses_ray_backend(self):
@@ -53,10 +55,12 @@ class RayBackendDispatchTests(unittest.IsolatedAsyncioTestCase):
                 use_existing_holdout=True,
                 pipeline_mode="hash_only",
                 execution_backend="auto",
+                progress_mode="compact",
             )
 
         self.assertIs(result, sentinel)
         ray_impl.assert_awaited_once()
+        self.assertEqual("compact", ray_impl.await_args.kwargs.get("progress_mode"))
         legacy_impl.assert_not_awaited()
 
     async def test_pipeline_hash_only_legacy_backend_uses_legacy_classifier(self):

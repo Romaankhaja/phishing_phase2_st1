@@ -8,7 +8,22 @@ import time
 from typing import Any
 
 from .config import resolve_ray_runtime_config, resolve_stage1_http_config, RAY_DEBUG_MODE
-from .reliability import RunContext, make_record_key, utc_now_iso
+from .progress_display import (
+    build_compact_postfix,
+    build_timing_postfix,
+    managed_progress_bar,
+    progress_bars_enabled,
+    resolve_progress_mode,
+    tqdm_logging_redirect,
+)
+from .reliability import (
+    ProgressTracker,
+    RunContext,
+    get_run_artifact_path,
+    make_record_key,
+    sync_run_artifact,
+    utc_now_iso,
+)
 from .ray_runtime import (
     HashRenderArtifact,
     _build_shortlist_patch,
@@ -25,6 +40,60 @@ from .ray_runtime import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _build_shortlist_progress_record_key(normalized_url: str, source_workbook: str, ordinal: int) -> str:
+    return f"{make_record_key(normalized_url, source_workbook)}::{max(0, int(ordinal))}"
+
+
+def _mark_shortlist_progress_completion(
+    progress_tracker: ProgressTracker,
+    completed_record_keys: set[str],
+    record_key: str,
+    *,
+    final_status: str,
+) -> bool:
+    key = str(record_key or "").strip()
+    if not key or key in completed_record_keys:
+        return False
+    completed_record_keys.add(key)
+    progress_tracker.mark_completed(final_status=final_status)
+    return True
+
+
+def _build_shortlist_progress_postfix(
+    *,
+    progress_tracker: ProgressTracker,
+    started_monotonic: float,
+    stage0_processed: int,
+    stage0_hits: int,
+    stage0_misses: int,
+    stage1_inflight: int,
+    stage1_backlog: int,
+    render_queue_depth: int,
+    aux_queue_depth: int,
+    finalize_queue_depth: int,
+    active_hash_concurrency: int,
+    match_count: int,
+    phase: str,
+) -> dict[str, str]:
+    fields = build_timing_postfix(
+        completed=progress_tracker.completed,
+        total=progress_tracker.total,
+        started_monotonic=started_monotonic,
+        rate_key="urls/s",
+    )
+    fields.update(
+        {
+            "stage0": f"{int(stage0_processed)},{int(stage0_hits)},{int(stage0_misses)}",
+            "stage1": f"{int(stage1_inflight)},{int(stage1_backlog)}",
+            "hash": f"{int(render_queue_depth)},{int(aux_queue_depth)},{int(finalize_queue_depth)}",
+            "active": int(active_hash_concurrency),
+            "match": int(match_count),
+            "phase": str(phase or "running"),
+        }
+    )
+    return build_compact_postfix(fields)
 
 
 async def run_hashing_shortlist_with_ray_impl(
@@ -51,6 +120,7 @@ async def run_hashing_shortlist_with_ray_impl(
     checkpoint_store=None,
     resume: bool = False,
     force_reprocess: bool = False,
+    progress_mode: str | None = None,
 ):
     del checkpoint_store
 
@@ -60,9 +130,14 @@ async def run_hashing_shortlist_with_ray_impl(
     ensure_ray_initialized()
     primitives = _get_ray_primitives()
     runtime_config = resolve_ray_runtime_config()
+    debug_mode = _is_debug_mode()
+    progress_mode = resolve_progress_mode(progress_mode, execution_backend="ray")
+    progress_enabled = progress_bars_enabled(progress_mode)
+    telemetry_mode = str(getattr(run_context, "telemetry_mode", "sampled") or "sampled").strip().lower()
     logger.info(
-        "Ray shortlist startup | urls=%d | ram={total_gb=%s,available_gb=%s} | local_mode=%s | low_memory=%s | server_mode=%s | prewarm=%s | actors={stage1_fetch=%d,stage1_enrich=%d,hash_browser=%d,classify=%d} | stage0={batch_size=%d,inflight=%d} | backpressure={stage1_cap=%d,hash_cap=%d} | hash={tabs_per_actor=%d,finalize_batch=%d}",
+        "Ray shortlist startup | urls=%d | progress_mode=%s | ram={total_gb=%s,available_gb=%s} | local_mode=%s | low_memory=%s | server_mode=%s | prewarm=%s | actors={stage1_fetch=%d,stage1_enrich=%d,hash_browser=%d,classify=%d} | stage0={batch_size=%d,inflight=%d} | backpressure={stage1_cap=%d,hash_cap=%d} | hash={tabs_per_actor=%d,finalize_batch=%d}",
         len(url_list),
+        progress_mode,
         runtime_config.get("detected_total_ram_gb", "NA"),
         runtime_config.get("detected_available_ram_gb", "NA"),
         bool(runtime_config.get("local_mode")),
@@ -116,6 +191,9 @@ async def run_hashing_shortlist_with_ray_impl(
         (total_keepalive_budget + stage1_fetch_actor_count - 1) // stage1_fetch_actor_count,
     )
     source_workbook_map = comparison._resolve_source_workbook_map(url_sources)
+    trace_record_key = str(getattr(run_context, "trace_record_key", "") or "")
+    trace_url = comparison.normalize_url(str(getattr(run_context, "trace_url", "") or "")) if run_context is not None else ""
+    capture_full_render_trace = debug_mode or telemetry_mode in {"full", "debug"}
     checkpoint_actor = (
         primitives["CheckpointWriterActor"].remote(_ray_context_dict(run_context))
         if run_context is not None
@@ -128,41 +206,52 @@ async def run_hashing_shortlist_with_ray_impl(
     hash_browser_actors: list[Any] = []
     prewarm_actors = bool(runtime_config.get("prewarm_actors", False))
     logger.info("Ray shortlist control actors created | checkpoint=%s", bool(checkpoint_actor))
-    stop_metrics = asyncio.Event()
-    metrics_task = asyncio.create_task(
-        _log_metrics_periodically(
-            metrics_actor,
-            stop_metrics,
-            "shortlist",
-            float(runtime_config["metrics_interval_seconds"]),
-        )
-    )
 
     input_urls = list(url_list)
     t0 = time.perf_counter()
-    log_path = comparison._configure_hashing_log()
+    log_path = comparison._configure_hashing_log(
+        get_run_artifact_path(run_context, "hashing_log", comparison.HASHING_LOG_PATH)
+    )
     logger.info("Hashing log: %s", log_path)
     reset_rdap_state()
 
-    completed_record_keys = set()
+    checkpoint_completed_record_keys = set()
     if checkpoint_actor is not None and resume and not force_reprocess:
-        completed_record_keys = await _ray_get(checkpoint_actor.get_completed_record_keys.remote())
+        checkpoint_completed_record_keys = await _ray_get(checkpoint_actor.get_completed_record_keys.remote())
 
-    pending_records_by_url: dict[str, list[tuple[str, str]]] = {}
+    shortlist_progress = ProgressTracker(total=len(input_urls))
+    progress_completed_record_keys: set[str] = set()
+    pending_records_by_url: dict[str, list[dict[str, str]]] = {}
     metric_urls: list[str] = []
     seen_metric_urls: set[str] = set()
     ensure_records: list[dict[str, Any]] = []
     stage0_skipped = 0
-    for raw_url in input_urls:
+    for ordinal, raw_url in enumerate(input_urls):
         normalized_url = comparison.normalize_url(raw_url)
         source_workbook = source_workbook_map.get(normalized_url, "")
+        progress_record_key = _build_shortlist_progress_record_key(normalized_url, source_workbook, ordinal)
         ensure_records.append(
             {"raw_url": raw_url, "normalized_url": normalized_url, "source_workbook": source_workbook}
         )
-        if run_context is not None and make_record_key(normalized_url, source_workbook) in completed_record_keys:
+        if (
+            run_context is not None
+            and make_record_key(normalized_url, source_workbook) in checkpoint_completed_record_keys
+        ):
             stage0_skipped += 1
+            _mark_shortlist_progress_completion(
+                shortlist_progress,
+                progress_completed_record_keys,
+                progress_record_key,
+                final_status="resume_skip",
+            )
             continue
-        pending_records_by_url.setdefault(normalized_url, []).append((raw_url, source_workbook))
+        pending_records_by_url.setdefault(normalized_url, []).append(
+            {
+                "raw_url": raw_url,
+                "source_workbook": source_workbook,
+                "progress_key": progress_record_key,
+            }
+        )
         if normalized_url and normalized_url not in seen_metric_urls:
             seen_metric_urls.add(normalized_url)
             metric_urls.append(normalized_url)
@@ -176,6 +265,8 @@ async def run_hashing_shortlist_with_ray_impl(
     results: list[dict[str, Any]] = []
     review_results: list[dict[str, Any]] = []
     prefetch_admitted_failures: list[dict[str, Any]] = []
+    render_trace_rows: list[dict[str, Any]] = []
+    render_trace_written = False
     metrics = {
         "processed": 0,
         "render_completed": 0,
@@ -197,6 +288,8 @@ async def run_hashing_shortlist_with_ray_impl(
         "live_page_workers": 0,
         "phase": "running",
         "hash_execution_mode": "ray",
+        "render_rescue_attempted": 0,
+        "render_rescue_applied": 0,
     }
     stage1_progress = {"escalated": 0, "failed": 0, "head_only": 0, "fetched": 0, "fallback_dns": 0, "timeout": 0}
     stage0_hits = 0
@@ -210,7 +303,7 @@ async def run_hashing_shortlist_with_ray_impl(
     stage1_enrich_actor_max_concurrency = int(runtime_config.get("stage1_enrich_actor_max_concurrency", 4) or 4)
     pending: dict[Any, tuple[str, Any]] = {}
     stage1_backlog: deque[dict[str, Any]] = deque()
-    hash_backlog: deque[tuple[str, str, str]] = deque()
+    hash_backlog: deque[tuple[str, str, str, str]] = deque()
     remaining_stage0_urls = list(metric_urls)
     browser_actor_index = 0
     fetch_actor_index = 0
@@ -225,6 +318,80 @@ async def run_hashing_shortlist_with_ray_impl(
     _debug_heartbeat_interval = 10.0  # seconds
     _debug_consecutive_empty_waits = 0
     _debug_stall_warning_threshold = 6  # ~60s of consecutive empty waits
+    _debug_last_stall_event = 0.0
+    progress_stop = asyncio.Event()
+
+    def _should_capture_render_trace(artifact: dict[str, Any], render_payload: dict[str, Any] | None = None) -> bool:
+        if capture_full_render_trace:
+            return True
+        resolved_artifact = dict(artifact or {})
+        resolved_payload = dict(render_payload or {})
+        normalized_url = str(
+            resolved_artifact.get("normalized_url", "")
+            or resolved_payload.get("normalized_url", resolved_payload.get("url", ""))
+            or ""
+        ).strip().lower()
+        source_workbook = str(
+            resolved_artifact.get("source_workbook", "")
+            or resolved_payload.get("source_workbook", "")
+            or source_workbook_map.get(normalized_url, "")
+        )
+        record_key = str(resolved_artifact.get("record_key", "") or make_record_key(normalized_url, source_workbook))
+        if trace_record_key and record_key == trace_record_key:
+            return True
+        return bool(trace_url and normalized_url == trace_url)
+
+    def _stage_name_for_task(kind: str) -> str:
+        if kind == "stage0_batch":
+            return "stage0"
+        if kind.startswith("stage1_"):
+            return "stage1"
+        return "hash"
+
+    def _ensure_debug_submit_times() -> None:
+        now = time.perf_counter()
+        for ref, (kind, context) in list(pending.items()):
+            if id(ref) in _debug_pending_submit_times:
+                continue
+            submitted_monotonic = now
+            if isinstance(context, dict):
+                submitted_monotonic = float(context.get("submitted_monotonic", now) or now)
+            _debug_pending_submit_times[id(ref)] = (kind, submitted_monotonic)
+
+    def _track_pending(ref: Any, kind: str, context: dict[str, Any]) -> None:
+        submitted_monotonic = float(context.get("submitted_monotonic", time.perf_counter()) or time.perf_counter())
+        context["submitted_monotonic"] = submitted_monotonic
+        pending[ref] = (kind, context)
+        _debug_pending_submit_times[id(ref)] = (kind, submitted_monotonic)
+
+    def _build_heartbeat_payload(kind: str, context: Any, *, now: float) -> dict[str, Any] | None:
+        context_dict = dict(context or {}) if isinstance(context, dict) else {}
+        record = dict(context_dict.get("record") or {}) if "record" in context_dict else context_dict
+        worker_id = str(context_dict.get("worker_id", "") or record.get("worker_id", "") or "")
+        if not worker_id:
+            return None
+        normalized_url = str(record.get("normalized_url", "") or record.get("url", "") or "").strip().lower()
+        source_workbook = str(record.get("source_workbook", "") or source_workbook_map.get(normalized_url, ""))
+        details = {
+            "normalized_url": normalized_url,
+            "stage0_remaining": len(remaining_stage0_urls),
+            "stage1_backlog": len(stage1_backlog),
+            "hash_backlog": len(hash_backlog),
+            "finalize_queue": len(finalize_buffer),
+        }
+        if kind == "stage0_batch":
+            details["batch_size"] = len(list(context_dict.get("normalized_urls") or []))
+        record_key = str(context_dict.get("record_key", "") or record.get("record_key", "") or "")
+        if not record_key and normalized_url:
+            record_key = make_record_key(normalized_url, source_workbook)
+        return {
+            "stage_name": _stage_name_for_task(kind),
+            "worker_id": worker_id,
+            "record_key": record_key,
+            "task_kind": kind,
+            "item_age_s": max(0.0, now - float(context_dict.get("submitted_monotonic", now) or now)),
+            "details": details,
+        }
 
     async def _record_checkpoint(patch: dict[str, Any] | None, event: dict[str, Any] | None) -> None:
         if checkpoint_actor is None:
@@ -303,13 +470,93 @@ async def run_hashing_shortlist_with_ray_impl(
 
     await _prewarm_actor_pools()
 
+    def _should_attempt_hash_render_rescue(artifact: dict[str, Any], render_payload: dict[str, Any]) -> bool:
+        stage1_analysis = dict(artifact.get("stage1_analysis", {}) or {})
+        prefetch_metrics = dict(artifact.get("prefetch_metrics", {}) or {})
+        lexical_hit = bool(stage1_analysis.get("lexical_hit", False) or prefetch_metrics.get("strict_lexical_hit", False))
+        fetch_status = str(render_payload.get("fetch_status", "") or "").strip().lower()
+        if not lexical_hit or fetch_status not in {"fetched", "fetched_visual_missing"}:
+            return False
+        return comparison._looks_like_noninformative_hash_render(
+            title_text=str(render_payload.get("html_title_text", "") or ""),
+            visible_text_excerpt=str(render_payload.get("visible_text_excerpt", "") or ""),
+            html_content=str(render_payload.get("html_content", "") or ""),
+        )
+
+    async def _attempt_hash_render_rescue(
+        artifact: dict[str, Any],
+        render_payload: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any] | None, bool, str]:
+        nonlocal fetch_actor_index
+
+        _ensure_stage1_fetch_actors()
+        record = {
+            "raw_url": str(artifact.get("raw_url", "") or artifact.get("normalized_url", "")),
+            "normalized_url": str(artifact.get("normalized_url", "") or artifact.get("raw_url", "")),
+            "source_workbook": str(artifact.get("source_workbook", "") or ""),
+        }
+        actor = stage1_fetch_actors[fetch_actor_index % len(stage1_fetch_actors)]
+        fetch_actor_index += 1
+        rescue_fetch = await _ray_get(actor.fetch.remote(record))
+        rescue_payload = dict((rescue_fetch or {}).get("payload") or {})
+        parsed = await _ray_get(primitives["stage1_parse_task"].remote(record, rescue_payload, stage1_http_config))
+        rescue_result = dict((parsed or {}).get("result") or {})
+        merged_payload, applied = comparison._merge_stage1_rescue_into_hash_render_payload(render_payload, rescue_result)
+        rescue_reason = ""
+        if applied:
+            rescue_reason = "stage1_http_rescue"
+            merged_stage1_analysis = {**comparison._stage1_signal_defaults(), **dict(artifact.get("stage1_analysis", {}) or {}), **rescue_result}
+            artifact["stage1_analysis"] = merged_stage1_analysis
+        return merged_payload, rescue_result, applied, rescue_reason
+
     def _pending_count(*kinds: str) -> int:
         wanted = set(kinds)
         return sum(1 for kind, _ in pending.values() if kind in wanted)
 
-    async def _schedule_hash_admission(raw_url: str, normalized_url: str, source_workbook: str) -> None:
+    stop_metrics = asyncio.Event()
+    metrics_task = asyncio.create_task(
+        _log_metrics_periodically(
+            metrics_actor,
+            stop_metrics,
+            "shortlist",
+            float(runtime_config["metrics_interval_seconds"]),
+            checkpoint_actor=checkpoint_actor,
+            stage_name="shortlist",
+            details_getter=lambda: {
+                "stage0": {
+                    "hits": stage0_hits,
+                    "misses": stage0_misses,
+                    "skipped": stage0_skipped,
+                    "remaining": len(remaining_stage0_urls),
+                },
+                "stage1": {
+                    "progress": dict(stage1_progress),
+                    "pending": _pending_count("stage1_fetch", "stage1_parse", "stage1_enrich"),
+                    "backlog": len(stage1_backlog),
+                    "fetch_actors": len(stage1_fetch_actors),
+                    "enrich_actors": len(stage1_enrich_actors),
+                },
+                "hash": {
+                    "pending": _pending_count("hash_render", "hash_enrich", "hash_finalize"),
+                    "backlog": len(hash_backlog),
+                    "render_queue_depth": metrics.get("render_queue_depth", 0),
+                    "aux_queue_depth": metrics.get("aux_queue_depth", 0),
+                    "finalize_queue_depth": len(finalize_buffer),
+                    "browser_actors": len(hash_browser_actors),
+                    "render_trace_rows": len(render_trace_rows),
+                },
+                "matches": int(metrics.get("final_matches_above_threshold", 0) or 0),
+            },
+            resource_snapshot_getter=debug_ray_resource_snapshot,
+            emit_logs=not progress_enabled,
+        )
+    )
+
+    async def _schedule_hash_admission(raw_url: str, normalized_url: str, source_workbook: str, progress_key: str) -> None:
         nonlocal browser_actor_index
         _ensure_hash_browser_actors()
+        record_key = make_record_key(normalized_url, source_workbook)
+        actor_slot = browser_actor_index % len(hash_browser_actors)
         artifact = asdict(
             HashRenderArtifact(
                 raw_url=raw_url,
@@ -319,9 +566,13 @@ async def run_hashing_shortlist_with_ray_impl(
                 stage1_analysis=dict(stage1_analysis_map.get(normalized_url, {}) or {}),
             )
         )
-        actor = hash_browser_actors[browser_actor_index % len(hash_browser_actors)]
+        artifact["progress_key"] = progress_key
+        artifact["record_key"] = record_key
+        artifact["worker_id"] = f"hash-browser-{actor_slot}-{record_key[:8] or 'item'}"
+        artifact["submitted_monotonic"] = time.perf_counter()
+        actor = hash_browser_actors[actor_slot]
         browser_actor_index += 1
-        pending[actor.render.remote(artifact)] = ("hash_render", artifact)
+        _track_pending(actor.render.remote(artifact), "hash_render", artifact)
         await _record_checkpoint(
             _build_shortlist_patch(
                 run_context=run_context,
@@ -346,27 +597,37 @@ async def run_hashing_shortlist_with_ray_impl(
             ),
         )
 
-    async def _admit_to_hash(raw_url: str, normalized_url: str, source_workbook: str) -> None:
-        hash_backlog.append((raw_url, normalized_url, source_workbook))
+    async def _admit_to_hash(raw_url: str, normalized_url: str, source_workbook: str, progress_key: str) -> None:
+        hash_backlog.append((raw_url, normalized_url, source_workbook, progress_key))
 
     async def _schedule_stage1_fetch(record: dict[str, Any]) -> None:
         nonlocal fetch_actor_index
         _ensure_stage1_fetch_actors()
-        actor = stage1_fetch_actors[fetch_actor_index % len(stage1_fetch_actors)]
+        record = dict(record)
+        normalized_url = str(record.get("normalized_url", "") or comparison.normalize_url(record.get("raw_url", "")))
+        source_workbook = str(record.get("source_workbook", "") or source_workbook_map.get(normalized_url, ""))
+        record_key = make_record_key(normalized_url, source_workbook)
+        actor_slot = fetch_actor_index % len(stage1_fetch_actors)
+        actor = stage1_fetch_actors[actor_slot]
         fetch_actor_index += 1
-        pending[actor.fetch.remote(record)] = ("stage1_fetch", dict(record))
+        record["normalized_url"] = normalized_url
+        record["source_workbook"] = source_workbook
+        record["record_key"] = record_key
+        record["worker_id"] = f"stage1-fetch-{actor_slot}-{record_key[:8] or 'item'}"
+        record["submitted_monotonic"] = time.perf_counter()
+        _track_pending(actor.fetch.remote(record), "stage1_fetch", record)
 
     async def _submit_stage1_fetch(record: dict[str, Any]) -> None:
         stage1_backlog.append(dict(record))
 
     async def _drain_backlogs() -> None:
         while hash_backlog and _pending_count("hash_render", "hash_enrich", "hash_finalize") < hash_pending_cap:
-            raw_url, normalized_url, source_workbook = hash_backlog.popleft()
-            await _schedule_hash_admission(raw_url, normalized_url, source_workbook)
+            raw_url, normalized_url, source_workbook, progress_key = hash_backlog.popleft()
+            await _schedule_hash_admission(raw_url, normalized_url, source_workbook, progress_key)
         while stage1_backlog and _pending_count("stage1_fetch", "stage1_parse", "stage1_enrich") < stage1_pending_cap:
             await _schedule_stage1_fetch(stage1_backlog.popleft())
 
-    async def _record_hash_fetch_outcome(payload_outcome: dict[str, Any]) -> None:
+    async def _record_hash_fetch_outcome(payload_outcome: dict[str, Any], artifact: dict[str, Any] | None = None) -> None:
         decision_row = payload_outcome.get("decision_row")
         if decision_row is not None:
             decision_rows.append(decision_row)
@@ -378,11 +639,19 @@ async def run_hashing_shortlist_with_ray_impl(
         metrics[metric_key] += 1
         metrics["processed"] += 1
         metrics["finalized"] += 1
+        if artifact is not None:
+            _mark_shortlist_progress_completion(
+                shortlist_progress,
+                progress_completed_record_keys,
+                str(artifact.get("progress_key", "") or ""),
+                final_status=metric_key,
+            )
 
     async def _finalize_stage1(record: dict[str, Any], analysis: dict[str, Any]) -> None:
         raw_url = str(record.get("raw_url", "") or "")
         normalized_url = str(record.get("normalized_url", "") or comparison.normalize_url(raw_url))
         source_workbook = str(record.get("source_workbook", "") or source_workbook_map.get(normalized_url, ""))
+        progress_key = str(record.get("progress_key", "") or "")
         prefetch_metrics = prefetch_metrics_map.get(normalized_url, {})
         fallback_taken = ""
         if (
@@ -409,7 +678,14 @@ async def run_hashing_shortlist_with_ray_impl(
         stage1_analysis_map[normalized_url] = final_analysis
         if bool(final_analysis.get("escalate_to_hashing")):
             stage1_progress["escalated"] += 1
-            await _admit_to_hash(raw_url, normalized_url, source_workbook)
+            await _admit_to_hash(raw_url, normalized_url, source_workbook, progress_key)
+        else:
+            _mark_shortlist_progress_completion(
+                shortlist_progress,
+                progress_completed_record_keys,
+                progress_key,
+                final_status=fetch_status or "filtered_lexical_miss",
+            )
         if fetch_status == "failed":
             stage1_progress["failed"] += 1
         elif fetch_status == "head_only":
@@ -493,9 +769,98 @@ async def run_hashing_shortlist_with_ray_impl(
                 scoring_config,
                 stage1_analysis=dict(artifact.get("stage1_analysis", {}) or {}),
             )
-            await _record_hash_fetch_outcome(payload_outcome)
+            await _record_hash_fetch_outcome(payload_outcome, artifact)
             return
         raise exc
+
+    def _refresh_progress_bar(progress_bar: Any | None) -> None:
+        if progress_bar is None:
+            return
+        completed = shortlist_progress.completed
+        if completed > progress_bar.n:
+            progress_bar.update(completed - progress_bar.n)
+        render_queue_depth = sum(1 for pending_kind, _ in pending.values() if pending_kind == "hash_render") + len(hash_backlog)
+        aux_queue_depth = sum(1 for pending_kind, _ in pending.values() if pending_kind == "hash_enrich")
+        finalize_queue_depth = len(finalize_buffer) + sum(
+            1 for pending_kind, _ in pending.values() if pending_kind == "hash_finalize"
+        )
+        progress_bar.set_postfix(
+            _build_shortlist_progress_postfix(
+                progress_tracker=shortlist_progress,
+                started_monotonic=t0,
+                stage0_processed=stage0_hits + stage0_misses,
+                stage0_hits=stage0_hits,
+                stage0_misses=stage0_misses,
+                stage1_inflight=_pending_count("stage1_fetch", "stage1_parse", "stage1_enrich"),
+                stage1_backlog=len(stage1_backlog),
+                render_queue_depth=render_queue_depth,
+                aux_queue_depth=aux_queue_depth,
+                finalize_queue_depth=finalize_queue_depth,
+                active_hash_concurrency=int(runtime_config["hash_tabs_per_actor"]) * len(hash_browser_actors),
+                match_count=int(metrics.get("final_matches_above_threshold", 0) or 0),
+                phase=str(metrics.get("phase", "running") or "running"),
+            ),
+            refresh=False,
+        )
+        progress_bar.refresh()
+
+    async def _progress_monitor(progress_bar: Any | None) -> None:
+        if progress_bar is None:
+            return
+        while not progress_stop.is_set():
+            _refresh_progress_bar(progress_bar)
+            try:
+                await asyncio.wait_for(progress_stop.wait(), timeout=0.5)
+            except asyncio.TimeoutError:
+                pass
+
+    heartbeat_stop = asyncio.Event()
+    heartbeat_workers: set[tuple[str, str]] = set()
+
+    async def _heartbeat_monitor() -> None:
+        nonlocal heartbeat_workers
+        if checkpoint_actor is None:
+            return
+        while not heartbeat_stop.is_set():
+            now = time.perf_counter()
+            active_workers: set[tuple[str, str]] = set()
+            for kind, context in list(pending.values()):
+                heartbeat = _build_heartbeat_payload(kind, context, now=now)
+                if heartbeat is None:
+                    continue
+                stage_name = str(heartbeat.get("stage_name", "") or "shortlist")
+                worker_id = str(heartbeat.get("worker_id", "") or "")
+                active_workers.add((stage_name, worker_id))
+                checkpoint_actor.update_worker_heartbeat.remote(
+                    stage_name=stage_name,
+                    worker_id=worker_id,
+                    record_key=str(heartbeat.get("record_key", "") or ""),
+                    state="running",
+                    task_kind=str(heartbeat.get("task_kind", "") or ""),
+                    item_age_s=float(heartbeat.get("item_age_s", 0.0) or 0.0),
+                    details=dict(heartbeat.get("details") or {}),
+                )
+            for stage_name, worker_id in sorted(heartbeat_workers - active_workers):
+                checkpoint_actor.clear_worker_heartbeat.remote(stage_name=stage_name, worker_id=worker_id)
+            heartbeat_workers = active_workers
+            try:
+                await asyncio.wait_for(heartbeat_stop.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                pass
+
+    logging_redirect_ctx = tqdm_logging_redirect(progress_enabled)
+    progress_bar_ctx = managed_progress_bar(
+        enabled=progress_enabled,
+        desc="Ray shortlist",
+        total=len(input_urls),
+        unit="url",
+        position=0,
+    )
+    logging_redirect_ctx.__enter__()
+    progress_bar = progress_bar_ctx.__enter__()
+    progress_task = asyncio.create_task(_progress_monitor(progress_bar)) if progress_bar is not None else None
+    heartbeat_task = asyncio.create_task(_heartbeat_monitor()) if checkpoint_actor is not None else None
+    _refresh_progress_bar(progress_bar)
 
     try:
         while remaining_stage0_urls or pending or finalize_buffer or stage1_backlog or hash_backlog:
@@ -515,11 +880,15 @@ async def run_hashing_shortlist_with_ray_impl(
                     break
                 batch = remaining_stage0_urls[:stage0_batch_size]
                 remaining_stage0_urls = remaining_stage0_urls[stage0_batch_size:]
-                pending[primitives["stage0_batch_task"].remote(batch, lex_eval_config)] = ("stage0_batch", {"normalized_urls": list(batch)})
-                # Track submission time for debug stall detection
-                for _ref in list(pending.keys()):
-                    if id(_ref) not in _debug_pending_submit_times:
-                        _debug_pending_submit_times[id(_ref)] = ("stage0_batch", time.perf_counter())
+                _track_pending(
+                    primitives["stage0_batch_task"].remote(batch, lex_eval_config),
+                    "stage0_batch",
+                    {
+                        "normalized_urls": list(batch),
+                        "worker_id": f"stage0-batch-{stage0_batches_completed + inflight_stage0 + 1}",
+                        "submitted_monotonic": time.perf_counter(),
+                    },
+                )
                 if not stage0_warmup_logged:
                     logger.info(
                         "Ray shortlist Stage0 warmup | submitted initial lexical batches=%d | batch_size=%d | first completion can take a while on Windows due to worker import cost",
@@ -535,6 +904,7 @@ async def run_hashing_shortlist_with_ray_impl(
                     threshold=threshold,
                     scoring_config=scoring_config,
                 )
+                _ensure_debug_submit_times()
                 if not pending:
                     break
             ready, _ = await _ray_wait(list(pending.keys()), num_returns=min(8, len(pending)), timeout=1.0)
@@ -575,11 +945,48 @@ async def run_hashing_shortlist_with_ray_impl(
                             len(stage1_backlog), len(hash_backlog), len(finalize_buffer), len(remaining_stage0_urls),
                             resources.get("available_cpu", 0), resources.get("cluster_cpu", 0),
                         )
+                    if (
+                        checkpoint_actor is not None
+                        and (is_cpu_exhausted or _debug_consecutive_empty_waits >= _debug_stall_warning_threshold)
+                        and (now_mono - _debug_last_stall_event) >= _debug_heartbeat_interval
+                    ):
+                        _debug_last_stall_event = now_mono
+                        checkpoint_actor.append_stall_event.remote(
+                            {
+                                "emitted_at": utc_now_iso(),
+                                "label": "ray_shortlist_empty_wait",
+                                "stage_name": "shortlist",
+                                "severity": "error" if is_cpu_exhausted else "warning",
+                                "message": (
+                                    "Ray shortlist empty wait with CPU exhaustion"
+                                    if is_cpu_exhausted
+                                    else "Ray shortlist waiting on pending work without completions"
+                                ),
+                                "resource_snapshot": resources,
+                                "details": {
+                                    "elapsed_s": round(max(0.0, now_mono - t0), 3),
+                                    "consecutive_empty_waits": _debug_consecutive_empty_waits,
+                                    "pending_by_kind": kind_counts,
+                                    "oldest_age_s": oldest_ages,
+                                    "stage1_backlog": len(stage1_backlog),
+                                    "hash_backlog": len(hash_backlog),
+                                    "finalize_queue": len(finalize_buffer),
+                                    "stage0_remaining": len(remaining_stage0_urls),
+                                },
+                            }
+                        )
+                _refresh_progress_bar(progress_bar)
                 continue
             _debug_consecutive_empty_waits = 0  # Reset on successful wait
             for ref in ready:
                 kind, context = pending.pop(ref)
                 _debug_pending_submit_times.pop(id(ref), None)  # Clean up debug tracking
+                heartbeat = _build_heartbeat_payload(kind, context, now=time.perf_counter())
+                if checkpoint_actor is not None and heartbeat is not None:
+                    checkpoint_actor.clear_worker_heartbeat.remote(
+                        stage_name=str(heartbeat.get("stage_name", "") or "shortlist"),
+                        worker_id=str(heartbeat.get("worker_id", "") or ""),
+                    )
                 try:
                     payload = await _ray_get(ref)
                 except Exception as exc:
@@ -592,7 +999,10 @@ async def run_hashing_shortlist_with_ray_impl(
                         prefetch_row = dict(prefetch_metrics or {})
                         prefetch_row["source_workbook"] = source_workbook_map.get(normalized_url, prefetch_row.get("source_workbook", ""))
                         prefetch_metrics_map[normalized_url] = prefetch_row
-                        for raw_url, source_workbook in pending_records_by_url.get(normalized_url, []):
+                        for record_entry in pending_records_by_url.get(normalized_url, []):
+                            raw_url = str(record_entry.get("raw_url", "") or "")
+                            source_workbook = str(record_entry.get("source_workbook", "") or "")
+                            progress_key = str(record_entry.get("progress_key", "") or "")
                             stage_started_at = utc_now_iso()
                             stage_started_monotonic = time.perf_counter()
                             if comparison._passes_lexical_gate(prefetch_row):
@@ -602,7 +1012,7 @@ async def run_hashing_shortlist_with_ray_impl(
                                     _build_shortlist_patch(run_context=run_context, raw_url=raw_url, normalized_url=normalized_url, source_workbook=source_workbook, stage_name="stage0", stage_status="lexical_hit", current_stage="stage0", worker_id="ray-stage0"),
                                     _build_shortlist_stage_event(run_context=run_context, raw_url=raw_url, normalized_url=normalized_url, source_workbook=source_workbook, stage_name="stage0", worker_id="ray-stage0", started_at=stage_started_at, started_monotonic=stage_started_monotonic, status="lexical_hit"),
                                 )
-                                await _admit_to_hash(raw_url, normalized_url, source_workbook)
+                                await _admit_to_hash(raw_url, normalized_url, source_workbook, progress_key)
                             else:
                                 stage0_misses += 1
                                 lexical_reject_urls.add(normalized_url)
@@ -610,18 +1020,50 @@ async def run_hashing_shortlist_with_ray_impl(
                                     _build_shortlist_patch(run_context=run_context, raw_url=raw_url, normalized_url=normalized_url, source_workbook=source_workbook, stage_name="stage0", stage_status="filtered_lexical_miss", current_stage="stage0", worker_id="ray-stage0"),
                                     _build_shortlist_stage_event(run_context=run_context, raw_url=raw_url, normalized_url=normalized_url, source_workbook=source_workbook, stage_name="stage0", worker_id="ray-stage0", started_at=stage_started_at, started_monotonic=stage_started_monotonic, status="filtered_lexical_miss"),
                                 )
-                                await _submit_stage1_fetch({"raw_url": raw_url, "normalized_url": normalized_url, "source_workbook": source_workbook, "stage_started_at": stage_started_at, "started_monotonic": stage_started_monotonic})
+                                await _submit_stage1_fetch(
+                                    {
+                                        "raw_url": raw_url,
+                                        "normalized_url": normalized_url,
+                                        "source_workbook": source_workbook,
+                                        "stage_started_at": stage_started_at,
+                                        "started_monotonic": stage_started_monotonic,
+                                        "progress_key": progress_key,
+                                    }
+                                )
                 elif kind == "stage1_fetch":
                     record = dict(context)
-                    pending[primitives["stage1_parse_task"].remote(record, payload, stage1_http_config)] = ("stage1_parse", {"record": record})
+                    _track_pending(
+                        primitives["stage1_parse_task"].remote(record, payload, stage1_http_config),
+                        "stage1_parse",
+                        {
+                            "record": record,
+                            "record_key": str(record.get("record_key", "") or ""),
+                            "worker_id": f"stage1-parse-{str(record.get('record_key', '') or 'item')[:8]}",
+                            "submitted_monotonic": time.perf_counter(),
+                        },
+                    )
                 elif kind == "stage1_parse":
                     record = dict(payload.get("record") or context.get("record") or {})
                     result = dict(payload.get("result") or {})
                     if bool(payload.get("should_enrich")):
                         _ensure_stage1_enrich_actors()
-                        actor = stage1_enrich_actors[enrich_actor_index % len(stage1_enrich_actors)]
+                        actor_slot = enrich_actor_index % len(stage1_enrich_actors)
+                        actor = stage1_enrich_actors[actor_slot]
                         enrich_actor_index += 1
-                        pending[actor.enrich.remote(record, result, prefetch_metrics_map.get(record.get("normalized_url", ""), {}))] = ("stage1_enrich", {"record": record})
+                        record_key = str(
+                            record.get("record_key", "")
+                            or make_record_key(str(record.get("normalized_url", "") or ""), str(record.get("source_workbook", "") or ""))
+                        )
+                        _track_pending(
+                            actor.enrich.remote(record, result, prefetch_metrics_map.get(record.get("normalized_url", ""), {})),
+                            "stage1_enrich",
+                            {
+                                "record": record,
+                                "record_key": record_key,
+                                "worker_id": f"stage1-enrich-{actor_slot}-{record_key[:8] or 'item'}",
+                                "submitted_monotonic": time.perf_counter(),
+                            },
+                        )
                     else:
                         await _finalize_stage1(record, result)
                 elif kind == "stage1_enrich":
@@ -629,21 +1071,69 @@ async def run_hashing_shortlist_with_ray_impl(
                 elif kind == "hash_render":
                     artifact = dict(context)
                     metrics["render_completed"] += 1
-                    if str(payload.get("fetch_status", "")).strip().lower() in {"fetched", "fetched_visual_missing"}:
-                        pending[primitives["hash_enrich_task"].remote(payload, dict(artifact.get("prefetch_metrics", {}) or {}), dict(artifact.get("stage1_analysis", {}) or {}), scoring_config)] = ("hash_enrich", artifact)
+                    render_payload = dict(payload or {})
+                    rescue_attempted = False
+                    rescue_applied = False
+                    rescue_reason = ""
+                    rescue_result = None
+                    if _should_attempt_hash_render_rescue(artifact, render_payload):
+                        metrics["render_rescue_attempted"] = int(metrics.get("render_rescue_attempted", 0) or 0) + 1
+                        rescue_attempted = True
+                        render_payload, rescue_result, rescue_applied, rescue_reason = await _attempt_hash_render_rescue(
+                            artifact,
+                            render_payload,
+                        )
+                        if rescue_applied:
+                            metrics["render_rescue_applied"] = int(metrics.get("render_rescue_applied", 0) or 0) + 1
+                    if _should_capture_render_trace(artifact, render_payload):
+                        render_trace_rows.append(
+                            comparison._build_ray_render_trace_row(
+                                render_payload,
+                                artifact=artifact,
+                                rescue_attempted=rescue_attempted,
+                                rescue_applied=rescue_applied,
+                                rescue_reason=rescue_reason,
+                                rescue_result=rescue_result,
+                            )
+                        )
+                    if str(render_payload.get("fetch_status", "")).strip().lower() in {"fetched", "fetched_visual_missing"}:
+                        record_key = str(artifact.get("record_key", "") or "")
+                        _track_pending(
+                            primitives["hash_enrich_task"].remote(
+                                render_payload,
+                                dict(artifact.get("prefetch_metrics", {}) or {}),
+                                dict(artifact.get("stage1_analysis", {}) or {}),
+                                scoring_config,
+                            ),
+                            "hash_enrich",
+                            {
+                                **artifact,
+                                "record_key": record_key,
+                                "worker_id": f"hash-enrich-{record_key[:8] or 'item'}",
+                                "submitted_monotonic": time.perf_counter(),
+                            },
+                        )
                     else:
                         await _record_hash_fetch_outcome(
                             comparison._handle_stage1_fetch_payload(
-                                payload,
+                                render_payload,
                                 str(artifact.get("normalized_url", "") or artifact.get("raw_url", "")),
                                 dict(artifact.get("prefetch_metrics", {}) or {}),
                                 scoring_config,
                                 stage1_analysis=dict(artifact.get("stage1_analysis", {}) or {}),
-                            )
+                            ),
+                            artifact,
                         )
                 elif kind == "hash_enrich":
                     metrics["aux_completed"] += 1
-                    finalize_buffer.append(dict(payload or {}))
+                    finalize_payload = dict(payload or {})
+                    finalize_payload["progress_key"] = str(
+                        finalize_payload.get("progress_key", "") or context.get("progress_key", "") or ""
+                    )
+                    finalize_payload["record_key"] = str(
+                        finalize_payload.get("record_key", "") or context.get("record_key", "") or ""
+                    )
+                    finalize_buffer.append(finalize_payload)
                 elif kind == "hash_finalize":
                     decision = dict(payload or {})
                     results.extend(list(decision.get("results") or []))
@@ -652,15 +1142,25 @@ async def run_hashing_shortlist_with_ray_impl(
                     for key, value in dict(decision.get("metrics") or {}).items():
                         if isinstance(value, (int, float)):
                             metrics[key] = float(metrics.get(key, 0.0) or 0.0) + float(value)
+                    for progress_key in list((context or {}).get("progress_keys") or []):
+                        _mark_shortlist_progress_completion(
+                            shortlist_progress,
+                            progress_completed_record_keys,
+                            str(progress_key or ""),
+                            final_status="hash_finalized",
+                        )
             await _drain_backlogs()
             if finalize_buffer and not any(kind == "hash_finalize" for kind, _ in pending.values()):
                 await _flush_finalize_buffer(finalize_buffer=finalize_buffer, pending=pending, threshold=threshold, scoring_config=scoring_config)
+                _ensure_debug_submit_times()
             metrics["gpu_queue_depth"] = len(finalize_buffer)
             metrics["render_queue_depth"] = sum(1 for kind, _ in pending.values() if kind == "hash_render") + len(hash_backlog)
             metrics["aux_queue_depth"] = sum(1 for kind, _ in pending.values() if kind == "hash_enrich")
             metrics["stage_elapsed_s"] = time.perf_counter() - t0
+            _refresh_progress_bar(progress_bar)
         if prefetch_admitted_failures:
             results.extend(prefetch_admitted_failures)
+        _refresh_progress_bar(progress_bar)
         logger.info(
             "Ray shortlist complete | stage0={hits=%d,misses=%d,skipped=%d,batches=%d,avg_batch_ms=%.1f} | stage1=%s | hash={processed=%d,matched=%d}",
             stage0_hits,
@@ -672,6 +1172,10 @@ async def run_hashing_shortlist_with_ray_impl(
             int(metrics.get("processed", 0) or 0),
             int(metrics.get("final_matches_above_threshold", 0) or 0),
         )
+        if render_trace_rows:
+            trace_path = comparison._write_ray_render_trace_debug(render_trace_rows, run_context=run_context)
+            logger.info("Ray shortlist render trace written to %s with %d rows", trace_path, len(render_trace_rows))
+            render_trace_written = True
         logger.info("Ray shortlist RDAP metrics | %s", get_rdap_metrics_snapshot())
         return comparison._finish_hashing_shortlist_output(
             t0=t0,
@@ -692,11 +1196,30 @@ async def run_hashing_shortlist_with_ray_impl(
             checkpoint_store=None,
         )
     finally:
+        progress_stop.set()
+        if progress_task is not None:
+            await asyncio.gather(progress_task, return_exceptions=True)
+        heartbeat_stop.set()
+        if heartbeat_task is not None:
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+        if checkpoint_actor is not None:
+            for stage_name, worker_id in sorted(heartbeat_workers):
+                checkpoint_actor.clear_worker_heartbeat.remote(stage_name=stage_name, worker_id=worker_id)
+        _refresh_progress_bar(progress_bar)
+        progress_bar_ctx.__exit__(None, None, None)
+        logging_redirect_ctx.__exit__(None, None, None)
         stop_metrics.set()
         await asyncio.gather(metrics_task, return_exceptions=True)
+        if render_trace_rows and not render_trace_written:
+            try:
+                trace_path = comparison._write_ray_render_trace_debug(render_trace_rows, run_context=run_context)
+                logger.info("Ray shortlist render trace written to %s with %d rows", trace_path, len(render_trace_rows))
+            except Exception:
+                logger.exception("Failed to write Ray shortlist render trace debug artifact")
         close_refs = [actor.close.remote() for actor in stage1_fetch_actors + stage1_enrich_actors + hash_browser_actors]
         if close_refs:
             await _ray_get(close_refs)
         if checkpoint_actor is not None:
             await _ray_get(checkpoint_actor.close.remote())
         comparison._close_hashing_log()
+        sync_run_artifact(run_context, "hashing_log", src_path=log_path, best_effort=True)

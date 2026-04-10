@@ -7,6 +7,8 @@ import sys
 import os
 import argparse
 import asyncio
+import csv
+import json
 import logging
 import warnings
 from typing import Any
@@ -128,6 +130,14 @@ def _stage1_failure_policy(value: str) -> str:
     allowed = {"route_to_dns", "stop"}
     if normalized not in allowed:
         raise argparse.ArgumentTypeError(f"stage1 failure policy must be one of {sorted(allowed)}")
+    return normalized
+
+
+def _telemetry_mode(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    allowed = {"sampled", "full", "debug"}
+    if normalized not in allowed:
+        raise argparse.ArgumentTypeError(f"telemetry mode must be one of {sorted(allowed)}")
     return normalized
 
 
@@ -421,8 +431,22 @@ def _load_runtime_components() -> dict[str, Any]:
 
 
 def _load_existing_run_manifest(path: str) -> dict[str, Any] | None:
+    json_path = os.path.splitext(path)[0] + ".json"
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                metadata_json = data.get("metadata_json")
+                if isinstance(metadata_json, str):
+                    try:
+                        data["metadata_json"] = json.loads(metadata_json)
+                    except Exception:
+                        data["metadata_json"] = {}
+                return data
+        except Exception:
+            pass
     try:
-        import csv
         with open(path, newline="", encoding="utf-8") as fh:
             rows = list(csv.DictReader(fh))
     except Exception:
@@ -433,10 +457,65 @@ def _load_existing_run_manifest(path: str) -> dict[str, Any] | None:
     metadata_json = data.get("metadata_json")
     if isinstance(metadata_json, str):
         try:
-            data["metadata_json"] = __import__("json").loads(metadata_json)
+            data["metadata_json"] = json.loads(metadata_json)
         except Exception:
             data["metadata_json"] = {}
     return data
+
+
+def _stable_json_dumps(payload: Any) -> str:
+    return json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
+def _build_resume_compatibility_snapshot(
+    *,
+    args: argparse.Namespace,
+    runtime_profile_settings: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "paths": {
+            "shortlisting": os.path.abspath(args.shortlisting),
+            "whitelist": os.path.abspath(args.whitelist),
+        },
+        "pipeline": {
+            "pipeline_mode": args.pipeline_mode,
+            "target_limit": args.target_limit,
+            "limit_whitelisted": args.limit,
+            "stage1_failure_policy": args.stage1_failure_policy,
+            "runtime_profile": runtime_profile_settings["resolved_profile"],
+            "telemetry_mode": args.telemetry_mode,
+            "trace_record_key": str(args.trace_record_key or ""),
+            "trace_url": str(args.trace_url or ""),
+        },
+        "thresholds": {
+            "hashing_threshold": args.hashing_threshold,
+            "domain_similarity_threshold": args.domain_sim_threshold,
+            "high_confidence_threshold": args.high_confidence_threshold,
+            "medium_confidence_threshold": args.medium_confidence_threshold,
+            "typo_top_k": args.typo_top_k,
+            "typo_min_score": args.typo_min_score,
+            "lexical_pass_min_score": args.lexical_pass_min_score,
+            "stage1_escalate_total_threshold": args.stage1_escalate_total_threshold,
+            "stage1_brand_min": args.stage1_brand_min,
+            "stage1_credential_min": args.stage1_credential_min,
+            "stage1_low_band_min": args.stage1_low_band_min,
+            "stage1_hard_trigger_brand_min": args.stage1_hard_trigger_brand_min,
+            "keep_stage1_suspected": bool(args.keep_stage1_suspected),
+            "keep_fetch_failed_strict_lexical": bool(args.keep_fetch_failed_strict_lexical),
+            "failed_fetch_suspected_min": args.failed_fetch_suspected_min,
+            "failed_fetch_review_min": args.failed_fetch_review_min,
+        },
+        "weights": {
+            "domain": args.weight_domain,
+            "favicon": args.weight_favicon,
+            "ssl_hash": args.weight_ssl_hash,
+            "html_hash": args.weight_html_hash,
+            "domain_hash": args.weight_domain_hash,
+            "keywords": args.weight_keywords,
+        },
+        "runtime_env": dict(runtime_profile_settings.get("env") or {}),
+        "stage1_http_profile": dict(runtime_profile_settings.get("stage1_http") or {}),
+    }
 
 
 def _manifest_matches_inputs(manifest: dict[str, Any] | None, metadata: dict[str, Any]) -> bool:
@@ -445,6 +524,10 @@ def _manifest_matches_inputs(manifest: dict[str, Any] | None, metadata: dict[str
     manifest_meta = manifest.get("metadata_json")
     if not isinstance(manifest_meta, dict):
         return False
+    existing_signature = str(manifest_meta.get("resume_signature", "") or "").strip()
+    current_signature = str(metadata.get("resume_signature", "") or "").strip()
+    if existing_signature or current_signature:
+        return bool(existing_signature and current_signature and existing_signature == current_signature)
     for key in ("shortlisting", "whitelist", "pipeline_mode", "target_limit", "limit_whitelisted"):
         if str(manifest_meta.get(key, "")) != str(metadata.get(key, "")):
             return False
@@ -541,12 +624,18 @@ async def main():
                         help="Routing policy when cheap Stage1 HTTP analysis fails for lexical misses")
     parser.add_argument("--stall-threshold-seconds", type=_positive_int, default=180,
                         help="Watchdog threshold for no-progress detection in long-running stages (default=180)")
+    parser.add_argument("--telemetry-mode", type=_telemetry_mode, default="sampled",
+                        help="Observability mode: sampled (default), full, or debug")
+    parser.add_argument("--trace-record-key", type=str, default=None,
+                        help="Optional record_key to trace deeply without enabling deep tracing for every row")
+    parser.add_argument("--trace-url", type=str, default=None,
+                        help="Optional URL to trace deeply without enabling deep tracing for every row")
     parser.add_argument("--ray-debug", action="store_true",
                         help="Enable deep Ray debug logging: resource snapshots, task age tracking, stall detection heartbeats")
     args = parser.parse_args()
 
     # --- Activate Ray debug mode if requested ---
-    if args.ray_debug:
+    if args.ray_debug or args.telemetry_mode == "debug":
         os.environ["PHISHING_RAY_DEBUG"] = "1"
         logger.info("\n" + "=" * 80)
         logger.info("🔍  RAY DEBUG MODE ENABLED")
@@ -555,7 +644,14 @@ async def main():
         logger.info("=" * 80 + "\n")
 
     from phishing_pipeline.config import OUTPUT_DIR, RELIABILITY_CONFIG, RUN_MANIFEST_CSV
-    from phishing_pipeline.reliability import CheckpointStore, build_run_context
+    from phishing_pipeline.reliability import (
+        CheckpointStore,
+        build_run_context,
+        get_run_artifact_path,
+        sync_run_artifact,
+        write_run_artifact_csv,
+        write_run_artifact_json,
+    )
 
     runtime_profile_settings = _resolve_runtime_profile_settings(args.runtime_profile)
     reliability_config = _apply_reliability_runtime_profile(dict(RELIABILITY_CONFIG), runtime_profile_settings)
@@ -567,7 +663,16 @@ async def main():
         "target_limit": args.target_limit,
         "limit_whitelisted": args.limit,
         "runtime_profile": args.runtime_profile,
+        "telemetry_mode": args.telemetry_mode,
+        "trace_record_key": str(args.trace_record_key or ""),
+        "trace_url": str(args.trace_url or ""),
     }
+    resume_snapshot = _build_resume_compatibility_snapshot(
+        args=args,
+        runtime_profile_settings=runtime_profile_settings,
+    )
+    reliability_metadata["resume_snapshot"] = resume_snapshot
+    reliability_metadata["resume_signature"] = _stable_json_dumps(resume_snapshot)
     existing_manifest = None
     existing_run_id = None
     if args.resume and not args.force_reprocess:
@@ -590,6 +695,9 @@ async def main():
     run_context = build_run_context(
         output_dir=OUTPUT_DIR,
         run_id=resolved_run_id,
+        telemetry_mode=args.telemetry_mode,
+        trace_record_key=args.trace_record_key,
+        trace_url=args.trace_url,
         stall_threshold_seconds=args.stall_threshold_seconds,
         watchdog_warning_seconds=int(reliability_config.get("watchdog_warning_seconds", 60)),
         append_flush_interval_seconds=int(reliability_config.get("append_flush_interval_seconds", 5)),
@@ -604,6 +712,13 @@ async def main():
     checkpoint_store = CheckpointStore(run_context)
     checkpoint_store.update_manifest(status="running", metadata_json=reliability_metadata)
     execution_backend = "ray" if args.pipeline_mode == "hash_only" else "legacy"
+    from phishing_pipeline.progress_display import resolve_progress_mode
+
+    requested_progress_mode = os.getenv("PHISHING_PROGRESS_MODE", "auto")
+    effective_progress_mode = resolve_progress_mode(
+        requested_progress_mode,
+        execution_backend=execution_backend,
+    )
     logger.info(
         "Reliability run context | run_id=%s | resume=%s | force_reprocess=%s | manifest=%s | checkpoints=%s | stage1_failure_policy=%s | stall_threshold_seconds=%d",
         run_context.run_id,
@@ -614,9 +729,13 @@ async def main():
         run_context.stage1_failure_policy,
         run_context.stall_threshold_seconds,
     )
-    if execution_backend == "ray":
-        checkpoint_store.close()
-        checkpoint_store = None
+    logger.info(
+        "Progress mode requested=%s resolved=%s | backend=%s | stderr_tty=%s",
+        requested_progress_mode,
+        effective_progress_mode,
+        execution_backend,
+        sys.stderr.isatty(),
+    )
 
     def _load_checkpoint_store_for_finalize():
         store = checkpoint_store
@@ -639,6 +758,62 @@ async def main():
     ray_runtime = None
     if execution_backend == "ray":
         from phishing_pipeline import ray_runtime as ray_runtime
+    effective_runtime_snapshot = {
+        "requested_progress_mode": requested_progress_mode,
+        "effective_progress_mode": effective_progress_mode,
+        "execution_backend": execution_backend,
+        "runtime_profile": runtime_profile_settings,
+        "stage1_http_config": dict(stage1_http_config or {}),
+        "telemetry_mode": args.telemetry_mode,
+        "trace_record_key": str(args.trace_record_key or ""),
+        "trace_url": str(args.trace_url or ""),
+    }
+    if execution_backend == "ray":
+        from phishing_pipeline.config import resolve_ray_runtime_config
+
+        effective_runtime_snapshot["ray_runtime_config"] = resolve_ray_runtime_config()
+    else:
+        effective_runtime_snapshot["ray_runtime_config"] = {}
+    write_run_artifact_json(
+        run_context,
+        "effective_args_json",
+        {
+            "args": vars(args),
+            "run_id": run_context.run_id,
+            "run_output_dir": run_context.run_output_dir,
+            "latest_output_dir": run_context.latest_output_dir,
+        },
+        best_effort=True,
+    )
+    write_run_artifact_json(
+        run_context,
+        "effective_runtime_json",
+        effective_runtime_snapshot,
+        best_effort=True,
+    )
+    if checkpoint_store is not None:
+        checkpoint_store.update_manifest(
+            metadata_json={**reliability_metadata, "effective_runtime_snapshot": effective_runtime_snapshot}
+        )
+    effective_shortlist_debug_csv = get_run_artifact_path(
+        run_context,
+        "stage0_lexical_decisions_csv",
+        args.shortlist_debug_csv,
+    )
+    canonical_holdout_csv = get_run_artifact_path(
+        run_context,
+        "holdout_csv",
+        os.path.join("output", "holdout.csv"),
+    )
+    logger.info(
+        "Run artifact roots | run_id=%s | run_output_dir=%s | latest_output_dir=%s",
+        run_context.run_id,
+        run_context.run_output_dir,
+        run_context.latest_output_dir,
+    )
+    if execution_backend == "ray" and checkpoint_store is not None:
+        checkpoint_store.close()
+        checkpoint_store = None
 
     # --- Ray debug startup diagnostic ---
     if getattr(args, "ray_debug", False) and execution_backend == "ray":
@@ -884,7 +1059,7 @@ async def main():
             args.weight_domain_hash,
             args.weight_keywords,
             args.stage_smoke_test,
-            args.shortlist_debug_csv,
+            effective_shortlist_debug_csv,
         )
 
         df_out = None
@@ -893,9 +1068,9 @@ async def main():
         if run_hashing_shortlist_async and shortlisting:
             if args.stage_smoke_test == "classify":
                 fatal_stage = "classify"
-                existing_holdout = os.path.join("output", "holdout.csv")
+                existing_holdout = canonical_holdout_csv
                 if not os.path.exists(existing_holdout):
-                    raise FileNotFoundError("stage-smoke-test=classify requires an existing output/holdout.csv")
+                    raise FileNotFoundError(f"stage-smoke-test=classify requires an existing holdout CSV at {existing_holdout}")
                 logger.info("--- Stage Smoke Test classify: Reusing existing holdout.csv ---")
                 df_out = await run_pipeline(
                     holdout_folder=args.shortlisting,
@@ -911,7 +1086,7 @@ async def main():
                     typo_top_k=args.typo_top_k,
                     typo_min_score=args.typo_min_score,
                     lexical_pass_min_score=args.lexical_pass_min_score,
-                    shortlist_debug_csv=args.shortlist_debug_csv,
+                    shortlist_debug_csv=effective_shortlist_debug_csv,
                     stage1_escalate_total_threshold=args.stage1_escalate_total_threshold,
                     stage1_brand_min=args.stage1_brand_min,
                     stage1_credential_min=args.stage1_credential_min,
@@ -926,6 +1101,7 @@ async def main():
                     resume=args.resume,
                     force_reprocess=args.force_reprocess,
                     execution_backend=execution_backend,
+                    progress_mode=effective_progress_mode,
                 )
                 logger.info("--- Finished Stage Smoke Test classify ---")
             else:
@@ -935,6 +1111,20 @@ async def main():
                 url_records = shortlisting.load_url_records_from_excel_folder(
                     args.shortlisting,
                     limit=args.target_limit,
+                )
+                input_manifest_rows = [
+                    {
+                        "url": str(record.get("url", "") or ""),
+                        "source_workbooks_json": _stable_json_dumps(record.get("source_workbooks", []) or []),
+                    }
+                    for record in url_records
+                ]
+                write_run_artifact_csv(
+                    run_context,
+                    "input_manifest_csv",
+                    ("url", "source_workbooks_json"),
+                    input_manifest_rows,
+                    best_effort=True,
                 )
                 urls = [record["url"] for record in url_records]
                 url_sources = {
@@ -960,7 +1150,7 @@ async def main():
                     typo_min_score=args.typo_min_score,
                     lexical_pass_min_score=args.lexical_pass_min_score,
                     weights=shortlist_weights,
-                    shortlist_debug_csv=args.shortlist_debug_csv,
+                    shortlist_debug_csv=effective_shortlist_debug_csv,
                     url_sources=url_sources,
                     keep_stage1_suspected=args.keep_stage1_suspected,
                     keep_fetch_failed_strict_lexical=args.keep_fetch_failed_strict_lexical,
@@ -974,12 +1164,13 @@ async def main():
                     resume=args.resume,
                     force_reprocess=args.force_reprocess,
                     execution_backend=execution_backend,
+                    progress_mode=effective_progress_mode,
                 )
                 
                 # Save output to holdout.csv
-                out_csv = os.path.join("output", "holdout.csv")
-                os.makedirs("output", exist_ok=True)
-                holdout_df.to_csv(out_csv, index=False)
+                os.makedirs(os.path.dirname(canonical_holdout_csv), exist_ok=True)
+                holdout_df.to_csv(canonical_holdout_csv, index=False)
+                sync_run_artifact(run_context, "holdout_csv", src_path=canonical_holdout_csv, best_effort=True)
                 logger.info(f"--- Finished Step 1: Shortlisting Complete ({len(holdout_df)} matched) ---")
 
                 if args.stage_smoke_test in {"fetch", "lexical", "score"}:
@@ -1010,7 +1201,7 @@ async def main():
                     typo_top_k=args.typo_top_k,
                     typo_min_score=args.typo_min_score,
                     lexical_pass_min_score=args.lexical_pass_min_score,
-                    shortlist_debug_csv=args.shortlist_debug_csv,
+                    shortlist_debug_csv=effective_shortlist_debug_csv,
                     stage1_escalate_total_threshold=args.stage1_escalate_total_threshold,
                     stage1_brand_min=args.stage1_brand_min,
                     stage1_credential_min=args.stage1_credential_min,
@@ -1025,6 +1216,7 @@ async def main():
                     resume=args.resume,
                     force_reprocess=args.force_reprocess,
                     execution_backend=execution_backend,
+                    progress_mode=effective_progress_mode,
                 )
                 
                 logger.info("--- Finished Step 2: Main Pipeline Complete ---")
@@ -1047,7 +1239,7 @@ async def main():
                     typo_top_k=args.typo_top_k,
                     typo_min_score=args.typo_min_score,
                     lexical_pass_min_score=args.lexical_pass_min_score,
-                    shortlist_debug_csv=args.shortlist_debug_csv,
+                    shortlist_debug_csv=effective_shortlist_debug_csv,
                     stage1_escalate_total_threshold=args.stage1_escalate_total_threshold,
                     stage1_brand_min=args.stage1_brand_min,
                     stage1_credential_min=args.stage1_credential_min,
@@ -1062,6 +1254,7 @@ async def main():
                     resume=args.resume,
                     force_reprocess=args.force_reprocess,
                     execution_backend=execution_backend,
+                    progress_mode=effective_progress_mode,
                 )
             except TypeError:
                 df_out = await run_pipeline(args.shortlisting, args.whitelist, args.limit)

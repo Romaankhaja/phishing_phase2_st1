@@ -33,7 +33,7 @@ try:
     import resource as _resource
 except Exception:
     _resource = None
-from .config import HASH_EXPORT_DIR, STAGE1_HTTP_CONFIG, resolve_stage1_http_config
+from .config import HASH_EXPORT_DIR, OUTPUT_DIR, RAY_DEBUG_MODE, STAGE1_HTTP_CONFIG, resolve_stage1_http_config
 from .similarity_hashing import (
     SIMHASH_BITS,
     best_similarity_against_set,
@@ -58,8 +58,10 @@ from .reliability import (
     RunContext,
     StageWatchdog,
     async_with_timeout_and_retry,
+    get_run_artifact_path,
     make_record_key,
     normalize_exception,
+    sync_run_artifact,
     stage_result_patch,
     utc_now_iso,
 )
@@ -1211,6 +1213,250 @@ def _close_hashing_log() -> None:
                 logger.removeHandler(handler)
                 handler.close()
     _logging.captureWarnings(False)
+
+
+_NONINFORMATIVE_RENDER_MARKERS = (
+    "403 forbidden",
+    "404 not found",
+    "access denied",
+    "index of /",
+    "directory listing for /",
+    "forbidden",
+    "not found",
+)
+
+_RAY_RENDER_TRACE_COLUMNS = (
+    "record_key",
+    "worker_id",
+    "raw_url",
+    "normalized_url",
+    "source_workbook",
+    "decision_code",
+    "reason_code",
+    "fetch_status",
+    "visual_status",
+    "final_landing_url",
+    "screenshot_path",
+    "artifact_paths_json",
+    "html_title_text",
+    "visible_text_excerpt",
+    "has_screenshot_path",
+    "has_page_hash",
+    "has_html_hash",
+    "has_domain_hash",
+    "looks_placeholder",
+    "rescue_attempted",
+    "rescue_applied",
+    "rescue_reason",
+    "rescue_fetch_status",
+    "rescue_final_landing_url",
+    "rescue_html_title_text",
+    "rescue_visible_text_excerpt",
+    "rescue_html_bytes_read",
+    "rescue_looks_placeholder",
+)
+
+
+def _looks_like_noninformative_hash_render(
+    *,
+    title_text: str = "",
+    visible_text_excerpt: str = "",
+    html_content: str = "",
+) -> bool:
+    surface = _collapse_text(
+        " ".join(
+            part
+            for part in [
+                str(title_text or ""),
+                str(visible_text_excerpt or ""),
+                str(html_content or "")[:512],
+            ]
+            if part
+        )
+    )
+    if not surface:
+        return True
+    if any(marker in surface for marker in _NONINFORMATIVE_RENDER_MARKERS):
+        return True
+    if len(surface.split()) <= 3 and surface in {"403", "forbidden", "index of"}:
+        return True
+    return False
+
+
+def _merge_stage1_rescue_into_hash_render_payload(
+    render_payload: dict[str, Any],
+    rescue_result: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    payload = dict(render_payload or {})
+    stage1_result = dict(rescue_result or {})
+    rescue_title = str(stage1_result.get("title_text", "") or "").strip().lower()
+    rescue_visible_text = str(stage1_result.get("visible_text", "") or "").strip().lower()
+    rescue_html_excerpt = str(stage1_result.get("html_excerpt", "") or "").strip()
+    rescue_final_landing_url = str(stage1_result.get("final_landing_url", "") or "").strip()
+    rescue_final_domain = str(stage1_result.get("final_domain", "") or "").strip().lower()
+    rescue_placeholder = _looks_like_noninformative_hash_render(
+        title_text=rescue_title,
+        visible_text_excerpt=rescue_visible_text[:500],
+        html_content=rescue_html_excerpt,
+    )
+    existing_placeholder = _looks_like_noninformative_hash_render(
+        title_text=str(payload.get("html_title_text", "") or ""),
+        visible_text_excerpt=str(payload.get("visible_text_excerpt", "") or ""),
+        html_content=str(payload.get("html_content", "") or ""),
+    )
+    original_final_landing_url = str(payload.get("final_landing_url", "") or "").strip()
+    better_landing = bool(
+        rescue_final_landing_url
+        and rescue_final_landing_url != original_final_landing_url
+        and _registered_domain(rescue_final_landing_url) != _registered_domain(payload.get("normalized_url", payload.get("url", "")))
+    )
+    rescue_informative = not rescue_placeholder and bool(rescue_title or rescue_visible_text or rescue_html_excerpt)
+    if not (rescue_informative or better_landing):
+        return payload, False
+
+    merged = dict(payload)
+    if rescue_final_landing_url and (better_landing or rescue_informative or not original_final_landing_url):
+        merged["final_landing_url"] = rescue_final_landing_url
+    if rescue_final_domain:
+        merged["final_domain"] = rescue_final_domain
+    if rescue_informative or existing_placeholder:
+        if rescue_title:
+            merged["html_title_text"] = rescue_title
+        if rescue_visible_text:
+            merged["visible_text_excerpt"] = rescue_visible_text[:500]
+            merged["visible_text_words"] = set(re.findall(r"[a-z0-9]+", rescue_visible_text))
+        if rescue_html_excerpt:
+            merged["html_content"] = rescue_html_excerpt
+            if not merged.get("html_hash"):
+                merged["html_hash"] = None if _USE_SIMILARITY_HASHING else sha256_text(rescue_html_excerpt)
+    return merged, True
+
+
+def _build_ray_render_trace_row(
+    render_payload: dict[str, Any],
+    *,
+    artifact: dict[str, Any] | None = None,
+    rescue_attempted: bool = False,
+    rescue_applied: bool = False,
+    rescue_reason: str = "",
+    rescue_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = dict(render_payload or {})
+    artifact = dict(artifact or {})
+    rescue = dict(rescue_result or {})
+    normalized_url = str(artifact.get("normalized_url", "") or payload.get("normalized_url", payload.get("url", "")))
+    source_workbook = str(artifact.get("source_workbook", "") or payload.get("source_workbook", ""))
+    screenshot_path = str(payload.get("screenshot_path", "") or "")
+    artifact_paths = {
+        key: value
+        for key, value in {
+            "screenshot_path": screenshot_path,
+        }.items()
+        if str(value or "").strip()
+    }
+    title_text = str(payload.get("html_title_text", "") or "")
+    visible_text_excerpt = str(payload.get("visible_text_excerpt", "") or "")
+    row = {
+        "record_key": str(artifact.get("record_key", "") or make_record_key(normalized_url, source_workbook)),
+        "worker_id": str(artifact.get("worker_id", "") or ""),
+        "raw_url": str(artifact.get("raw_url", "") or payload.get("url", "")),
+        "normalized_url": normalized_url,
+        "source_workbook": source_workbook,
+        "decision_code": str(payload.get("decision_code", "") or payload.get("fetch_status", "") or payload.get("visual_status", "")),
+        "reason_code": str(
+            payload.get("reason_code", "")
+            or rescue_reason
+            or payload.get("fetch_error_type", "")
+            or payload.get("fetch_status", "")
+        ),
+        "fetch_status": str(payload.get("fetch_status", "") or ""),
+        "visual_status": str(payload.get("visual_status", "") or ""),
+        "final_landing_url": str(payload.get("final_landing_url", "") or ""),
+        "screenshot_path": screenshot_path,
+        "artifact_paths_json": json.dumps(artifact_paths, ensure_ascii=True, sort_keys=True),
+        "html_title_text": title_text,
+        "visible_text_excerpt": visible_text_excerpt,
+        "has_screenshot_path": bool(screenshot_path.strip()),
+        "has_page_hash": bool(payload.get("page_hash")),
+        "has_html_hash": bool(payload.get("html_hash")),
+        "has_domain_hash": bool(payload.get("domain_hash")),
+        "looks_placeholder": _looks_like_noninformative_hash_render(
+            title_text=title_text,
+            visible_text_excerpt=visible_text_excerpt,
+            html_content=str(payload.get("html_content", "") or ""),
+        ),
+        "rescue_attempted": bool(rescue_attempted),
+        "rescue_applied": bool(rescue_applied),
+        "rescue_reason": str(rescue_reason or ""),
+        "rescue_fetch_status": str(rescue.get("fetch_status", "") or ""),
+        "rescue_final_landing_url": str(rescue.get("final_landing_url", "") or ""),
+        "rescue_html_title_text": str(rescue.get("title_text", "") or ""),
+        "rescue_visible_text_excerpt": str(rescue.get("visible_text", "") or "")[:500],
+        "rescue_html_bytes_read": int(rescue.get("html_bytes_read", 0) or 0),
+        "rescue_looks_placeholder": _looks_like_noninformative_hash_render(
+            title_text=str(rescue.get("title_text", "") or ""),
+            visible_text_excerpt=str(rescue.get("visible_text", "") or "")[:500],
+            html_content=str(rescue.get("html_excerpt", "") or ""),
+        ),
+    }
+    return row
+
+
+def _write_ray_render_trace_debug(rows: list[dict[str, Any]], *, run_context: RunContext | None = None) -> str:
+    path = get_run_artifact_path(
+        run_context,
+        "ray_render_trace_csv",
+        os.path.join(OUTPUT_DIR, "debug", "ray_shortlist_render_trace.csv"),
+    )
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    pd.DataFrame(rows or [], columns=list(_RAY_RENDER_TRACE_COLUMNS)).to_csv(path, index=False, encoding="utf-8")
+    sync_run_artifact(run_context, "ray_render_trace_csv", src_path=path, best_effort=True)
+    return path
+
+
+def _validate_ray_hash_finalize_transport(
+    *,
+    decision_rows: list[dict[str, Any]],
+    results: list[dict[str, Any]],
+    review_results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    shortlist_index: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in list(results or []) + list(review_results or []):
+        key = (
+            str(row.get("url", "") or ""),
+            str(row.get("source_workbook", "") or ""),
+        )
+        shortlist_index[key] = dict(row or {})
+
+    mismatches: list[dict[str, Any]] = []
+    compare_fields = (
+        "hash_anchor",
+        "direct_brand_evidence_count",
+        "content_spoof_strong",
+        "final_landing_url",
+        "signal_hit_favicon",
+        "signal_hit_ssl_hash",
+        "signal_hit_html_hash",
+        "signal_hit_domain_hash",
+    )
+    for decision_row in decision_rows or []:
+        key = (
+            str(decision_row.get("raw_url", "") or decision_row.get("normalized_url", "")),
+            str(decision_row.get("source_workbook", "") or ""),
+        )
+        shortlist_row = shortlist_index.get(key)
+        if shortlist_row is None:
+            mismatches.append({"key": key, "reason": "missing_shortlist_row"})
+            continue
+        field_diff = {}
+        for field in compare_fields:
+            left = decision_row.get(field)
+            right = shortlist_row.get(field)
+            if left != right:
+                field_diff[field] = {"decision_row": left, "shortlist_row": right}
+        if field_diff:
+            mismatches.append({"key": key, "reason": "field_mismatch", "fields": field_diff})
+    return mismatches
 
 
 def _write_hashing_log_messages(log_messages: list[dict]) -> None:
@@ -3010,7 +3256,11 @@ def _build_stage2_hash_export_row(decision_row: dict, *, run_id: str, export_wor
 def _write_stage2_hash_exports(decision_rows: list[dict], *, run_context: RunContext | None) -> list[str]:
     if not decision_rows:
         return []
-    output_dir = os.path.join(getattr(run_context, "output_dir", "") or os.path.dirname(HASH_EXPORT_DIR), "hash_folder")
+    output_dir = get_run_artifact_path(
+        run_context,
+        "hash_export_dir",
+        os.path.join(getattr(run_context, "output_dir", "") or os.path.dirname(HASH_EXPORT_DIR), "hash_folder"),
+    )
     os.makedirs(output_dir, exist_ok=True)
     run_id = str(getattr(run_context, "run_id", "") or "")
     timestamp_token = _hash_export_timestamp_token(run_context)
@@ -3038,6 +3288,26 @@ def _write_stage2_hash_exports(decision_rows: list[dict], *, run_context: RunCon
             for row in workbook_rows:
                 writer.writerow({column: row.get(column, "") for column in _HASH_EXPORT_COLUMNS})
         os.replace(temp_path, output_path)
+        legacy_hash_dir = os.path.join(getattr(run_context, "output_dir", "") or os.path.dirname(HASH_EXPORT_DIR), "hash_folder")
+        latest_hash_dir = get_run_artifact_path(run_context, "hash_export_dir", output_dir)
+        if run_context is not None:
+            if legacy_hash_dir and os.path.normcase(os.path.abspath(legacy_hash_dir)) != os.path.normcase(os.path.abspath(output_dir)):
+                os.makedirs(legacy_hash_dir, exist_ok=True)
+                legacy_path = os.path.join(legacy_hash_dir, os.path.basename(output_path))
+                try:
+                    from .reliability import _copy_file_atomic  # type: ignore
+                    _copy_file_atomic(output_path, legacy_path)
+                except Exception:
+                    pass
+            latest_root = str((run_context.artifact_latest_paths or {}).get("hash_export_dir", "") or "")
+            if latest_root and os.path.normcase(os.path.abspath(latest_root)) != os.path.normcase(os.path.abspath(output_dir)):
+                os.makedirs(latest_root, exist_ok=True)
+                latest_path = os.path.join(latest_root, os.path.basename(output_path))
+                try:
+                    from .reliability import _copy_file_atomic  # type: ignore
+                    _copy_file_atomic(output_path, latest_path)
+                except Exception:
+                    pass
         written_paths.append(output_path)
     return written_paths
 
@@ -3253,12 +3523,19 @@ def _log_stage1_method_summary(stage1_rows) -> None:
     )
 
 
-def _write_stage1_method_artifacts(stage1_rows) -> tuple[str, str]:
+def _write_stage1_method_artifacts(
+    stage1_rows,
+    *,
+    methods_path: str | None = None,
+    deep_analysis_path: str | None = None,
+) -> tuple[str, str]:
     method_rows = _build_stage1_method_rows(stage1_rows)
-    methods_path = _write_stage1_method_rows_csv(method_rows, STAGE1_METHODS_DEBUG_PATH)
+    resolved_methods_path = str(methods_path or STAGE1_METHODS_DEBUG_PATH)
+    resolved_deep_analysis_path = str(deep_analysis_path or STAGE1_DEEP_ANALYSIS_CANDIDATES_PATH)
+    methods_path = _write_stage1_method_rows_csv(method_rows, resolved_methods_path)
     deep_analysis_path = _write_stage1_method_rows_csv(
         [row for row in method_rows if bool(row.get("deep_analysis_candidate", False))],
-        STAGE1_DEEP_ANALYSIS_CANDIDATES_PATH,
+        resolved_deep_analysis_path,
     )
     if not method_rows:
         _hash_logger.info("Stage1 methods summary | rows=0")
@@ -9662,6 +9939,25 @@ def _finish_hashing_shortlist_output(
     import pandas as pd
 
     elapsed = time.perf_counter() - t0
+    resolved_shortlist_debug_csv = get_run_artifact_path(
+        run_context,
+        "stage0_lexical_decisions_csv",
+        shortlist_debug_csv or DEFAULT_STAGE1_DEBUG_CSV,
+    ) if shortlist_debug_csv else ""
+    stage1_http_routing_csv = get_run_artifact_path(
+        run_context,
+        "stage1_http_routing_csv",
+        os.path.join(getattr(run_context, "output_dir", "") or OUTPUT_DIR, "stage1_http_routing.csv"),
+    )
+    stage1_methods_csv = get_run_artifact_path(run_context, "stage1_methods_csv", STAGE1_METHODS_DEBUG_PATH)
+    stage1_deep_analysis_csv = get_run_artifact_path(
+        run_context,
+        "stage1_deep_analysis_candidates_csv",
+        STAGE1_DEEP_ANALYSIS_CANDIDATES_PATH,
+    )
+    stage1_review_queue_csv = get_run_artifact_path(run_context, "stage1_review_queue_csv", STAGE1_REVIEW_QUEUE_PATH)
+    fetch_failed_hits_csv = get_run_artifact_path(run_context, "fetch_failed_lexical_hits_csv", FETCH_FAILED_LEXICAL_HITS_PATH)
+    excluded_urls_csv = get_run_artifact_path(run_context, "hashing_excluded_urls_csv", HASHING_EXCLUDED_URLS_PATH)
     metrics["stage_elapsed_s"] = elapsed
     metrics["gpu_queue_depth"] = 0
     metrics["render_queue_depth"] = 0
@@ -9727,7 +10023,13 @@ def _finish_hashing_shortlist_output(
         scoring_config=scoring_config,
         source_workbook_map=source_workbook_map,
     )
-    methods_path, deep_analysis_path = _write_stage1_method_artifacts(stage1_rows)
+    methods_path, deep_analysis_path = _write_stage1_method_artifacts(
+        stage1_rows,
+        methods_path=stage1_methods_csv,
+        deep_analysis_path=stage1_deep_analysis_csv,
+    )
+    sync_run_artifact(run_context, "stage1_methods_csv", src_path=methods_path, best_effort=True)
+    sync_run_artifact(run_context, "stage1_deep_analysis_candidates_csv", src_path=deep_analysis_path, best_effort=True)
     passthrough_rows = [
         row
         for row in (
@@ -9766,24 +10068,30 @@ def _finish_hashing_shortlist_output(
         ]
         if dedupe_columns:
             review_df = review_df.drop_duplicates(subset=dedupe_columns, keep="last")
-    os.makedirs(os.path.dirname(STAGE1_REVIEW_QUEUE_PATH), exist_ok=True)
-    review_df.to_csv(STAGE1_REVIEW_QUEUE_PATH, index=False, encoding="utf-8")
+    os.makedirs(os.path.dirname(stage1_review_queue_csv), exist_ok=True)
+    review_df.to_csv(stage1_review_queue_csv, index=False, encoding="utf-8")
+    sync_run_artifact(run_context, "stage1_review_queue_csv", src_path=stage1_review_queue_csv, best_effort=True)
     _hash_logger.info(
         "Stage1 review queue written to %s with %d rows",
-        STAGE1_REVIEW_QUEUE_PATH,
+        stage1_review_queue_csv,
         len(review_df),
     )
-    if shortlist_debug_csv:
-        debug_path = _write_stage1_debug_csv(stage1_rows, output_path=shortlist_debug_csv)
+    if resolved_shortlist_debug_csv:
+        debug_path = _write_stage1_debug_csv(stage1_rows, output_path=resolved_shortlist_debug_csv)
+        sync_run_artifact(run_context, "stage0_lexical_decisions_csv", src_path=debug_path, best_effort=True)
         _hash_logger.info("Stage1 debug CSV written to %s with %d rows", debug_path, len(stage1_rows))
         print(f"Stage1 debug: {debug_path} ({len(stage1_rows)} rows)")
+        routing_path = _write_stage1_debug_csv(stage1_rows, output_path=stage1_http_routing_csv)
+        sync_run_artifact(run_context, "stage1_http_routing_csv", src_path=routing_path, best_effort=True)
     _write_stage1_subset_csv(
         stage1_rows,
-        FETCH_FAILED_LEXICAL_HITS_PATH,
+        fetch_failed_hits_csv,
         lambda row: str(row.get("fetch_status", "")).strip().lower() in {"failed", "timeout"} and bool(row.get("strict_lexical_hit")),
     )
+    sync_run_artifact(run_context, "fetch_failed_lexical_hits_csv", src_path=fetch_failed_hits_csv, best_effort=True)
     excluded_rows = _build_excluded_url_rows(stage1_rows)
-    excluded_path = _write_excluded_urls_audit(excluded_rows)
+    excluded_path = _write_excluded_urls_audit(excluded_rows, output_path=excluded_urls_csv)
+    sync_run_artifact(run_context, "hashing_excluded_urls_csv", src_path=excluded_path, best_effort=True)
     _hash_logger.info(
         "Excluded URL audit written to %s with %d rows",
         excluded_path,
@@ -9902,6 +10210,7 @@ async def run_hashing_shortlist_async(
     resume: bool = False,
     force_reprocess: bool = False,
     execution_backend: str = "auto",
+    progress_mode: str | None = None,
 ):
     """Async entry point for hashing shortlist."""
     resolved_backend = str(execution_backend or "auto").strip().lower()
@@ -9933,6 +10242,7 @@ async def run_hashing_shortlist_async(
             checkpoint_store=checkpoint_store,
             resume=resume,
             force_reprocess=force_reprocess,
+            progress_mode=progress_mode,
         )
     return await run_hashing_shortlist_streaming(
         url_list,

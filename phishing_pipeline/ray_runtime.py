@@ -40,6 +40,32 @@ def _is_debug_mode() -> bool:
     return _DEBUG_MODE or os.getenv("PHISHING_RAY_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _browser_hardened_flags_enabled() -> bool:
+    return os.getenv("PHISHING_RAY_BROWSER_HARDENED_FLAGS", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _resolve_hash_browser_launch_kwargs() -> dict[str, Any]:
+    kwargs: dict[str, Any] = {"headless": True}
+    if _browser_hardened_flags_enabled():
+        kwargs["args"] = [
+            "--disable-background-networking",
+            "--disable-background-timer-throttling",
+            "--disable-breakpad",
+            "--disable-client-side-phishing-detection",
+            "--disable-default-apps",
+            "--disable-dev-shm-usage",
+            "--disable-extensions",
+            "--disable-features=Translate,BackForwardCache,MediaRouter,OptimizationHints",
+            "--disable-gpu",
+            "--disable-renderer-backgrounding",
+            "--disable-sync",
+            "--mute-audio",
+            "--no-default-browser-check",
+            "--no-first-run",
+        ]
+    return kwargs
+
+
 def debug_ray_resource_snapshot() -> dict[str, Any]:
     """Dump Ray cluster vs available resources for stall diagnosis."""
     try:
@@ -278,6 +304,36 @@ class _CheckpointWriterActorImpl:
 
     def append_stage_event(self, event: dict[str, Any]) -> None:
         self._store.append_stage_event(event)
+
+    def append_stage_metric(self, snapshot: dict[str, Any]) -> None:
+        self._store.append_stage_metric(snapshot)
+
+    def append_stall_event(self, event: dict[str, Any]) -> None:
+        self._store.append_stall_event(event)
+
+    def update_worker_heartbeat(
+        self,
+        *,
+        stage_name: str,
+        worker_id: str,
+        record_key: str,
+        state: str,
+        task_kind: str = "",
+        item_age_s: float = 0.0,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        self._store.update_worker_heartbeat(
+            stage_name=stage_name,
+            worker_id=worker_id,
+            record_key=record_key,
+            state=state,
+            task_kind=task_kind,
+            item_age_s=item_age_s,
+            details=details,
+        )
+
+    def clear_worker_heartbeat(self, *, stage_name: str, worker_id: str) -> None:
+        self._store.clear_worker_heartbeat(stage_name=stage_name, worker_id=worker_id)
 
     def get_completed_record_keys(self) -> set[str]:
         return self._store.get_completed_record_keys()
@@ -526,25 +582,14 @@ class _HashBrowserActorImpl:
             from playwright.async_api import async_playwright
 
             self._playwright = await async_playwright().start()
-            self._browser = await self._playwright.chromium.launch(
-                headless=True,
-                args=[
-                    "--disable-background-networking",
-                    "--disable-background-timer-throttling",
-                    "--disable-breakpad",
-                    "--disable-client-side-phishing-detection",
-                    "--disable-default-apps",
-                    "--disable-dev-shm-usage",
-                    "--disable-extensions",
-                    "--disable-features=Translate,BackForwardCache,MediaRouter,OptimizationHints",
-                    "--disable-gpu",
-                    "--disable-renderer-backgrounding",
-                    "--disable-sync",
-                    "--mute-audio",
-                    "--no-default-browser-check",
-                    "--no-first-run",
-                ],
-            )
+            launch_kwargs = _resolve_hash_browser_launch_kwargs()
+            if _is_debug_mode():
+                logger.info(
+                    "[RAY-DEBUG] Hash browser launch | hardened_flags=%s | kwargs=%s",
+                    _browser_hardened_flags_enabled(),
+                    launch_kwargs,
+                )
+            self._browser = await self._playwright.chromium.launch(**launch_kwargs)
             self._context = await self._browser.new_context(ignore_https_errors=True, service_workers="block")
             await self._context.route("**/*", comparison._route_nonessential_requests)
             self._context.set_default_navigation_timeout(comparison.SCRAPER_NAV_TIMEOUT_MS)
@@ -861,6 +906,18 @@ def _hash_finalize_batch_task_impl(batch: list[dict[str, Any]], threshold: float
             scoring_config,
         )
         metrics["gpu_items_scored"] += 1
+    parity_mismatches = comparison._validate_ray_hash_finalize_transport(
+        decision_rows=decision_rows,
+        results=results,
+        review_results=review_results,
+    )
+    metrics["transport_parity_mismatches"] = len(parity_mismatches)
+    if parity_mismatches:
+        logger.error(
+            "Ray hash finalize transport mismatch | mismatches=%d | sample=%s",
+            len(parity_mismatches),
+            parity_mismatches[:2],
+        )
     return asdict(
         HashDecisionRecord(
             results=results,
@@ -902,11 +959,48 @@ def _get_ray_primitives() -> dict[str, Any]:
     return _RAY_PRIMITIVES
 
 
-async def _log_metrics_periodically(metrics_actor: Any, stop_event: asyncio.Event, label: str, interval_seconds: float) -> None:
+async def _log_metrics_periodically(
+    metrics_actor: Any,
+    stop_event: asyncio.Event,
+    label: str,
+    interval_seconds: float,
+    *,
+    checkpoint_actor: Any | None = None,
+    stage_name: str = "",
+    metric_kind: str = "snapshot",
+    details_getter: Any | None = None,
+    resource_snapshot_getter: Any | None = None,
+    emit_logs: bool = True,
+) -> None:
     while not stop_event.is_set():
         try:
             snapshot = await _ray_get(metrics_actor.snapshot.remote())
-            logger.info("Ray %s metrics | %s", label, snapshot)
+            resource_snapshot = (
+                dict(resource_snapshot_getter() or {})
+                if callable(resource_snapshot_getter)
+                else debug_ray_resource_snapshot()
+            )
+            details = (
+                dict(details_getter() or {})
+                if callable(details_getter)
+                else {}
+            )
+            if checkpoint_actor is not None:
+                checkpoint_actor.append_stage_metric.remote(
+                    {
+                        "emitted_at": utc_now_iso(),
+                        "label": label,
+                        "stage_name": stage_name or label,
+                        "metric_kind": metric_kind,
+                        "counters": dict(snapshot.get("counters") or {}),
+                        "gauges": dict(snapshot.get("gauges") or {}),
+                        "latency_ms": dict(snapshot.get("latency_ms") or {}),
+                        "resource_snapshot": resource_snapshot,
+                        "details": details,
+                    }
+                )
+            if emit_logs:
+                logger.info("Ray %s metrics | snapshot=%s | resources=%s | details=%s", label, snapshot, resource_snapshot, details)
         except Exception:
             logger.exception("Failed to snapshot Ray metrics for %s", label)
         try:
@@ -1003,8 +1097,22 @@ async def _flush_finalize_buffer(
     if not finalize_buffer:
         return
     primitives = _get_ray_primitives()
-    ref = primitives["hash_finalize_batch_task"].remote(list(finalize_buffer), threshold, scoring_config)
-    pending[ref] = ("hash_finalize", {"size": len(finalize_buffer)})
+    batch = list(finalize_buffer)
+    ref = primitives["hash_finalize_batch_task"].remote(batch, threshold, scoring_config)
+    first_record_key = next(
+        (str(item.get("record_key", "") or "") for item in batch if str(item.get("record_key", "") or "").strip()),
+        "",
+    )
+    pending[ref] = (
+        "hash_finalize",
+        {
+            "size": len(batch),
+            "progress_keys": [str(item.get("progress_key", "") or "") for item in batch if str(item.get("progress_key", "") or "")],
+            "record_key": first_record_key,
+            "worker_id": f"hash-finalize-{(first_record_key or 'batch')[:8]}",
+            "submitted_monotonic": time.perf_counter(),
+        },
+    )
     finalize_buffer.clear()
 
 
@@ -1032,6 +1140,7 @@ async def run_hashing_shortlist_with_ray(
     checkpoint_store=None,
     resume: bool = False,
     force_reprocess: bool = False,
+    progress_mode: str | None = None,
 ):
     from .ray_shortlist_runtime import run_hashing_shortlist_with_ray_impl
 
@@ -1058,6 +1167,7 @@ async def run_hashing_shortlist_with_ray(
         checkpoint_store=checkpoint_store,
         resume=resume,
         force_reprocess=force_reprocess,
+        progress_mode=progress_mode,
     )
 
 
