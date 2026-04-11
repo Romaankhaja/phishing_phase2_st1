@@ -66,6 +66,23 @@ def _resolve_hash_browser_launch_kwargs() -> dict[str, Any]:
     return kwargs
 
 
+def _is_browser_lifecycle_error(exc: BaseException | None) -> bool:
+    if exc is None:
+        return False
+    text = f"{exc.__class__.__name__}: {exc}".lower()
+    return any(
+        marker in text
+        for marker in (
+            "targetclosederror",
+            "browsercontext.new_page",
+            "target page, context or browser has been closed",
+            "browser has been closed",
+            "context has been closed",
+            "page has been closed",
+        )
+    )
+
+
 def debug_ray_resource_snapshot() -> dict[str, Any]:
     """Dump Ray cluster vs available resources for stall diagnosis."""
     try:
@@ -573,6 +590,36 @@ class _HashBrowserActorImpl:
         self._context = None
         self._active_fetch_limiter = None
         self._host_limiter = None
+        self._context_resets = 0
+        self._render_retries = 0
+        self._render_retry_exhausted = 0
+
+    async def _reset_browser(self, *, reason: str = "") -> None:
+        async with self._lock:
+            for cleanup in (
+                self._context.close if self._context is not None else None,
+                self._browser.close if self._browser is not None else None,
+                self._playwright.stop if self._playwright is not None else None,
+            ):
+                if cleanup is None:
+                    continue
+                try:
+                    await cleanup()
+                except Exception:
+                    pass
+            self._playwright = None
+            self._browser = None
+            self._context = None
+            self._active_fetch_limiter = None
+            self._host_limiter = None
+            self._context_resets += 1
+            if _is_debug_mode() or reason:
+                logger.warning(
+                    "Hash browser actor reset | reason=%s | tabs_per_actor=%d | resets=%d",
+                    str(reason or "unknown"),
+                    self._tabs_per_actor,
+                    self._context_resets,
+                )
 
     async def _ensure_browser(self) -> None:
         if self._browser is not None:
@@ -601,39 +648,63 @@ class _HashBrowserActorImpl:
 
     async def warm(self) -> dict[str, Any]:
         await self._ensure_browser()
-        return {"ready": True, "tabs_per_actor": self._tabs_per_actor}
+        return {
+            "ready": True,
+            "tabs_per_actor": self._tabs_per_actor,
+            "browser_context_resets": self._context_resets,
+            "browser_render_retries": self._render_retries,
+            "browser_render_retry_exhausted": self._render_retry_exhausted,
+        }
 
     async def render(self, artifact: dict[str, Any]) -> dict[str, Any]:
         from . import comparison
 
         await self._ensure_browser()
         async with self._page_semaphore:
-            page = await self._context.new_page()
-            try:
-                return await comparison._render_hash_payload_on_page(
-                    str(artifact.get("raw_url", "") or artifact.get("normalized_url", "")),
-                    page,
-                    self._active_fetch_limiter,
-                    self._host_limiter,
-                    prefetch_metrics=dict(artifact.get("prefetch_metrics", {}) or {}),
-                    stage1_analysis=dict(artifact.get("stage1_analysis", {}) or {}),
-                )
-            finally:
-                if page is not None and not page.is_closed():
-                    await page.close()
+            browser_retry_taken = False
+            for attempt_index in range(2):
+                page = None
+                try:
+                    await self._ensure_browser()
+                    page = await self._context.new_page()
+                    payload = await comparison._render_hash_payload_on_page(
+                        str(artifact.get("raw_url", "") or artifact.get("normalized_url", "")),
+                        page,
+                        self._active_fetch_limiter,
+                        self._host_limiter,
+                        prefetch_metrics=dict(artifact.get("prefetch_metrics", {}) or {}),
+                        stage1_analysis=dict(artifact.get("stage1_analysis", {}) or {}),
+                    )
+                    if browser_retry_taken:
+                        payload["_browser_context_reset"] = True
+                        payload["_browser_render_retry"] = True
+                    return payload
+                except Exception as exc:
+                    if attempt_index == 0 and _is_browser_lifecycle_error(exc):
+                        browser_retry_taken = True
+                        self._render_retries += 1
+                        await self._reset_browser(reason=f"render_retry:{type(exc).__name__}")
+                        continue
+                    if browser_retry_taken:
+                        self._render_retry_exhausted += 1
+                        raise RuntimeError(f"browser_actor_failure_after_retry: {exc}") from exc
+                    raise
+                finally:
+                    if page is not None and not page.is_closed():
+                        await page.close()
+            raise RuntimeError("browser_actor_failure_after_retry: render loop exhausted")
+
+    async def stats(self) -> dict[str, Any]:
+        return {
+            "ready": bool(self._browser is not None and self._context is not None),
+            "tabs_per_actor": self._tabs_per_actor,
+            "browser_context_resets": int(self._context_resets),
+            "browser_render_retries": int(self._render_retries),
+            "browser_render_retry_exhausted": int(self._render_retry_exhausted),
+        }
 
     async def close(self) -> None:
-        for cleanup in (
-            self._context.close if self._context is not None else None,
-            self._browser.close if self._browser is not None else None,
-            self._playwright.stop if self._playwright is not None else None,
-        ):
-            if cleanup is None:
-                continue
-            try:
-                await cleanup()
-            except Exception:
-                pass
+        await self._reset_browser(reason="close")
 
 
 class _OcrWorkerActorImpl:

@@ -96,6 +96,167 @@ def _build_shortlist_progress_postfix(
     return build_compact_postfix(fields)
 
 
+def _decide_shortlist_controller_update(
+    *,
+    controller_state: dict[str, Any],
+    dynamic_control_enabled: bool,
+    server_mode: bool,
+    stage0_inflight_cap: int,
+    stage0_inflight_floor: int,
+    stage1_fetch_limit_cap: int,
+    stage1_fetch_limit_floor: int,
+    hash_active_pages_cap: int,
+    hash_active_pages_floor: int,
+    hash_finalize_batch_size: int,
+    target_cpu_utilization: float,
+    cpu_headroom_cores: int,
+    severe_available_cpu_floor: float,
+    healthy_available_cpu_floor: float,
+    available_cpu: float,
+    cpu_utilization: float,
+    event_loop_lag_ms: float,
+    stage1_pressure_ratio: float,
+    hash_pressure_ratio: float,
+    timeout_ratio: float,
+    checkpoint_pending_rows: int,
+    checkpoint_backlog_growth: int,
+    render_queue_depth: int,
+    finalize_buffer_depth: int,
+) -> dict[str, Any]:
+    next_state = dict(controller_state)
+    next_state.setdefault("healthy_streak", 0)
+    next_state.setdefault("render_backlog_streak", 0)
+
+    if not dynamic_control_enabled:
+        next_state["healthy_streak"] = 0
+        next_state["render_backlog_streak"] = 0
+        next_state["action"] = "hold"
+        next_state["reason"] = "dynamic_control_disabled"
+        return next_state
+
+    cpu_headroom_low = available_cpu < severe_available_cpu_floor
+    cpu_utilization_high = (
+        available_cpu < float(cpu_headroom_cores)
+        and cpu_utilization > min(0.99, target_cpu_utilization + 0.12)
+    )
+    event_loop_stalled = event_loop_lag_ms > 250.0
+    checkpoint_backlogged = checkpoint_pending_rows > 20000
+    checkpoint_growing = checkpoint_backlog_growth > 2000
+    local_pressure = cpu_headroom_low or cpu_utilization_high or event_loop_stalled or checkpoint_backlogged or checkpoint_growing
+
+    severe_reasons: list[str] = []
+    if cpu_headroom_low:
+        severe_reasons.append("cpu_headroom_low")
+    if cpu_utilization_high:
+        severe_reasons.append("cpu_utilization")
+    if event_loop_stalled:
+        severe_reasons.append("event_loop_lag")
+    if stage1_pressure_ratio > 0.75:
+        severe_reasons.append("stage1_pressure")
+    if finalize_buffer_depth > (2 * max(1, int(hash_finalize_batch_size))):
+        severe_reasons.append("hash_finalize_backlog")
+    if checkpoint_backlogged:
+        severe_reasons.append("checkpoint_backlog")
+    if timeout_ratio > 0.25 and local_pressure:
+        severe_reasons.append("timeout_ratio")
+
+    healthy_cpu_window = (
+        available_cpu > healthy_available_cpu_floor
+        and cpu_utilization < min(0.99, target_cpu_utilization + 0.05)
+        and event_loop_lag_ms < 100.0
+        and checkpoint_pending_rows < 5000
+        and checkpoint_backlog_growth <= 1000
+    )
+    if render_queue_depth > int(next_state.get("hash_live_active_pages", hash_active_pages_cap) or hash_active_pages_cap) and healthy_cpu_window:
+        next_state["render_backlog_streak"] = int(next_state.get("render_backlog_streak", 0) or 0) + 1
+    else:
+        next_state["render_backlog_streak"] = 0
+
+    healthy_window = (
+        healthy_cpu_window
+        and stage1_pressure_ratio < 0.50
+        and hash_pressure_ratio < 0.50
+        and timeout_ratio < 0.10
+    )
+    backlog_upshift_ready = (
+        healthy_cpu_window
+        and int(next_state.get("render_backlog_streak", 0) or 0) >= 2
+        and stage1_pressure_ratio < 0.85
+    )
+
+    action = "hold"
+    reason = "steady"
+    if severe_reasons:
+        next_state["healthy_streak"] = 0
+        changed = False
+        if int(next_state.get("stage0_live_inflight", stage0_inflight_cap) or stage0_inflight_cap) > stage0_inflight_floor:
+            next_state["stage0_live_inflight"] = max(
+                stage0_inflight_floor,
+                int(next_state.get("stage0_live_inflight", stage0_inflight_cap) or stage0_inflight_cap) - 1,
+            )
+            changed = True
+        if int(next_state.get("stage1_live_fetch_limit", stage1_fetch_limit_cap) or stage1_fetch_limit_cap) > stage1_fetch_limit_floor:
+            next_state["stage1_live_fetch_limit"] = max(
+                stage1_fetch_limit_floor,
+                int(next_state.get("stage1_live_fetch_limit", stage1_fetch_limit_cap) or stage1_fetch_limit_cap) - 8,
+            )
+            changed = True
+        hash_downshift_step = 1 if server_mode else 2
+        if int(next_state.get("hash_live_active_pages", hash_active_pages_cap) or hash_active_pages_cap) > hash_active_pages_floor:
+            next_state["hash_live_active_pages"] = max(
+                hash_active_pages_floor,
+                int(next_state.get("hash_live_active_pages", hash_active_pages_cap) or hash_active_pages_cap) - hash_downshift_step,
+            )
+            changed = True
+        action = "downshift" if changed else "hold"
+        reason = ",".join(severe_reasons[:3])
+    elif backlog_upshift_ready:
+        next_state["healthy_streak"] = 0
+        if int(next_state.get("hash_live_active_pages", hash_active_pages_cap) or hash_active_pages_cap) < hash_active_pages_cap:
+            next_state["hash_live_active_pages"] = min(
+                hash_active_pages_cap,
+                int(next_state.get("hash_live_active_pages", hash_active_pages_cap) or hash_active_pages_cap) + 2,
+            )
+            action = "upshift"
+        else:
+            action = "hold"
+        reason = "render_backlog"
+    elif healthy_window:
+        next_state["healthy_streak"] = int(next_state.get("healthy_streak", 0) or 0) + 1
+        if int(next_state["healthy_streak"]) >= 2:
+            next_state["healthy_streak"] = 0
+            changed = False
+            if int(next_state.get("stage0_live_inflight", stage0_inflight_floor) or stage0_inflight_floor) < stage0_inflight_cap:
+                next_state["stage0_live_inflight"] = min(
+                    stage0_inflight_cap,
+                    int(next_state.get("stage0_live_inflight", stage0_inflight_floor) or stage0_inflight_floor) + 1,
+                )
+                changed = True
+            if int(next_state.get("stage1_live_fetch_limit", stage1_fetch_limit_floor) or stage1_fetch_limit_floor) < stage1_fetch_limit_cap:
+                next_state["stage1_live_fetch_limit"] = min(
+                    stage1_fetch_limit_cap,
+                    int(next_state.get("stage1_live_fetch_limit", stage1_fetch_limit_floor) or stage1_fetch_limit_floor) + 8,
+                )
+                changed = True
+            if int(next_state.get("hash_live_active_pages", hash_active_pages_floor) or hash_active_pages_floor) < hash_active_pages_cap:
+                next_state["hash_live_active_pages"] = min(
+                    hash_active_pages_cap,
+                    int(next_state.get("hash_live_active_pages", hash_active_pages_floor) or hash_active_pages_floor) + 2,
+                )
+                changed = True
+            action = "upshift" if changed else "hold"
+            reason = "healthy_window"
+        else:
+            action = "hold"
+            reason = "healthy_window_pending"
+    else:
+        next_state["healthy_streak"] = 0
+
+    next_state["action"] = action
+    next_state["reason"] = reason
+    return next_state
+
+
 async def run_hashing_shortlist_with_ray_impl(
     url_list,
     *,
@@ -295,6 +456,9 @@ async def run_hashing_shortlist_with_ray_impl(
         "hash_execution_mode": "ray",
         "render_rescue_attempted": 0,
         "render_rescue_applied": 0,
+        "browser_context_reset": 0,
+        "browser_render_retry": 0,
+        "browser_render_retry_exhausted": 0,
     }
     stage1_progress = {
         "escalated": 0,
@@ -332,7 +496,10 @@ async def run_hashing_shortlist_with_ray_impl(
     hash_active_pages_cap = max(1, int(runtime_config["hash_browser_actors"]) * int(runtime_config["hash_tabs_per_actor"]))
     hash_active_pages_floor = min(
         hash_active_pages_cap,
-        4 if runtime_config.get("server_mode") and not runtime_config.get("low_memory_mode") else max(1, int(runtime_config["hash_tabs_per_actor"])),
+        max(
+            int(getattr(comparison, "ACTIVE_FETCH_LIMIT_FLOOR", 1) or 1),
+            8 if runtime_config.get("server_mode") and not runtime_config.get("low_memory_mode") else max(1, int(runtime_config["hash_tabs_per_actor"])),
+        ),
     )
     pending: dict[Any, tuple[str, Any]] = {}
     stage1_backlog: deque[dict[str, Any]] = deque()
@@ -371,6 +538,7 @@ async def run_hashing_shortlist_with_ray_impl(
         "event_loop_lag_ms": 0.0,
         "checkpoint_pending_rows": 0,
         "healthy_streak": 0,
+        "render_backlog_streak": 0,
         "timeout_ratio": 0.0,
         "stage1_pressure_ratio": 0.0,
         "hash_pressure_ratio": 0.0,
@@ -506,6 +674,29 @@ async def run_hashing_shortlist_with_ray_impl(
         metrics["active_fetch_limit"] = int(runtime_config["hash_tabs_per_actor"]) * max(1, len(hash_browser_actors))
         metrics["worker_nodes_alive"] = len(hash_browser_actors)
         logger.info("Ray shortlist browser actors created | count=%d", len(hash_browser_actors))
+
+    async def _replace_hash_browser_actor(actor_slot: int, *, reason: str) -> None:
+        _ensure_hash_browser_actors()
+        if actor_slot < 0 or actor_slot >= len(hash_browser_actors):
+            return
+        old_actor = hash_browser_actors[actor_slot]
+        try:
+            await _ray_get(old_actor.close.remote(), _label=f"hash_browser_close:{actor_slot}")
+        except Exception:
+            pass
+        try:
+            primitives["ray"].kill(old_actor, no_restart=True)
+        except Exception:
+            pass
+        hash_browser_actors[actor_slot] = primitives["HashBrowserActor"].options(
+            num_cpus=1 if runtime_config.get("server_mode") else 0.5,
+            max_concurrency=int(runtime_config["hash_tabs_per_actor"]),
+        ).remote(
+            int(runtime_config["hash_tabs_per_actor"]),
+            int(stage1_http_config.get("stage1_per_host_limit", 4) or 4),
+        )
+        metrics["worker_nodes_alive"] = len(hash_browser_actors)
+        logger.warning("Ray shortlist browser actor replaced | slot=%d | reason=%s", actor_slot, reason)
 
     async def _prewarm_actor_pools() -> None:
         if not prewarm_actors:
@@ -651,6 +842,8 @@ async def run_hashing_shortlist_with_ray_impl(
         )
         artifact["progress_key"] = progress_key
         artifact["record_key"] = record_key
+        artifact["actor_slot"] = actor_slot
+        artifact["attempt_count"] = int(artifact.get("attempt_count", 0) or 0)
         artifact["worker_id"] = f"hash-browser-{actor_slot}-{record_key[:8] or 'item'}"
         artifact["submitted_monotonic"] = time.perf_counter()
         actor = hash_browser_actors[actor_slot]
@@ -844,6 +1037,9 @@ async def run_hashing_shortlist_with_ray_impl(
             return
         if kind in {"hash_render", "hash_enrich"}:
             artifact = dict(context)
+            if kind == "hash_render" and "browser_actor_failure_after_retry" in error_message:
+                error_type = "browser_actor_failure_after_retry"
+                metrics["browser_render_retry_exhausted"] += 1
             payload_outcome = comparison._handle_stage1_fetch_payload(
                 {
                     "url": str(artifact.get("raw_url", "") or artifact.get("normalized_url", "")),
@@ -864,6 +1060,45 @@ async def run_hashing_shortlist_with_ray_impl(
             await _record_hash_fetch_outcome(payload_outcome, artifact)
             return
         raise exc
+
+    async def _reap_stale_hash_render_tasks() -> None:
+        stale_refs: list[Any] = []
+        now = time.perf_counter()
+        for ref, (kind, context) in list(pending.items()):
+            if kind != "hash_render":
+                continue
+            age_s = now - float(dict(context).get("submitted_monotonic", now) or now)
+            if age_s < 90.0:
+                continue
+            stale_refs.append(ref)
+        for ref in stale_refs:
+            pending_entry = pending.pop(ref, None)
+            _debug_pending_submit_times.pop(id(ref), None)
+            if pending_entry is None:
+                continue
+            _, context = pending_entry
+            artifact = dict(context or {})
+            actor_slot = int(artifact.get("actor_slot", -1) or -1)
+            attempt_count = int(artifact.get("attempt_count", 0) or 0)
+            worker_id = str(artifact.get("worker_id", "") or "")
+            if checkpoint_actor is not None and worker_id:
+                checkpoint_actor.clear_worker_heartbeat.remote(stage_name="hash", worker_id=worker_id)
+            if attempt_count >= 1:
+                await _handle_stage_error(
+                    "hash_render",
+                    artifact,
+                    RuntimeError("browser_actor_failure_after_retry: stale_hash_render_task"),
+                )
+                continue
+            metrics["browser_context_reset"] += 1
+            metrics["browser_render_retry"] += 1
+            if actor_slot >= 0:
+                await _replace_hash_browser_actor(actor_slot, reason="stale_hash_render_task")
+            artifact["attempt_count"] = attempt_count + 1
+            artifact["submitted_monotonic"] = time.perf_counter()
+            artifact["worker_id"] = f"hash-browser-{max(actor_slot, 0)}-{str(artifact.get('record_key', '') or '')[:8] or 'item'}"
+            actor_index = actor_slot if 0 <= actor_slot < len(hash_browser_actors) else 0
+            _track_pending(hash_browser_actors[actor_index].render.remote(artifact), "hash_render", artifact)
 
     def _refresh_progress_bar(progress_bar: Any | None) -> None:
         if progress_bar is None:
@@ -961,6 +1196,7 @@ async def run_hashing_shortlist_with_ray_impl(
         last_checkpoint_flush = last_tick
         last_completed = shortlist_progress.completed
         last_timeout_count = int(stage1_progress.get("timeout", 0) or 0) + int(metrics.get("fetch_timed_out", 0) or 0)
+        last_checkpoint_pending_rows = 0
         while not controller_stop.is_set():
             try:
                 await asyncio.wait_for(controller_stop.wait(), timeout=control_interval_seconds)
@@ -1003,78 +1239,42 @@ async def run_hashing_shortlist_with_ray_impl(
                     checkpoint_actor.export_all.remote()
                     last_checkpoint_flush = now
             checkpoint_pending_rows = int(checkpoint_backlog.get("pending_rows_total", 0) or 0)
-            severe_reasons: list[str] = []
-            if available_cpu < severe_available_cpu_floor:
-                severe_reasons.append("cpu_headroom_low")
-            if available_cpu < float(cpu_headroom_cores) and cpu_utilization > min(0.99, target_cpu_utilization + 0.12):
-                severe_reasons.append("cpu_utilization")
-            if event_loop_lag_ms > 250.0:
-                severe_reasons.append("event_loop_lag")
-            if stage1_pressure_ratio > 0.75:
-                severe_reasons.append("stage1_pressure")
-            if len(finalize_buffer) > (2 * max(1, int(runtime_config["hash_finalize_batch"]))):
-                severe_reasons.append("hash_finalize_backlog")
-            if timeout_ratio > 0.25:
-                severe_reasons.append("timeout_ratio")
-            if checkpoint_pending_rows > 20000:
-                severe_reasons.append("checkpoint_backlog")
-            healthy_window = (
-                available_cpu > healthy_available_cpu_floor
-                and cpu_utilization < min(0.99, target_cpu_utilization + 0.05)
-                and event_loop_lag_ms < 100.0
-                and stage1_pressure_ratio < 0.50
-                and hash_pressure_ratio < 0.50
-                and timeout_ratio < 0.10
-                and checkpoint_pending_rows < 5000
+            checkpoint_backlog_growth = max(0, checkpoint_pending_rows - last_checkpoint_pending_rows)
+            last_checkpoint_pending_rows = checkpoint_pending_rows
+            updated_controller_state = _decide_shortlist_controller_update(
+                controller_state=controller_state,
+                dynamic_control_enabled=dynamic_control_enabled,
+                server_mode=bool(runtime_config.get("server_mode")),
+                stage0_inflight_cap=stage0_inflight,
+                stage0_inflight_floor=stage0_inflight_floor,
+                stage1_fetch_limit_cap=stage1_fetch_limit_cap,
+                stage1_fetch_limit_floor=stage1_fetch_limit_floor,
+                hash_active_pages_cap=hash_active_pages_cap,
+                hash_active_pages_floor=hash_active_pages_floor,
+                hash_finalize_batch_size=max(1, int(runtime_config["hash_finalize_batch"])),
+                target_cpu_utilization=target_cpu_utilization,
+                cpu_headroom_cores=cpu_headroom_cores,
+                severe_available_cpu_floor=severe_available_cpu_floor,
+                healthy_available_cpu_floor=healthy_available_cpu_floor,
+                available_cpu=available_cpu,
+                cpu_utilization=cpu_utilization,
+                event_loop_lag_ms=event_loop_lag_ms,
+                stage1_pressure_ratio=stage1_pressure_ratio,
+                hash_pressure_ratio=hash_pressure_ratio,
+                timeout_ratio=timeout_ratio,
+                checkpoint_pending_rows=checkpoint_pending_rows,
+                checkpoint_backlog_growth=checkpoint_backlog_growth,
+                render_queue_depth=int(metrics.get("render_queue_depth", 0) or 0),
+                finalize_buffer_depth=len(finalize_buffer),
             )
-            action = "hold"
-            reason = "steady"
-            if dynamic_control_enabled and severe_reasons:
-                controller_state["healthy_streak"] = 0
-                changed = False
-                if int(controller_state["stage0_live_inflight"]) > stage0_inflight_floor:
-                    controller_state["stage0_live_inflight"] = max(stage0_inflight_floor, int(controller_state["stage0_live_inflight"]) - 1)
-                    changed = True
-                if int(controller_state["stage1_live_fetch_limit"]) > stage1_fetch_limit_floor:
-                    controller_state["stage1_live_fetch_limit"] = max(stage1_fetch_limit_floor, int(controller_state["stage1_live_fetch_limit"]) - 8)
-                    changed = True
-                if int(controller_state["hash_live_active_pages"]) > hash_active_pages_floor:
-                    controller_state["hash_live_active_pages"] = max(hash_active_pages_floor, int(controller_state["hash_live_active_pages"]) - 2)
-                    changed = True
-                action = "downshift" if changed else "hold"
-                reason = ",".join(severe_reasons[:3])
-            elif dynamic_control_enabled and healthy_window:
-                controller_state["healthy_streak"] = int(controller_state.get("healthy_streak", 0) or 0) + 1
-                if int(controller_state["healthy_streak"]) >= 2:
-                    controller_state["healthy_streak"] = 0
-                    changed = False
-                    if int(controller_state["stage0_live_inflight"]) < stage0_inflight:
-                        controller_state["stage0_live_inflight"] = min(stage0_inflight, int(controller_state["stage0_live_inflight"]) + 1)
-                        changed = True
-                    if int(controller_state["stage1_live_fetch_limit"]) < stage1_fetch_limit_cap:
-                        controller_state["stage1_live_fetch_limit"] = min(stage1_fetch_limit_cap, int(controller_state["stage1_live_fetch_limit"]) + 8)
-                        changed = True
-                    if int(controller_state["hash_live_active_pages"]) < hash_active_pages_cap:
-                        controller_state["hash_live_active_pages"] = min(hash_active_pages_cap, int(controller_state["hash_live_active_pages"]) + 2)
-                        changed = True
-                    action = "upshift" if changed else "hold"
-                    reason = "healthy_window"
-                else:
-                    action = "hold"
-                    reason = "healthy_window_pending"
-            elif dynamic_control_enabled:
-                controller_state["healthy_streak"] = 0
-            else:
-                action = "hold"
-                reason = "dynamic_control_disabled"
+            controller_state.update(updated_controller_state)
             controller_state.update(
                 {
-                    "action": action,
-                    "reason": reason,
                     "available_cpu": round(available_cpu, 3),
                     "cpu_utilization": round(cpu_utilization, 3),
                     "event_loop_lag_ms": round(event_loop_lag_ms, 3),
                     "checkpoint_pending_rows": checkpoint_pending_rows,
+                    "checkpoint_backlog_growth": checkpoint_backlog_growth,
                     "timeout_ratio": round(timeout_ratio, 3),
                     "stage1_pressure_ratio": round(stage1_pressure_ratio, 3),
                     "hash_pressure_ratio": round(hash_pressure_ratio, 3),
@@ -1135,6 +1335,7 @@ async def run_hashing_shortlist_with_ray_impl(
                 _ensure_debug_submit_times()
                 if not pending:
                     break
+            await _reap_stale_hash_render_tasks()
             ready, _ = await _ray_wait(list(pending.keys()), num_returns=min(8, len(pending)), timeout=1.0)
             if not ready:
                 metrics["stage_elapsed_s"] = time.perf_counter() - t0
@@ -1490,6 +1691,10 @@ async def run_hashing_shortlist_with_ray_impl(
                     artifact = dict(context)
                     metrics["render_completed"] += 1
                     render_payload = dict(payload or {})
+                    if bool(render_payload.pop("_browser_context_reset", False)):
+                        metrics["browser_context_reset"] = int(metrics.get("browser_context_reset", 0) or 0) + 1
+                    if bool(render_payload.pop("_browser_render_retry", False)):
+                        metrics["browser_render_retry"] = int(metrics.get("browser_render_retry", 0) or 0) + 1
                     rescue_attempted = False
                     rescue_applied = False
                     rescue_reason = ""
@@ -1642,6 +1847,10 @@ async def run_hashing_shortlist_with_ray_impl(
         if close_refs:
             await _ray_get(close_refs)
         if checkpoint_actor is not None:
+            try:
+                await _ray_get(checkpoint_actor.export_all.remote())
+            except Exception:
+                logger.exception("Failed to export shortlist checkpoint state before shutdown")
             await _ray_get(checkpoint_actor.close.remote())
         comparison._close_hashing_log()
         sync_run_artifact(run_context, "hashing_log", src_path=log_path, best_effort=True)

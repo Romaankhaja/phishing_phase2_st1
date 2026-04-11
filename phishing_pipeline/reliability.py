@@ -769,6 +769,9 @@ class CheckpointStore:
         self._stage_events: list[dict[str, Any]] = []
         self._stage_metrics: list[dict[str, Any]] = []
         self._stall_events: list[dict[str, Any]] = []
+        self._stage_event_count_total = 0
+        self._stage_metric_count_total = 0
+        self._stall_event_count_total = 0
         self._manifest: dict[str, Any] = {
             "run_id": self.context.run_id,
             "status": "running",
@@ -859,7 +862,7 @@ class CheckpointStore:
                             item = _coerce_int_fields(dict(row), STAGE_EVENT_INT_FIELDS)
                             if str(item.get("run_id", "") or "") != self.context.run_id:
                                 continue
-                            self._stage_events.append(item)
+                            self._stage_event_count_total += 1
                 except Exception:
                     logger.exception("Failed to load stage events CSV")
             if self.context.worker_heartbeats_csv and os.path.exists(self.context.worker_heartbeats_csv):
@@ -881,7 +884,7 @@ class CheckpointStore:
                         for row in csv.DictReader(fh):
                             if str(row.get("run_id", "") or "") != self.context.run_id:
                                 continue
-                            self._stage_metrics.append(dict(row))
+                            self._stage_metric_count_total += 1
                 except Exception:
                     logger.exception("Failed to load stage metrics CSV")
             if self.context.stall_events_csv and os.path.exists(self.context.stall_events_csv):
@@ -890,7 +893,7 @@ class CheckpointStore:
                         for row in csv.DictReader(fh):
                             if str(row.get("run_id", "") or "") != self.context.run_id:
                                 continue
-                            self._stall_events.append(dict(row))
+                            self._stall_event_count_total += 1
                 except Exception:
                     logger.exception("Failed to load stall events CSV")
 
@@ -986,16 +989,17 @@ class CheckpointStore:
         manifest = self.get_manifest()
         with self._lock:
             rows = list(self._url_results.values())
-            stage_event_count = len(self._stage_events)
+            stage_event_count = int(self._stage_event_count_total)
             heartbeat_count = len(self._worker_heartbeats)
-            stage_metric_count = len(self._stage_metrics)
-            stall_event_count = len(self._stall_events)
+            stage_metric_count = int(self._stage_metric_count_total)
+            stall_event_count = int(self._stall_event_count_total)
         final_decision_counts: dict[str, int] = {}
         pipeline_status_counts: dict[str, int] = {}
         for row in rows:
             final_decision = str(row.get("final_decision", "") or "").strip()
             final_status = str(row.get("final_pipeline_status", "") or "").strip()
-            if final_decision:
+            submission_payload = str(row.get("submission_record_json", "") or "").strip()
+            if final_decision and submission_payload:
                 final_decision_counts[final_decision] = final_decision_counts.get(final_decision, 0) + 1
             if final_status:
                 pipeline_status_counts[final_status] = pipeline_status_counts.get(final_status, 0) + 1
@@ -1106,7 +1110,10 @@ class CheckpointStore:
     def append_stage_event(self, event: dict[str, Any]) -> None:
         normalized = _coerce_int_fields(dict(event), STAGE_EVENT_INT_FIELDS)
         with self._lock:
-            self._stage_events.append(dict(normalized))
+            self._pending_stage_events.append(dict(normalized))
+            self._stage_event_count_total += 1
+            self._pending_event_count += 1
+            self._append_dirty = True
             self._dirty_snapshot_updates += 1
             self._snapshot_dirty = True
 
@@ -1160,6 +1167,7 @@ class CheckpointStore:
         }
         with self._lock:
             self._stage_metrics.append(item)
+            self._stage_metric_count_total += 1
             self._snapshot_dirty = True
             self._dirty_snapshot_updates += 1
 
@@ -1176,28 +1184,31 @@ class CheckpointStore:
         }
         with self._lock:
             self._stall_events.append(item)
+            self._stall_event_count_total += 1
             self._snapshot_dirty = True
             self._dirty_snapshot_updates += 1
 
     def snapshot_backlog(self) -> dict[str, Any]:
         with self._lock:
             pending_result_events = len(self._pending_result_events)
-            stage_event_rows = len(self._stage_events)
+            pending_stage_events = len(self._pending_stage_events)
+            stage_event_rows = int(self._stage_event_count_total)
             worker_heartbeats = len(self._worker_heartbeats)
-            stage_metric_rows = len(self._stage_metrics)
-            stall_event_rows = len(self._stall_events)
+            stage_metric_rows = int(self._stage_metric_count_total)
+            stall_event_rows = int(self._stall_event_count_total)
             snapshot_dirty_updates = int(self._dirty_snapshot_updates)
             return {
                 "append_dirty": bool(self._append_dirty),
                 "snapshot_dirty": bool(self._snapshot_dirty),
                 "heartbeat_dirty": bool(self._heartbeat_dirty),
                 "pending_result_events": pending_result_events,
+                "pending_stage_events": pending_stage_events,
                 "stage_event_rows": stage_event_rows,
                 "worker_heartbeats": worker_heartbeats,
                 "stage_metric_rows": stage_metric_rows,
                 "stall_event_rows": stall_event_rows,
                 "snapshot_dirty_updates": snapshot_dirty_updates,
-                "pending_rows_total": pending_result_events + snapshot_dirty_updates,
+                "pending_rows_total": pending_result_events + pending_stage_events + snapshot_dirty_updates,
             }
 
     def list_worker_heartbeats(self, *, stage_name: str | None = None) -> list[dict[str, Any]]:
@@ -1246,24 +1257,30 @@ class CheckpointStore:
                     return
 
             result_rows = list(self._pending_result_events)
-            if not result_rows:
+            stage_rows = list(self._pending_stage_events)
+            if not result_rows and not stage_rows:
                 self._append_dirty = False
                 self._pending_event_count = 0
                 self._last_append_flush_monotonic = now
                 return
             try:
-                _append_csv_rows(self.context.checkpoints_csv, RUN_RESULT_COLUMNS, result_rows)
-                sync_run_artifact(self.context, "checkpoints_csv", src_path=self.context.checkpoints_csv, best_effort=best_effort)
+                if result_rows:
+                    _append_csv_rows(self.context.checkpoints_csv, RUN_RESULT_COLUMNS, result_rows)
+                    sync_run_artifact(self.context, "checkpoints_csv", src_path=self.context.checkpoints_csv, best_effort=best_effort)
+                if stage_rows:
+                    _append_csv_rows(self.context.stage_events_csv, STAGE_EVENT_COLUMNS, stage_rows)
+                    sync_run_artifact(self.context, "stage_events_csv", src_path=self.context.stage_events_csv, best_effort=best_effort)
             except Exception as exc:
                 if best_effort and _is_retryable_filesystem_error(exc):
                     self._append_dirty = True
-                    self._pending_event_count = len(self._pending_result_events)
+                    self._pending_event_count = len(self._pending_result_events) + len(self._pending_stage_events)
                     self._log_deferred_export_warning("append_checkpoints", exc)
                     return
                 raise
             del self._pending_result_events[: len(result_rows)]
-            self._pending_event_count = len(self._pending_result_events)
-            self._append_dirty = bool(self._pending_result_events)
+            del self._pending_stage_events[: len(stage_rows)]
+            self._pending_event_count = len(self._pending_result_events) + len(self._pending_stage_events)
+            self._append_dirty = bool(self._pending_result_events or self._pending_stage_events)
             self._last_append_flush_monotonic = now
 
     def maybe_export(self, *, force: bool = False) -> None:
@@ -1293,7 +1310,6 @@ class CheckpointStore:
                     ),
                 )
             ]
-            stage_rows = list(self._stage_events)
             worker_heartbeat_rows = []
             for _, row in sorted(self._worker_heartbeats.items()):
                 item = dict(row)
@@ -1303,10 +1319,19 @@ class CheckpointStore:
             stall_event_rows = list(self._stall_events)
         try:
             write_run_artifact_csv(self.context, "run_results_csv", RUN_RESULT_COLUMNS, result_rows, best_effort=best_effort)
-            write_run_artifact_csv(self.context, "stage_events_csv", STAGE_EVENT_COLUMNS, stage_rows, best_effort=best_effort)
             write_run_artifact_csv(self.context, "worker_heartbeats_csv", WORKER_HEARTBEAT_COLUMNS, worker_heartbeat_rows, best_effort=best_effort)
-            write_run_artifact_csv(self.context, "stage_metrics_csv", STAGE_METRIC_COLUMNS, stage_metric_rows, best_effort=best_effort)
-            write_run_artifact_csv(self.context, "stall_events_csv", STALL_EVENT_COLUMNS, stall_event_rows, best_effort=best_effort)
+            if stage_metric_rows or not os.path.exists(self.context.stage_metrics_csv):
+                if stage_metric_rows:
+                    _append_csv_rows(self.context.stage_metrics_csv, STAGE_METRIC_COLUMNS, stage_metric_rows)
+                else:
+                    _write_csv_atomic(self.context.stage_metrics_csv, STAGE_METRIC_COLUMNS, [])
+                sync_run_artifact(self.context, "stage_metrics_csv", src_path=self.context.stage_metrics_csv, best_effort=best_effort)
+            if stall_event_rows or not os.path.exists(self.context.stall_events_csv):
+                if stall_event_rows:
+                    _append_csv_rows(self.context.stall_events_csv, STALL_EVENT_COLUMNS, stall_event_rows)
+                else:
+                    _write_csv_atomic(self.context.stall_events_csv, STALL_EVENT_COLUMNS, [])
+                sync_run_artifact(self.context, "stall_events_csv", src_path=self.context.stall_events_csv, best_effort=best_effort)
             self._write_manifest_files(best_effort=best_effort)
             self._write_summary_files(best_effort=best_effort)
         except Exception as exc:
@@ -1320,6 +1345,8 @@ class CheckpointStore:
             self._snapshot_dirty = False
             self._dirty_snapshot_updates = 0
             self._heartbeat_dirty = False
+            self._stage_metrics.clear()
+            self._stall_events.clear()
             self._last_snapshot_flush_monotonic = time.monotonic()
 
     def close(self) -> None:

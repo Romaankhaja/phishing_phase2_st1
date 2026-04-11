@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 from dataclasses import asdict
 from datetime import datetime
 import logging
+import os
 import socket
 import time
 from typing import Any
@@ -173,6 +175,40 @@ def _aggregate_ocr_stats(stats_rows: list[dict[str, Any]] | None) -> dict[str, A
         aggregate["items_processed"] += int(stats.get("items_processed", 0) or 0)
         aggregate["last_batch_size"] += int(stats.get("last_batch_size", 0) or 0)
     return aggregate
+
+
+def _append_debug_rows_csv(
+    *,
+    rows: list[dict[str, Any]],
+    output_path: str,
+    run_context: RunContext | None,
+    artifact_key: str,
+) -> None:
+    if not rows:
+        return
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    fieldnames: list[str] = []
+    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+        with open(output_path, newline="", encoding="utf-8") as fh:
+            fieldnames = list(next(csv.reader(fh), []))
+    if not fieldnames:
+        seen: set[str] = set()
+        for row in rows:
+            for key in row.keys():
+                column = str(key)
+                if column and column not in seen:
+                    seen.add(column)
+                    fieldnames.append(column)
+    if not fieldnames:
+        return
+    write_header = not os.path.exists(output_path) or os.path.getsize(output_path) == 0
+    with open(output_path, "a", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
+        if write_header:
+            writer.writeheader()
+        for row in rows:
+            writer.writerow({column: row.get(column, "") for column in fieldnames})
+    sync_run_artifact(run_context, artifact_key, src_path=output_path, best_effort=True)
 
 
 async def classify_hash_only_row_impl(
@@ -1007,6 +1043,7 @@ async def run_hash_only_pipeline_with_ray_impl(
     ]
     classifier_actors = [primitives["HashOnlyClassifierActor"].options(num_cpus=1, max_concurrency=1).remote(failed_fetch_suspected_min, failed_fetch_review_min) for _ in range(int(runtime_config["classify_actors"]))]
     output_records: list[dict[str, Any]] = []
+    flagged_record_count = 0
     review_rows: list[dict[str, Any]] = []
     pending: dict[Any, dict[str, Any]] = {}
     failed_classifications = 0
@@ -1072,7 +1109,7 @@ async def run_hash_only_pipeline_with_ray_impl(
                     "cpu_headroom_cores": int(controller_state.get("cpu_headroom_cores", 0) or 0),
                 },
                 "inflight": len(pending),
-                "flagged": len(output_records),
+                "flagged": flagged_record_count,
                 "review": len(review_rows),
                 "failed": failed_classifications,
                 "ocr": dict(ocr_progress_stats or {}),
@@ -1159,6 +1196,42 @@ async def run_hash_only_pipeline_with_ray_impl(
     )
     next_row_index = 0
 
+    async def _replace_classifier_actor(actor_slot: int, *, reason: str) -> None:
+        if actor_slot < 0 or actor_slot >= len(classifier_actors):
+            return
+        old_actor = classifier_actors[actor_slot]
+        try:
+            await _ray_get(old_actor.close.remote(), _label=f"classifier_close:{actor_slot}")
+        except Exception:
+            pass
+        try:
+            primitives["ray"].kill(old_actor, no_restart=True)
+        except Exception:
+            pass
+        classifier_actors[actor_slot] = primitives["HashOnlyClassifierActor"].options(
+            num_cpus=1,
+            max_concurrency=1,
+        ).remote(failed_fetch_suspected_min, failed_fetch_review_min)
+        logger.warning("Ray classify actor replaced | slot=%d | reason=%s", actor_slot, reason)
+
+    def _submit_classify_row(*, row: dict[str, Any], sequence_number: int, actor_slot: int, attempt_count: int) -> None:
+        classifier = classifier_actors[actor_slot]
+        ocr_actor = ocr_actors[(max(1, sequence_number) - 1) % len(ocr_actors)]
+        domain_url = str(row.get("Identified Phishing/Suspected Domain Name", "")).strip()
+        normalized_url = domain_url.strip().lower()
+        source_workbook = str(row.get("source_workbook", "") or "")
+        record_key = make_record_key(normalized_url, source_workbook)
+        worker_id = f"classify-{actor_slot}"
+        pending[classifier.classify_row.remote(row, sequence_number, ocr_actor, whois_actor)] = {
+            "row": row,
+            "worker_id": worker_id,
+            "record_key": record_key,
+            "submitted_monotonic": time.perf_counter(),
+            "actor_slot": actor_slot,
+            "attempt_count": int(attempt_count),
+            "sequence_number": int(sequence_number),
+        }
+
     def _submit_until_cap() -> None:
         nonlocal next_row_index
         live_cap = int(controller_state.get("classify_live_inflight", classify_inflight_cap) or classify_inflight_cap)
@@ -1166,19 +1239,12 @@ async def run_hash_only_pipeline_with_ray_impl(
             row = rows_to_process[next_row_index]
             sequence_number = next_row_index + 1
             actor_slot = next_row_index % len(classifier_actors)
-            classifier = classifier_actors[actor_slot]
-            ocr_actor = ocr_actors[next_row_index % len(ocr_actors)]
-            domain_url = str(row.get("Identified Phishing/Suspected Domain Name", "")).strip()
-            normalized_url = domain_url.strip().lower()
-            source_workbook = str(row.get("source_workbook", "") or "")
-            record_key = make_record_key(normalized_url, source_workbook)
-            worker_id = f"classify-{actor_slot}"
-            pending[classifier.classify_row.remote(row, sequence_number, ocr_actor, whois_actor)] = {
-                "row": row,
-                "worker_id": worker_id,
-                "record_key": record_key,
-                "submitted_monotonic": time.perf_counter(),
-            }
+            _submit_classify_row(
+                row=row,
+                sequence_number=sequence_number,
+                actor_slot=actor_slot,
+                attempt_count=0,
+            )
             next_row_index += 1
 
     def _refresh_progress_bar(progress_bar: Any | None) -> None:
@@ -1192,7 +1258,7 @@ async def run_hash_only_pipeline_with_ray_impl(
                 progress_tracker=classify_progress,
                 started_monotonic=classify_started_monotonic,
                 inflight=len(pending),
-                flagged=len(output_records),
+                flagged=flagged_record_count,
                 review=len(review_rows),
                 failed=failed_classifications,
                 ocr_stats=ocr_progress_stats,
@@ -1207,22 +1273,24 @@ async def run_hash_only_pipeline_with_ray_impl(
         completed = classify_progress.completed
         now = time.perf_counter()
         if not force:
-            enough_rows = (completed - last_debug_flush_completed) >= 128
-            enough_time = (now - last_debug_flush_monotonic) >= 30.0
+            enough_rows = (completed - last_debug_flush_completed) >= 1000
+            enough_time = (now - last_debug_flush_monotonic) >= 15.0
             if not ((stage2_rows or stage3_rows) and (enough_rows or enough_time)):
                 return
-        pipeline_module._write_debug_csv(
-            stage2_rows,
-            stage2_debug_path,
+        _append_debug_rows_csv(
+            rows=stage2_rows,
+            output_path=stage2_debug_path,
             run_context=run_context,
             artifact_key="stage2_model_debug_csv",
         )
-        pipeline_module._write_debug_csv(
-            stage3_rows,
-            stage3_debug_path,
+        _append_debug_rows_csv(
+            rows=stage3_rows,
+            output_path=stage3_debug_path,
             run_context=run_context,
             artifact_key="stage3_classification_debug_csv",
         )
+        stage2_rows.clear()
+        stage3_rows.clear()
         last_debug_flush_monotonic = now
         last_debug_flush_completed = completed
 
@@ -1242,7 +1310,7 @@ async def run_hash_only_pipeline_with_ray_impl(
                     progress_tracker=classify_progress,
                     started_monotonic=started_monotonic,
                     inflight=len(pending),
-                    flagged=len(output_records),
+                    flagged=flagged_record_count,
                     review=len(review_rows),
                     failed=failed_classifications,
                     ocr_stats=ocr_progress_stats,
@@ -1293,6 +1361,63 @@ async def run_hash_only_pipeline_with_ray_impl(
                 await asyncio.wait_for(heartbeat_stop.wait(), timeout=10.0)
             except asyncio.TimeoutError:
                 pass
+
+    async def _reap_stale_classify_tasks() -> None:
+        nonlocal failed_classifications
+        now = time.perf_counter()
+        stale_contexts: list[tuple[Any, dict[str, Any], float]] = []
+        for ref, context in list(pending.items()):
+            submitted = float(context.get("submitted_monotonic", now) or now)
+            age_seconds = max(0.0, now - submitted)
+            if age_seconds < 180.0:
+                continue
+            stale_contexts.append((ref, dict(context), age_seconds))
+        for ref, context, _age_seconds in stale_contexts:
+            current_context = pending.pop(ref, None)
+            if current_context is None:
+                continue
+            worker_id = str(current_context.get("worker_id", "") or "")
+            if checkpoint_actor is not None and worker_id:
+                checkpoint_actor.clear_worker_heartbeat.remote(stage_name="classify", worker_id=worker_id)
+            row = dict(current_context.get("row") or {})
+            domain_url = str(row.get("Identified Phishing/Suspected Domain Name", "")).strip()
+            normalized_url = domain_url.strip().lower()
+            source_workbook = str(row.get("source_workbook", "") or "")
+            actor_slot = int(current_context.get("actor_slot", -1) or -1)
+            attempt_count = int(current_context.get("attempt_count", 0) or 0)
+            sequence_number = int(current_context.get("sequence_number", 0) or 0) or 1
+            if attempt_count >= 1:
+                failed_classifications += 1
+                classify_progress.mark_completed(final_status="classification_failed")
+                metrics_actor.increment.remote("classify.failed", 1.0)
+                if checkpoint_actor is not None and run_context is not None:
+                    checkpoint_actor.upsert_url_result.remote(
+                        stage_result_patch(
+                            run_id=run_context.run_id,
+                            raw_url=domain_url,
+                            normalized_url=normalized_url,
+                            source_workbook=source_workbook,
+                            stage_name="classify",
+                            stage_status="failed",
+                            current_stage="classify",
+                            worker_id="ray-classify",
+                            error_type="RuntimeError",
+                            error_message="stale_classify_task_after_retry",
+                            final_pipeline_status="classification_failed",
+                            final_decision="UNCLASSIFIED",
+                            failure_reason="stale_classify_task_after_retry",
+                        )
+                    )
+                continue
+            if actor_slot >= 0:
+                await _replace_classifier_actor(actor_slot, reason="stale_classify_task")
+            retry_slot = actor_slot if 0 <= actor_slot < len(classifier_actors) else 0
+            _submit_classify_row(
+                row=row,
+                sequence_number=sequence_number,
+                actor_slot=retry_slot,
+                attempt_count=attempt_count + 1,
+            )
 
     logging_redirect_ctx = tqdm_logging_redirect(progress_enabled)
     progress_bar_ctx = managed_progress_bar(
@@ -1411,6 +1536,9 @@ async def run_hash_only_pipeline_with_ray_impl(
     _refresh_progress_bar(progress_bar)
     try:
         while pending:
+            await _reap_stale_classify_tasks()
+            if not pending:
+                break
             ready, _ = await _ray_wait(list(pending.keys()), num_returns=min(16, len(pending)), timeout=1.0)
             if not ready:
                 _refresh_progress_bar(progress_bar)
@@ -1435,7 +1563,7 @@ async def run_hash_only_pipeline_with_ray_impl(
                     if checkpoint_actor is not None and run_context is not None:
                         checkpoint_actor.upsert_url_result.remote(stage_result_patch(run_id=run_context.run_id, raw_url=domain_url, normalized_url=normalized_url, source_workbook=source_workbook, stage_name="classify", stage_status="failed", current_stage="classify", worker_id="ray-classify", error_type=error_type, error_message=error_message, final_pipeline_status="classification_failed", final_decision="UNCLASSIFIED", failure_reason=error_message))
                     continue
-                if result.get("output_record") is not None:
+                if result.get("output_record") is not None and checkpoint_actor is None:
                     output_records.append(dict(result["output_record"]))
                 if result.get("review_row") is not None:
                     review_rows.append(dict(result["review_row"]))
@@ -1458,6 +1586,8 @@ async def run_hash_only_pipeline_with_ray_impl(
                 classify_progress.mark_completed(
                     final_status="review_only" if bool(result.get("review_sink")) else "completed"
                 )
+                if result.get("output_record") is not None:
+                    flagged_record_count += 1
             _flush_debug_artifacts()
             _submit_until_cap()
             _refresh_progress_bar(progress_bar)
@@ -1467,6 +1597,9 @@ async def run_hash_only_pipeline_with_ray_impl(
             run_context=run_context,
             output_path=review_queue_path,
         )
+        if checkpoint_actor is not None:
+            await _ray_get(checkpoint_actor.export_all.remote())
+            output_records = list(await _ray_get(checkpoint_actor.get_terminal_submission_records.remote()) or [])
         df_out = pd.DataFrame(output_records, columns=pipeline_module._submission_record_columns())
         df_out.to_csv(final_output_path, index=False, encoding="utf-8")
         flagged_df = df_out[df_out["Phishing/Suspected Domains (i.e. Class Label)"].isin(["Phishing", "Suspected"])].copy()
@@ -1474,8 +1607,6 @@ async def run_hash_only_pipeline_with_ray_impl(
         sync_run_artifact(run_context, "final_output_csv", src_path=final_output_path, best_effort=True)
         sync_run_artifact(run_context, "final_output_filtered_csv", src_path=filtered_output_path, best_effort=True)
         _flush_debug_artifacts(force=True)
-        if checkpoint_actor is not None:
-            checkpoint_actor.export_all.remote()
         _refresh_progress_bar(progress_bar)
         return df_out
     finally:
@@ -1501,4 +1632,8 @@ async def run_hash_only_pipeline_with_ray_impl(
         if close_refs:
             await _ray_get(close_refs)
         if checkpoint_actor is not None:
+            try:
+                await _ray_get(checkpoint_actor.export_all.remote())
+            except Exception:
+                logger.exception("Failed to export classify checkpoint state before shutdown")
             await _ray_get(checkpoint_actor.close.remote())

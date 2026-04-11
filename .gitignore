@@ -100,8 +100,8 @@ phishing_pipeline/PS-02_ISS_NLP_Evidences/
 # Ignore specific large datasets if they are not meant to be tracked
 # data/training/*.xlsx 
 
-# Large pipeline output files (exceed GitHub 100MB limit)
+# # Large pipeline output files (exceed GitHub 100MB limit)
 server_output/pipeline_run_results.csv
 server_output/pipeline_run_results.csv.*.tmp
 *.mp4
-server_output
+server_output/

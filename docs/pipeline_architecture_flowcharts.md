@@ -68,6 +68,7 @@ flowchart TD
 ## 2. Stage 0 — Lexical Evaluation (Batch)
 
 ### Purpose
+
 Fast, CPU-only pre-filter that evaluates every URL against the entity database using string similarity, typosquatting detection, and domain simhash comparison. Determines which URLs warrant deeper analysis.
 
 ### Key Files & Methods
@@ -94,6 +95,7 @@ Fast, CPU-only pre-filter that evaluates every URL against the entity database u
 | **Output** | `Stage0BatchResult` — per-URL: `lexical_score`, `best_entity`, `typo_anchor`, `strict_lexical_hit`, `lexical_score_pass`, `domain_simhash_similarity` |
 
 ### Concurrency
+
 - Ray task with `num_cpus=1.0`
 - `LEXICAL_WORKERS` parallel tasks (default: `min(32, max(4, CPU_COUNT-4))`)
 - `LEXICAL_BATCH_SIZE` URLs per task (default: 1024)
@@ -126,6 +128,7 @@ flowchart TD
 ## 3. Stage 1 Phase A — HTTP Fetch & HTML Parse
 
 ### Purpose
+
 For each URL that passes lexical evaluation, perform an HTTP fetch to capture the live page content. Parse the HTML to extract structural signals: title, forms, redirects, meta tags, favicon URL, and text content.
 
 ### Key Files & Methods
@@ -157,6 +160,7 @@ For each URL that passes lexical evaluation, perform an HTTP fetch to capture th
 | **Output** | `stage1_result` dict: `final_landing_url`, `redirect_chain`, `redirect_count`, `status_code`, `html_bytes`, `response_encoding`, `title_text`, `meta_description`, `visible_text`, `favicon_url`, `form_count`, `password_count`, `page_has_login_form`, `action_urls`, `iframe_count`, `meta_refresh`, `js_redirect` |
 
 ### Concurrency
+
 - `_Stage1FetchActorImpl` actors: `stage1_fetch_actors` from `resolve_ray_runtime_config()`
 - `Stage1ConcurrencyControls`: separate semaphores for URL, HTTP, DNS, RDAP, TLS
 - `_AdaptiveFetchLimiter` — dynamic fetch concurrency based on timeout/failure ratios
@@ -204,6 +208,7 @@ flowchart TD
 ## 4. Stage 1 Phase B — Enrichment (RDAP / DNS / TLS / GeoIP / Scoring)
 
 ### Purpose
+
 Enrich the fetched result with infrastructure signals: domain age (RDAP), DNS resolution, TLS certificate details, and GeoIP data. Then score all signals against the entity database to produce a `stage1_total_score` and escalation decision.
 
 ### Key Files & Methods
@@ -303,6 +308,7 @@ flowchart TD
 > **No OCR in Stage 2.** This stage is purely hash-based. OCR is only used later in Stage 3 (Classification) for TVC brand spoof detection.
 
 ### Purpose
+
 For URLs escalated from Stage 1, perform deep visual and content analysis: render the page in a headless browser, capture screenshots, extract perceptual hashes (favicon, page, SSL, domain), and compute weighted similarity scores against the entity hash database. Produce the final `holdout.csv` shortlist.
 
 ### Key Files & Methods
@@ -417,6 +423,7 @@ flowchart TD
 ## 6. Stage 3 — Classification (Models + TVC + Hybrid Decision)
 
 ### Purpose
+
 For each shortlisted URL from `holdout.csv`, perform the final classification by combining: ML model inference (brand classification model, domain source model), Textual-Visual Consistency (TVC) analysis, OCR-based brand spoof detection, WHOIS/RDAP registration data, DNS records, and a hybrid decision engine. Produce the final output with evidence.
 
 ### Key Files & Methods

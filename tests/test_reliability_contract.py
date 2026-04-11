@@ -344,6 +344,52 @@ class ReliabilityContractTests(unittest.TestCase):
             self.assertEqual(summary_json["fatal_stage"], "")
             store.close()
 
+    def test_summary_counts_only_emitted_submission_records(self):
+        with self._tempdir() as temp_dir:
+            ctx = build_run_context(
+                output_dir=temp_dir,
+                run_id="test_run",
+                metadata={"shortlisting": "demo"},
+            )
+            store = CheckpointStore(ctx)
+            store.upsert_url_result(
+                stage_result_patch(
+                    run_id=ctx.run_id,
+                    raw_url="https://phish.example",
+                    normalized_url="https://phish.example",
+                    source_workbook="demo.xlsx",
+                    stage_name="classify",
+                    stage_status="completed",
+                    current_stage="classify",
+                    final_pipeline_status="completed",
+                    final_decision="Phishing",
+                    submission_record={
+                        "Identified Phishing/Suspected Domain Name": "https://phish.example",
+                        "Phishing/Suspected Domains (i.e. Class Label)": "Phishing",
+                    },
+                )
+            )
+            store.upsert_url_result(
+                stage_result_patch(
+                    run_id=ctx.run_id,
+                    raw_url="https://review.example",
+                    normalized_url="https://review.example",
+                    source_workbook="demo.xlsx",
+                    stage_name="classify",
+                    stage_status="completed",
+                    current_stage="classify",
+                    final_pipeline_status="review_only",
+                    final_decision="Legitimate",
+                )
+            )
+
+            summary = store._build_summary_payload()
+
+            self.assertEqual({"Phishing": 1}, summary["final_decision_counts"])
+            self.assertEqual(1, summary["pipeline_status_counts"]["completed"])
+            self.assertEqual(1, summary["pipeline_status_counts"]["review_only"])
+            store.close()
+
 
 if __name__ == "__main__":
     unittest.main()
