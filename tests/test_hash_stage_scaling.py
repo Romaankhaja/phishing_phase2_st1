@@ -45,6 +45,36 @@ class HashStageScalingTests(unittest.TestCase):
             )
         )
 
+    def test_should_probe_delayed_redirect_for_lexical_placeholder_page(self):
+        self.assertTrue(
+            comparison._should_probe_delayed_redirect(
+                original_url="https://crsor.info",
+                final_landing_url="https://crsor.info/",
+                title_text="Index Of /",
+                visible_text="Index of /",
+                prefetch_metrics={
+                    "strict_lexical_hit": True,
+                    "lexical_score_pass": True,
+                },
+                stage1_analysis={},
+            )
+        )
+
+    def test_should_not_probe_delayed_redirect_after_cross_domain_landing(self):
+        self.assertFalse(
+            comparison._should_probe_delayed_redirect(
+                original_url="https://crsor.info",
+                final_landing_url="https://dcc.crsorgi.gov.in.crsor.info/crs/",
+                title_text="Index Of /",
+                visible_text="Index of /",
+                prefetch_metrics={
+                    "strict_lexical_hit": True,
+                    "lexical_score_pass": True,
+                },
+                stage1_analysis={},
+            )
+        )
+
     def test_commit_legacy_shard_fetch_outcome_defers_successful_payload_counting(self):
         metrics = {
             "processed": 0,

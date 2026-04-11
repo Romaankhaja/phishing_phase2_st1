@@ -149,6 +149,7 @@ async def classify_hash_only_row_impl(
     evidence_tier = pipeline_module._normalize_evidence_tier(row)
     stage_started_at = utc_now_iso()
     stage_started_monotonic = time.perf_counter()
+    registration_only_enrichment = pipeline_module._requires_registration_only_enrichment(row)
 
     def _event(status: str, *, error_type: str = "", error_message: str = "") -> dict[str, Any]:
         return {
@@ -217,7 +218,7 @@ async def classify_hash_only_row_impl(
             "Remarks": remarks,
         }
 
-    if fetch_status not in eligible_fetch_statuses:
+    if fetch_status not in eligible_fetch_statuses and not registration_only_enrichment:
         _log_ray_classify_decision_inputs(
             row,
             registrar="NA",
@@ -263,7 +264,12 @@ async def classify_hash_only_row_impl(
                 hosting_country="NA",
                 dns_records="NA",
                 evidence_name="NA",
-                remarks="weak_or_single_signal_match; NA values are due to privacy issues.",
+                remarks=pipeline_module._build_output_remarks(
+                    row=row,
+                    classification=classification,
+                    evidence_tier=evidence_tier,
+                    hosting_ip="NA",
+                ),
             )
         review_row = None
         if review_sink:
@@ -398,10 +404,13 @@ async def classify_hash_only_row_impl(
         if ocr_worker is not None
         else await pipeline_module._extract_hash_only_ocr_tvc(**ocr_request)
     )
-    try:
-        net_feats = await extract_network_features_async(domain_url)
-    except Exception:
+    if registration_only_enrichment:
         net_feats = {}
+    else:
+        try:
+            net_feats = await extract_network_features_async(domain_url)
+        except Exception:
+            net_feats = {}
     brand_model_top1 = "NA"
     brand_model_confidence = 0.0
     domain_model_top1 = "Unknown"
@@ -413,11 +422,12 @@ async def classify_hash_only_row_impl(
     model_usable = False
 
     resolved_ip = str(net_feats.get("ip_address") or "") or None
-    try:
-        loop = asyncio.get_running_loop()
-        resolved_ip = await asyncio.wait_for(loop.run_in_executor(None, socket.gethostbyname, host), timeout=3.0)
-    except Exception:
-        pass
+    if not registration_only_enrichment:
+        try:
+            loop = asyncio.get_running_loop()
+            resolved_ip = await asyncio.wait_for(loop.run_in_executor(None, socket.gethostbyname, host), timeout=3.0)
+        except Exception:
+            pass
 
     def _get_rdap_url(domain_host: str) -> str:
         ext = tldextract.extract(domain_host)
@@ -452,7 +462,12 @@ async def classify_hash_only_row_impl(
             hosting_country="NA",
             dns_records="NA",
             evidence_name="NA",
-            remarks="weak_or_single_signal_match; NA values are due to privacy issues.",
+            remarks=pipeline_module._build_output_remarks(
+                row=row,
+                classification="Suspected",
+                evidence_tier=evidence_tier,
+                hosting_ip="NA",
+            ),
         )
         return asdict(
             ClassificationRecord(
@@ -542,7 +557,7 @@ async def classify_hash_only_row_impl(
             )
         )
 
-    if reg_data is None and resolved_ip is not None:
+    if reg_data is None and (resolved_ip is not None or registration_only_enrichment):
         if whois_actor is not None:
             await _ray_get(whois_actor.acquire.remote())
         try:
@@ -669,12 +684,11 @@ async def classify_hash_only_row_impl(
         hosting_country=hosting_country,
         dns_records=dns_records,
         evidence_name=evidence_name,
-        remarks=(
-            "non_aligned_or_weak_cse_similarity; NA values are due to privacy issues."
-            if classification == "Legitimate"
-            else "weak_or_single_signal_match; NA values are due to privacy issues."
-            if evidence_tier == "weak_evidence"
-            else "NA values are due to privacy issues."
+        remarks=pipeline_module._build_output_remarks(
+            row=row,
+            classification=classification,
+            evidence_tier=evidence_tier,
+            hosting_ip=ip,
         ),
     )
     review_row = None

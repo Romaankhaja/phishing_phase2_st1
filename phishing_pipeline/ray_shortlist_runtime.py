@@ -260,6 +260,7 @@ async def run_hashing_shortlist_with_ray_impl(
         checkpoint_actor.ensure_url_results.remote(ensure_records)
 
     prefetch_metrics_map: dict[str, dict[str, Any]] = {}
+    dns_prefetch_map: dict[str, dict[str, Any]] = {}
     stage1_analysis_map: dict[str, dict[str, Any]] = {}
     lexical_reject_urls: set[str] = set()
     decision_rows: list[dict[str, Any]] = []
@@ -292,7 +293,18 @@ async def run_hashing_shortlist_with_ray_impl(
         "render_rescue_attempted": 0,
         "render_rescue_applied": 0,
     }
-    stage1_progress = {"escalated": 0, "failed": 0, "head_only": 0, "fetched": 0, "fallback_dns": 0, "timeout": 0}
+    stage1_progress = {
+        "escalated": 0,
+        "failed": 0,
+        "head_only": 0,
+        "fetched": 0,
+        "fallback_dns": 0,
+        "timeout": 0,
+        "dns_hit_gate_accepted": 0,
+        "dns_hit_gate_passthrough": 0,
+        "dns_gate_accepted": 0,
+        "dns_gate_filtered": 0,
+    }
     stage0_hits = 0
     stage0_misses = 0
     lex_eval_config = (int(scoring_config["typo_top_k"]), float(scoring_config["lexical_pass_min_score"]))
@@ -1207,6 +1219,8 @@ async def run_hashing_shortlist_with_ray_impl(
                 if kind == "stage0_batch":
                     stage0_batches_completed += 1
                     stage0_latency_sum_ms += float(payload.get("elapsed_ms", 0.0) or 0.0)
+                    lexical_hit_records: list[dict[str, Any]] = []
+                    lexical_miss_records: list[dict[str, Any]] = []
                     for normalized_url, prefetch_metrics in zip(payload.get("normalized_urls", []), payload.get("prefetch_results", [])):
                         prefetch_row = dict(prefetch_metrics or {})
                         prefetch_row["source_workbook"] = source_workbook_map.get(normalized_url, prefetch_row.get("source_workbook", ""))
@@ -1219,20 +1233,11 @@ async def run_hashing_shortlist_with_ray_impl(
                             stage_started_monotonic = time.perf_counter()
                             if comparison._passes_lexical_gate(prefetch_row):
                                 stage0_hits += 1
-                                stage1_analysis_map[normalized_url] = comparison._build_lexical_stage1_state(prefetch_row)
                                 await _record_checkpoint(
                                     _build_shortlist_patch(run_context=run_context, raw_url=raw_url, normalized_url=normalized_url, source_workbook=source_workbook, stage_name="stage0", stage_status="lexical_hit", current_stage="stage0", worker_id="ray-stage0"),
                                     _build_shortlist_stage_event(run_context=run_context, raw_url=raw_url, normalized_url=normalized_url, source_workbook=source_workbook, stage_name="stage0", worker_id="ray-stage0", started_at=stage_started_at, started_monotonic=stage_started_monotonic, status="lexical_hit"),
                                 )
-                                await _admit_to_hash(raw_url, normalized_url, source_workbook, progress_key)
-                            else:
-                                stage0_misses += 1
-                                lexical_reject_urls.add(normalized_url)
-                                await _record_checkpoint(
-                                    _build_shortlist_patch(run_context=run_context, raw_url=raw_url, normalized_url=normalized_url, source_workbook=source_workbook, stage_name="stage0", stage_status="filtered_lexical_miss", current_stage="stage0", worker_id="ray-stage0"),
-                                    _build_shortlist_stage_event(run_context=run_context, raw_url=raw_url, normalized_url=normalized_url, source_workbook=source_workbook, stage_name="stage0", worker_id="ray-stage0", started_at=stage_started_at, started_monotonic=stage_started_monotonic, status="filtered_lexical_miss"),
-                                )
-                                await _submit_stage1_fetch(
+                                lexical_hit_records.append(
                                     {
                                         "raw_url": raw_url,
                                         "normalized_url": normalized_url,
@@ -1242,6 +1247,203 @@ async def run_hashing_shortlist_with_ray_impl(
                                         "progress_key": progress_key,
                                     }
                                 )
+                            else:
+                                stage0_misses += 1
+                                await _record_checkpoint(
+                                    _build_shortlist_patch(run_context=run_context, raw_url=raw_url, normalized_url=normalized_url, source_workbook=source_workbook, stage_name="stage0", stage_status="filtered_lexical_miss", current_stage="stage0", worker_id="ray-stage0"),
+                                    _build_shortlist_stage_event(run_context=run_context, raw_url=raw_url, normalized_url=normalized_url, source_workbook=source_workbook, stage_name="stage0", worker_id="ray-stage0", started_at=stage_started_at, started_monotonic=stage_started_monotonic, status="filtered_lexical_miss"),
+                                )
+                                lexical_miss_records.append(
+                                    {
+                                        "raw_url": raw_url,
+                                        "normalized_url": normalized_url,
+                                        "source_workbook": source_workbook,
+                                        "stage_started_at": stage_started_at,
+                                        "started_monotonic": stage_started_monotonic,
+                                        "progress_key": progress_key,
+                                    }
+                                )
+                    if lexical_hit_records:
+                        dns_gate_result = await comparison._dns_gate_lexical_miss_records(
+                            lexical_hit_records,
+                            stage1_http_config=stage1_http_config,
+                        )
+                        hit_dns_prefetch_map = dict(dns_gate_result.get("dns_prefetch_map") or {})
+                        stage1_progress["dns_hit_gate_accepted"] = int(stage1_progress.get("dns_hit_gate_accepted", 0) or 0) + int(dns_gate_result.get("stats", {}).get("accepted", 0) or 0)
+                        stage1_progress["dns_hit_gate_passthrough"] = int(stage1_progress.get("dns_hit_gate_passthrough", 0) or 0) + int(dns_gate_result.get("stats", {}).get("rejected", 0) or 0)
+                        for record in dns_gate_result["accepted_records"]:
+                            raw_url = str(record.get("raw_url", "") or "")
+                            normalized_url = str(record.get("normalized_url", "") or comparison.normalize_url(raw_url))
+                            source_workbook = str(record.get("source_workbook", "") or source_workbook_map.get(normalized_url, ""))
+                            progress_key = str(record.get("progress_key", "") or "")
+                            stage1_state = comparison._build_lexical_stage1_state(prefetch_metrics_map.get(normalized_url, {}))
+                            stage1_state.update(dict(hit_dns_prefetch_map.get(normalized_url, {}) or {}))
+                            stage1_analysis_map[normalized_url] = stage1_state
+                            await _record_checkpoint(
+                                _build_shortlist_patch(
+                                    run_context=run_context,
+                                    raw_url=raw_url,
+                                    normalized_url=normalized_url,
+                                    source_workbook=source_workbook,
+                                    stage_name="dns_gate",
+                                    stage_status="accepted",
+                                    current_stage="dns_gate",
+                                    worker_id="ray-dns-gate",
+                                ),
+                                _build_shortlist_stage_event(
+                                    run_context=run_context,
+                                    raw_url=raw_url,
+                                    normalized_url=normalized_url,
+                                    source_workbook=source_workbook,
+                                    stage_name="dns_gate",
+                                    worker_id="ray-dns-gate",
+                                    started_at=utc_now_iso(),
+                                    started_monotonic=time.perf_counter(),
+                                    status="accepted",
+                                ),
+                            )
+                            await _admit_to_hash(raw_url, normalized_url, source_workbook, progress_key)
+                        for record in dns_gate_result["rejected_records"]:
+                            raw_url = str(record.get("raw_url", "") or "")
+                            normalized_url = str(record.get("normalized_url", "") or comparison.normalize_url(raw_url))
+                            source_workbook = str(record.get("source_workbook", "") or source_workbook_map.get(normalized_url, ""))
+                            progress_key = str(record.get("progress_key", "") or "")
+                            analysis = comparison._build_dns_failed_lexical_stage1_state(
+                                prefetch_metrics_map.get(normalized_url, {}),
+                                raw_url=raw_url,
+                                normalized_url=normalized_url,
+                                source_workbook=source_workbook,
+                                dns_status=str(record.get("dns_status", "") or ""),
+                                dns_decision=str(record.get("dns_decision", "") or "filtered"),
+                                dns_answer_count=0,
+                                error_message=str(record.get("error_message", "") or ""),
+                            )
+                            stage1_analysis_map[normalized_url] = analysis
+                            _mark_shortlist_progress_completion(
+                                shortlist_progress,
+                                progress_completed_record_keys,
+                                progress_key,
+                                final_status="registration_passthrough",
+                            )
+                            await _record_checkpoint(
+                                _build_shortlist_patch(
+                                    run_context=run_context,
+                                    raw_url=raw_url,
+                                    normalized_url=normalized_url,
+                                    source_workbook=source_workbook,
+                                    stage_name="dns_gate",
+                                    stage_status="registration_passthrough",
+                                    current_stage="dns_gate",
+                                    worker_id="ray-dns-gate",
+                                    error_type=str(analysis.get("stage1_error_type", "") or analysis.get("fetch_error_type", "")),
+                                    error_message=str(analysis.get("stage1_error_message", "") or analysis.get("fetch_error_detail", "")),
+                                    failure_reason=str(analysis.get("stage1_reasons", "") or "dns_not_mapped_to_ip"),
+                                ),
+                                _build_shortlist_stage_event(
+                                    run_context=run_context,
+                                    raw_url=raw_url,
+                                    normalized_url=normalized_url,
+                                    source_workbook=source_workbook,
+                                    stage_name="dns_gate",
+                                    worker_id="ray-dns-gate",
+                                    started_at=utc_now_iso(),
+                                    started_monotonic=time.perf_counter(),
+                                    status="registration_passthrough",
+                                    error_type=str(analysis.get("stage1_error_type", "") or analysis.get("fetch_error_type", "")),
+                                    error_message=str(analysis.get("stage1_error_message", "") or analysis.get("fetch_error_detail", "")),
+                                ),
+                            )
+                    if lexical_miss_records:
+                        dns_gate_result = await comparison._dns_gate_lexical_miss_records(
+                            lexical_miss_records,
+                            stage1_http_config=stage1_http_config,
+                        )
+                        dns_prefetch_map.update(dict(dns_gate_result.get("dns_prefetch_map") or {}))
+                        stage1_progress["dns_gate_accepted"] = int(stage1_progress.get("dns_gate_accepted", 0) or 0) + int(dns_gate_result.get("stats", {}).get("accepted", 0) or 0)
+                        stage1_progress["dns_gate_filtered"] = int(stage1_progress.get("dns_gate_filtered", 0) or 0) + int(dns_gate_result.get("stats", {}).get("rejected", 0) or 0)
+                        for record in dns_gate_result["accepted_records"]:
+                            raw_url = str(record.get("raw_url", "") or "")
+                            normalized_url = str(record.get("normalized_url", "") or comparison.normalize_url(raw_url))
+                            source_workbook = str(record.get("source_workbook", "") or source_workbook_map.get(normalized_url, ""))
+                            progress_key = str(record.get("progress_key", "") or "")
+                            await _record_checkpoint(
+                                _build_shortlist_patch(
+                                    run_context=run_context,
+                                    raw_url=raw_url,
+                                    normalized_url=normalized_url,
+                                    source_workbook=source_workbook,
+                                    stage_name="dns_gate",
+                                    stage_status="accepted",
+                                    current_stage="dns_gate",
+                                    worker_id="ray-dns-gate",
+                                ),
+                                _build_shortlist_stage_event(
+                                    run_context=run_context,
+                                    raw_url=raw_url,
+                                    normalized_url=normalized_url,
+                                    source_workbook=source_workbook,
+                                    stage_name="dns_gate",
+                                    worker_id="ray-dns-gate",
+                                    started_at=utc_now_iso(),
+                                    started_monotonic=time.perf_counter(),
+                                    status="accepted",
+                                ),
+                            )
+                            await _submit_stage1_fetch(
+                                {
+                                    "raw_url": raw_url,
+                                    "normalized_url": normalized_url,
+                                    "source_workbook": source_workbook,
+                                    "stage_started_at": str(record.get("stage_started_at", "") or utc_now_iso()),
+                                    "started_monotonic": float(record.get("started_monotonic", time.perf_counter()) or time.perf_counter()),
+                                    "progress_key": progress_key,
+                                }
+                            )
+                        for record in dns_gate_result["rejected_records"]:
+                            raw_url = str(record.get("raw_url", "") or "")
+                            normalized_url = str(record.get("normalized_url", "") or comparison.normalize_url(raw_url))
+                            source_workbook = str(record.get("source_workbook", "") or source_workbook_map.get(normalized_url, ""))
+                            progress_key = str(record.get("progress_key", "") or "")
+                            analysis = dict((dns_gate_result.get("analysis_by_url") or {}).get(normalized_url, {}) or {})
+                            stage1_analysis_map[normalized_url] = {
+                                **comparison._stage1_signal_defaults(),
+                                **analysis,
+                            }
+                            _mark_shortlist_progress_completion(
+                                shortlist_progress,
+                                progress_completed_record_keys,
+                                progress_key,
+                                final_status="dns_gate_filtered",
+                            )
+                            await _record_checkpoint(
+                                _build_shortlist_patch(
+                                    run_context=run_context,
+                                    raw_url=raw_url,
+                                    normalized_url=normalized_url,
+                                    source_workbook=source_workbook,
+                                    stage_name="dns_gate",
+                                    stage_status="filtered_dns_inactive",
+                                    current_stage="dns_gate",
+                                    worker_id="ray-dns-gate",
+                                    error_type=str(analysis.get("stage1_error_type", "") or analysis.get("fetch_error_type", "")),
+                                    error_message=str(analysis.get("stage1_error_message", "") or analysis.get("fetch_error_detail", "")),
+                                    final_pipeline_status="filtered_lexical_miss",
+                                    failure_reason=str(analysis.get("stage1_reasons", "") or "dns_gate_inactive"),
+                                ),
+                                _build_shortlist_stage_event(
+                                    run_context=run_context,
+                                    raw_url=raw_url,
+                                    normalized_url=normalized_url,
+                                    source_workbook=source_workbook,
+                                    stage_name="dns_gate",
+                                    worker_id="ray-dns-gate",
+                                    started_at=utc_now_iso(),
+                                    started_monotonic=time.perf_counter(),
+                                    status="filtered_dns_inactive",
+                                    error_type=str(analysis.get("stage1_error_type", "") or analysis.get("fetch_error_type", "")),
+                                    error_message=str(analysis.get("stage1_error_message", "") or analysis.get("fetch_error_detail", "")),
+                                ),
+                            )
                 elif kind == "stage1_fetch":
                     record = dict(context)
                     _track_pending(
@@ -1267,7 +1469,7 @@ async def run_hashing_shortlist_with_ray_impl(
                             or make_record_key(str(record.get("normalized_url", "") or ""), str(record.get("source_workbook", "") or ""))
                         )
                         _track_pending(
-                            actor.enrich.remote(record, result, prefetch_metrics_map.get(record.get("normalized_url", ""), {})),
+                            actor.enrich.remote(record, result, dns_prefetch_map.get(record.get("normalized_url", ""), {})),
                             "stage1_enrich",
                             {
                                 "record": record,

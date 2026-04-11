@@ -119,15 +119,9 @@ def _stage_smoke_mode(value: str) -> str:
 
 def _runtime_profile(value: str) -> str:
     normalized = str(value).strip().lower()
-    allowed = {
-        "auto",
-        "default",
-        "cpu-safe",
-        "cpu-recall",
-        "cpu-fast",
-        "server-balanced",
-        "server-throughput",
-    }
+    from phishing_pipeline.config import RUNTIME_PROFILE_NAMES
+
+    allowed = set(RUNTIME_PROFILE_NAMES)
     if normalized not in allowed:
         raise argparse.ArgumentTypeError(f"runtime profile must be one of {sorted(allowed)}")
     return normalized
@@ -150,44 +144,16 @@ def _telemetry_mode(value: str) -> str:
 
 
 def _probe_runtime_resources() -> dict[str, Any]:
-    cpu_cores = os.cpu_count() or 4
-    ram_gb = 0.0
-    vram_gb = 0.0
+    from phishing_pipeline.config import probe_runtime_resources
 
-    try:
-        import psutil  # type: ignore
-
-        ram_gb = float(psutil.virtual_memory().total / (1024 ** 3))
-    except Exception:
-        ram_gb = 0.0
-
-    try:
-        import torch  # type: ignore
-
-        if torch.cuda.is_available():
-            vram_gb = float(torch.cuda.get_device_properties(0).total_memory / (1024 ** 3))
-    except Exception:
-        vram_gb = 0.0
-
-    return {
-        "cpu_cores": int(cpu_cores),
-        "ram_gb": float(ram_gb),
-        "vram_gb": float(vram_gb),
-        "platform": sys.platform,
-    }
+    return probe_runtime_resources()
 
 
-def _resolve_auto_runtime_profile(resource_info: dict[str, Any] | None = None) -> str:
-    resource_info = dict(resource_info or _probe_runtime_resources())
-    cpu_cores = int(resource_info.get("cpu_cores", 0) or 0)
-    ram_gb = float(resource_info.get("ram_gb", 0.0) or 0.0)
-    vram_gb = float(resource_info.get("vram_gb", 0.0) or 0.0)
-
-    if cpu_cores >= 32 and ram_gb >= 128.0:
-        return "server-balanced"
-    if cpu_cores <= 16 or ram_gb < 16.0 or (0.0 < vram_gb <= 6.0):
-        return "cpu-safe"
-    return "cpu-fast"
+# UNUSED_IN_PROD_RAY_FLOW: dead wrapper after config centralization; no callers remain.
+# def _resolve_auto_runtime_profile(resource_info: dict[str, Any] | None = None) -> str:
+#     from phishing_pipeline.config import _resolve_auto_runtime_profile as resolve_auto_runtime_profile
+#
+#     return resolve_auto_runtime_profile(resource_info)
 
 
 def _resolve_runtime_profile_settings(
@@ -195,261 +161,35 @@ def _resolve_runtime_profile_settings(
     *,
     resource_info: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    requested_profile = _runtime_profile(profile)
-    resource_info = dict(resource_info or _probe_runtime_resources())
-    resolved_profile = (
-        _resolve_auto_runtime_profile(resource_info)
-        if requested_profile in {"auto", "default"}
-        else requested_profile
-    )
-    if resolved_profile == "cpu-recall":
-        resolved_profile = "server-throughput"
+    from phishing_pipeline.config import resolve_runtime_profile
 
-    profiles: dict[str, dict[str, Any]] = {
-        "cpu-safe": {
-            "env": {
-                "PHISHING_HASH_PAGES": 16,
-                "PHISHING_HASH_PAGE_CONCURRENCY": 4,
-                "PHISHING_HASH_HTTP_LIMIT": 64,
-                "PHISHING_HASH_AUX_NET_LIMIT": 24,
-                "PHISHING_HASH_ACTIVE_PAGES_FLOOR": 6,
-                "PHISHING_LEXICAL_WORKERS": 8,
-                "PHISHING_LEXICAL_BATCH_SIZE": 256,
-                "PHISHING_LEXICAL_INFLIGHT_BATCHES": 8,
-                "PHISHING_SHORTLIST_EXECUTION_MODE": "legacy-batch",
-                "PHISHING_HASH_PROGRESS_LOG_INTERVAL_SECONDS": 10,
-                "PHISHING_HASH_ADAPTIVE_DOWNSHIFT": "true",
-            },
-            "stage1_http": {
-                "concurrency": 96,
-                "http_concurrency": 96,
-                "dns_concurrency": 96,
-                "rdap_concurrency": 4,
-                "tls_concurrency": 16,
-                "stage1_fetch_concurrency_start": 96,
-                "stage1_fetch_concurrency_max": 192,
-                "stage1_fetch_concurrency_floor": 32,
-                "stage1_http_connection_limit": 192,
-                "stage1_http_keepalive_limit": 96,
-                "stage1_per_host_limit": 4,
-                "stage1_cpu_workers": 4,
-                "stage1_parse_workers": 4,
-                "stage1_enrich_dns_concurrency": 96,
-                "stage1_enrich_rdap_concurrency": 4,
-                "stage1_enrich_tls_concurrency": 16,
-                "stage1_fetch_queue_max": 4000,
-                "stage1_cpu_queue_max": 2000,
-                "stage1_parse_queue_max": 2000,
-                "stage1_score_queue_max": 2000,
-                "stage1_enrich_queue_max": 2000,
-                "stage1_result_queue_max": 2000,
-                "stage1_control_interval_seconds": 2.0,
-            },
-            "reliability": {},
-        },
-        "server-balanced": {
-            "env": {
-                "PHISHING_HASH_PAGES": 16,
-                "PHISHING_HASH_PAGE_CONCURRENCY": 2,
-                "PHISHING_HASH_HTTP_LIMIT": 192,
-                "PHISHING_HASH_AUX_NET_LIMIT": 96,
-                "PHISHING_HASH_ACTIVE_PAGES_FLOOR": 4,
-                "PHISHING_LEXICAL_WORKERS": 16,
-                "PHISHING_LEXICAL_BATCH_SIZE": 1024,
-                "PHISHING_LEXICAL_INFLIGHT_BATCHES": 8,
-                "PHISHING_SHORTLIST_EXECUTION_MODE": "streaming-concurrent",
-                "PHISHING_HASH_PROGRESS_LOG_INTERVAL_SECONDS": 10,
-                "PHISHING_HASH_ADAPTIVE_DOWNSHIFT": "true",
-                "PHISHING_RAY_STAGE0_BATCH_SIZE": 1024,
-                "PHISHING_RAY_STAGE0_INFLIGHT": 4,
-                "PHISHING_RAY_STAGE1_FETCH_ACTORS": 12,
-                "PHISHING_RAY_STAGE1_ENRICH_ACTORS": 6,
-                "PHISHING_RAY_HASH_BROWSER_ACTORS": 8,
-                "PHISHING_RAY_HASH_TABS_PER_ACTOR": 2,
-                "PHISHING_RAY_HASH_FINALIZE_BATCH": 32,
-                "PHISHING_RAY_CLASSIFY_ACTORS": 8,
-                "PHISHING_RAY_CLASSIFY_INFLIGHT": 8,
-                "PHISHING_RAY_OCR_ACTORS": 1,
-                "PHISHING_RAY_STAGE1_FETCH_ACTOR_MAX_CONCURRENCY": 4,
-                "PHISHING_RAY_STAGE1_ENRICH_ACTOR_MAX_CONCURRENCY": 2,
-                "PHISHING_RAY_STAGE1_PENDING_CAP": 48,
-                "PHISHING_RAY_HASH_PENDING_CAP": 16,
-                "PHISHING_RAY_STAGE1_HTTP_CONNECTION_CAP": 192,
-                "PHISHING_RAY_STAGE1_HTTP_KEEPALIVE_CAP": 96,
-                "PHISHING_RAY_OCR_BATCH_SIZE": 32,
-                "PHISHING_RAY_OCR_BATCH_DELAY_MS": 25,
-                "PHISHING_RAY_PREWARM_MODE": "staged",
-                "PHISHING_RAY_PREWARM_ACTORS": "true",
-                "PHISHING_RAY_ENABLE_DYNAMIC_CONTROL": "true",
-                "PHISHING_RAY_TARGET_CPU_UTILIZATION": "0.82",
-                "PHISHING_RAY_CPU_HEADROOM_CORES": "6",
-            },
-            "stage1_http": {
-                "concurrency": 96,
-                "http_concurrency": 192,
-                "dns_concurrency": 192,
-                "rdap_concurrency": 16,
-                "tls_concurrency": 64,
-                "stage1_target_urls_per_sec": 1200,
-                "stage1_fetch_concurrency_start": 48,
-                "stage1_fetch_concurrency_max": 192,
-                "stage1_fetch_concurrency_floor": 24,
-                "stage1_http_connection_limit": 192,
-                "stage1_http_keepalive_limit": 96,
-                "stage1_per_host_limit": 4,
-                "stage1_cpu_workers": 12,
-                "stage1_parse_workers": 12,
-                "stage1_enrich_dns_concurrency": 192,
-                "stage1_enrich_rdap_concurrency": 16,
-                "stage1_enrich_tls_concurrency": 64,
-                "stage1_fetch_queue_max": 4000,
-                "stage1_cpu_queue_max": 2000,
-                "stage1_parse_queue_max": 2000,
-                "stage1_score_queue_max": 2000,
-                "stage1_enrich_queue_max": 2000,
-                "stage1_result_queue_max": 4000,
-                "stage1_control_interval_seconds": 2.0,
-            },
-            "reliability": {
-                "append_flush_interval_seconds": 10,
-                "append_flush_row_interval": 10000,
-                "snapshot_flush_interval_seconds": 60,
-                "snapshot_flush_row_interval": 50000,
-            },
-        },
-        "server-throughput": {
-            "env": {
-                "PHISHING_HASH_PAGES": 48,
-                "PHISHING_HASH_PAGE_CONCURRENCY": 4,
-                "PHISHING_HASH_HTTP_LIMIT": 384,
-                "PHISHING_HASH_AUX_NET_LIMIT": 192,
-                "PHISHING_HASH_ACTIVE_PAGES_FLOOR": 16,
-                "PHISHING_LEXICAL_WORKERS": 32,
-                "PHISHING_LEXICAL_BATCH_SIZE": 2048,
-                "PHISHING_LEXICAL_INFLIGHT_BATCHES": 16,
-                "PHISHING_SHORTLIST_EXECUTION_MODE": "streaming-concurrent",
-                "PHISHING_HASH_PROGRESS_LOG_INTERVAL_SECONDS": 10,
-                "PHISHING_HASH_ADAPTIVE_DOWNSHIFT": "true",
-                "PHISHING_RAY_STAGE0_BATCH_SIZE": 2048,
-                "PHISHING_RAY_STAGE0_INFLIGHT": 16,
-                "PHISHING_RAY_STAGE1_FETCH_ACTORS": 24,
-                "PHISHING_RAY_STAGE1_ENRICH_ACTORS": 12,
-                "PHISHING_RAY_HASH_BROWSER_ACTORS": 12,
-                "PHISHING_RAY_HASH_TABS_PER_ACTOR": 4,
-                "PHISHING_RAY_HASH_FINALIZE_BATCH": 64,
-                "PHISHING_RAY_CLASSIFY_ACTORS": 16,
-                "PHISHING_RAY_CLASSIFY_INFLIGHT": 64,
-                "PHISHING_RAY_OCR_ACTORS": 1,
-                "PHISHING_RAY_STAGE1_FETCH_ACTOR_MAX_CONCURRENCY": 8,
-                "PHISHING_RAY_STAGE1_ENRICH_ACTOR_MAX_CONCURRENCY": 6,
-                "PHISHING_RAY_STAGE1_PENDING_CAP": 384,
-                "PHISHING_RAY_HASH_PENDING_CAP": 96,
-                "PHISHING_RAY_STAGE1_HTTP_CONNECTION_CAP": 1536,
-                "PHISHING_RAY_STAGE1_HTTP_KEEPALIVE_CAP": 768,
-                "PHISHING_RAY_OCR_BATCH_SIZE": 32,
-                "PHISHING_RAY_OCR_BATCH_DELAY_MS": 25,
-                "PHISHING_RAY_PREWARM_ACTORS": "true",
-            },
-            "stage1_http": {
-                "concurrency": 384,
-                "http_concurrency": 1536,
-                "dns_concurrency": 512,
-                "rdap_concurrency": 32,
-                "tls_concurrency": 128,
-                "stage1_target_urls_per_sec": 2500,
-                "stage1_fetch_concurrency_start": 384,
-                "stage1_fetch_concurrency_max": 1536,
-                "stage1_fetch_concurrency_floor": 96,
-                "stage1_http_connection_limit": 1536,
-                "stage1_http_keepalive_limit": 768,
-                "stage1_per_host_limit": 4,
-                "stage1_cpu_workers": 24,
-                "stage1_parse_workers": 24,
-                "stage1_enrich_dns_concurrency": 512,
-                "stage1_enrich_rdap_concurrency": 32,
-                "stage1_enrich_tls_concurrency": 128,
-                "stage1_fetch_queue_max": 12000,
-                "stage1_cpu_queue_max": 8000,
-                "stage1_parse_queue_max": 8000,
-                "stage1_score_queue_max": 6000,
-                "stage1_enrich_queue_max": 8000,
-                "stage1_result_queue_max": 12000,
-                "stage1_control_interval_seconds": 2.0,
-            },
-            "reliability": {
-                "append_flush_interval_seconds": 10,
-                "append_flush_row_interval": 10000,
-                "snapshot_flush_interval_seconds": 60,
-                "snapshot_flush_row_interval": 50000,
-            },
-        },
-        "cpu-fast": {
-            "env": {
-                "PHISHING_HASH_PAGES": 24,
-                "PHISHING_HASH_PAGE_CONCURRENCY": 4,
-                "PHISHING_HASH_HTTP_LIMIT": 96,
-                "PHISHING_HASH_AUX_NET_LIMIT": 40,
-                "PHISHING_HASH_ACTIVE_PAGES_FLOOR": 8,
-                "PHISHING_LEXICAL_WORKERS": 12,
-                "PHISHING_LEXICAL_BATCH_SIZE": 512,
-                "PHISHING_LEXICAL_INFLIGHT_BATCHES": 12,
-                "PHISHING_SHORTLIST_EXECUTION_MODE": "streaming-concurrent",
-                "PHISHING_HASH_PROGRESS_LOG_INTERVAL_SECONDS": 10,
-                "PHISHING_HASH_ADAPTIVE_DOWNSHIFT": "true",
-            },
-            "stage1_http": {
-                "concurrency": 144,
-                "http_concurrency": 144,
-                "dns_concurrency": 144,
-                "rdap_concurrency": 8,
-                "tls_concurrency": 24,
-                "stage1_fetch_concurrency_start": 192,
-                "stage1_fetch_concurrency_max": 384,
-                "stage1_fetch_concurrency_floor": 48,
-                "stage1_http_connection_limit": 384,
-                "stage1_http_keepalive_limit": 128,
-                "stage1_per_host_limit": 4,
-                "stage1_cpu_workers": 6,
-                "stage1_parse_workers": 6,
-                "stage1_enrich_dns_concurrency": 144,
-                "stage1_enrich_rdap_concurrency": 8,
-                "stage1_enrich_tls_concurrency": 24,
-                "stage1_fetch_queue_max": 6000,
-                "stage1_cpu_queue_max": 3000,
-                "stage1_parse_queue_max": 3000,
-                "stage1_score_queue_max": 3000,
-                "stage1_enrich_queue_max": 3000,
-                "stage1_result_queue_max": 3000,
-                "stage1_control_interval_seconds": 2.0,
-            },
-            "reliability": {},
-        },
-    }
-    selected = profiles[resolved_profile]
-    return {
-        "name": resolved_profile,
-        "requested_profile": requested_profile,
-        "resolved_profile": resolved_profile,
-        "resource_info": resource_info,
-        "env": dict(selected["env"]),
-        "stage1_http": dict(selected["stage1_http"]),
-        "reliability": dict(selected.get("reliability") or {}),
-    }
+    return resolve_runtime_profile(profile, resource_info=resource_info)
 
 
 def _apply_runtime_profile_env(settings: dict[str, Any]) -> None:
-    for key, value in (settings.get("env") or {}).items():
-        os.environ[str(key)] = str(value)
+    from phishing_pipeline.config import apply_runtime_profile_env
+
+    apply_runtime_profile_env(settings)
 
 
-def _apply_stage1_http_runtime_profile(stage1_http_config: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
-    stage1_http_config.update(settings.get("stage1_http") or {})
-    return stage1_http_config
+# UNUSED_IN_PROD_RAY_FLOW: dead wrapper after controller switched to direct config resolvers.
+# def _apply_stage1_http_runtime_profile(stage1_http_config: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
+#     from phishing_pipeline.config import resolve_stage1_http_config
+#
+#     resolved = resolve_stage1_http_config(stage1_http_config, runtime_profile_settings=settings)
+#     stage1_http_config.clear()
+#     stage1_http_config.update(resolved)
+#     return stage1_http_config
 
 
-def _apply_reliability_runtime_profile(reliability_config: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
-    reliability_config.update(settings.get("reliability") or {})
-    return reliability_config
+# UNUSED_IN_PROD_RAY_FLOW: dead wrapper after controller switched to direct config resolvers.
+# def _apply_reliability_runtime_profile(reliability_config: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
+#     from phishing_pipeline.config import resolve_reliability_config
+#
+#     resolved = resolve_reliability_config(reliability_config, runtime_profile_settings=settings)
+#     reliability_config.clear()
+#     reliability_config.update(resolved)
+#     return reliability_config
 
 
 def _load_runtime_components() -> dict[str, Any]:
@@ -466,13 +206,11 @@ def _load_runtime_components() -> dict[str, Any]:
         "package_results": None,
         "shortlisting": None,
         "run_hashing_shortlist_async": None,
-        "STAGE1_HTTP_CONFIG": {},
     }
 
     try:
-        from phishing_pipeline.config import FINAL_OUTPUT, STAGE1_HTTP_CONFIG
+        from phishing_pipeline.config import FINAL_OUTPUT
         components["FINAL_OUTPUT"] = FINAL_OUTPUT
-        components["STAGE1_HTTP_CONFIG"] = STAGE1_HTTP_CONFIG
     except Exception as exc:
         logger.warning("Could not import FINAL_OUTPUT from config: %s", exc)
 
@@ -721,7 +459,12 @@ async def main():
         logger.info("    heartbeats will be logged with [RAY-DEBUG] prefix.")
         logger.info("=" * 80 + "\n")
 
-    from phishing_pipeline.config import OUTPUT_DIR, RELIABILITY_CONFIG, RUN_MANIFEST_CSV
+    from phishing_pipeline.config import (
+        OUTPUT_DIR,
+        RUN_MANIFEST_CSV,
+        resolve_reliability_config,
+        resolve_stage1_http_config,
+    )
     from phishing_pipeline.reliability import (
         CheckpointStore,
         build_run_context,
@@ -732,7 +475,7 @@ async def main():
     )
 
     runtime_profile_settings = _resolve_runtime_profile_settings(args.runtime_profile)
-    reliability_config = _apply_reliability_runtime_profile(dict(RELIABILITY_CONFIG), runtime_profile_settings)
+    reliability_config = resolve_reliability_config(runtime_profile_settings=runtime_profile_settings)
 
     reliability_metadata = {
         "shortlisting": os.path.abspath(args.shortlisting),
@@ -831,11 +574,13 @@ async def main():
     package_results = components["package_results"]
     shortlisting = components["shortlisting"]
     run_hashing_shortlist_async = components["run_hashing_shortlist_async"]
-    stage1_http_config = components["STAGE1_HTTP_CONFIG"] or {}
-    _apply_stage1_http_runtime_profile(stage1_http_config, runtime_profile_settings)
+    stage1_http_config = resolve_stage1_http_config(runtime_profile_settings=runtime_profile_settings)
     ray_runtime = None
+    ray_runtime_config = {}
     if execution_backend == "ray":
         from phishing_pipeline import ray_runtime as ray_runtime
+        from phishing_pipeline.config import resolve_ray_runtime_config
+        ray_runtime_config = resolve_ray_runtime_config()
     effective_runtime_snapshot = {
         "requested_progress_mode": requested_progress_mode,
         "effective_progress_mode": effective_progress_mode,
@@ -846,12 +591,7 @@ async def main():
         "trace_record_key": str(args.trace_record_key or ""),
         "trace_url": str(args.trace_url or ""),
     }
-    if execution_backend == "ray":
-        from phishing_pipeline.config import resolve_ray_runtime_config
-
-        effective_runtime_snapshot["ray_runtime_config"] = resolve_ray_runtime_config()
-    else:
-        effective_runtime_snapshot["ray_runtime_config"] = {}
+    effective_runtime_snapshot["ray_runtime_config"] = dict(ray_runtime_config or {})
     write_run_artifact_json(
         run_context,
         "effective_args_json",
@@ -896,8 +636,7 @@ async def main():
     # --- Ray debug startup diagnostic ---
     if getattr(args, "ray_debug", False) and execution_backend == "ray":
         resource_info = _probe_runtime_resources()
-        from phishing_pipeline.config import resolve_ray_runtime_config
-        ray_cfg = resolve_ray_runtime_config()
+        ray_cfg = dict(ray_runtime_config or {})
         actor_cpu_total = (
             ray_cfg["stage1_fetch_actors"] * 0.25
             + ray_cfg["stage1_enrich_actors"] * 0.25
@@ -939,15 +678,20 @@ async def main():
     ):
         raise ValueError("failed-fetch-suspected-min must be >= failed-fetch-review-min")
     logger.info(
-        "Runtime profile requested=%s resolved=%s | host={cpu=%s,ram_gb=%.1f,vram_gb=%.1f,platform=%s} | hash_env=%s | stage1_http_overrides=%s",
+        "Runtime profile requested=%s resolved=%s | host={cpu=%s,ram_gb=%.1f,vram_gb=%.1f,platform=%s} | ray={fetch_actors=%s,enrich_actors=%s,browser_actors=%s,classify_actors=%s,stage0_inflight=%s,prewarm=%s,dynamic_control=%s}",
         runtime_profile_settings["requested_profile"],
         runtime_profile_settings["resolved_profile"],
         runtime_profile_settings["resource_info"].get("cpu_cores", "NA"),
         float(runtime_profile_settings["resource_info"].get("ram_gb", 0.0) or 0.0),
         float(runtime_profile_settings["resource_info"].get("vram_gb", 0.0) or 0.0),
         runtime_profile_settings["resource_info"].get("platform", "unknown"),
-        runtime_profile_settings.get("env", {}),
-        runtime_profile_settings.get("stage1_http", {}),
+        (ray_runtime_config or {}).get("stage1_fetch_actors", "NA"),
+        (ray_runtime_config or {}).get("stage1_enrich_actors", "NA"),
+        (ray_runtime_config or {}).get("hash_browser_actors", "NA"),
+        (ray_runtime_config or {}).get("classify_actors", "NA"),
+        (ray_runtime_config or {}).get("stage0_inflight", "NA"),
+        (ray_runtime_config or {}).get("prewarm_mode", "NA"),
+        (ray_runtime_config or {}).get("enable_dynamic_control", "NA"),
     )
     logger.info(
         "Effective runtime concurrency | hash={pages=%s,page_concurrency=%s,http_limit=%s,aux_net_limit=%s,active_fetch_floor=%s} | stage1_http={url=%s,http=%s,dns=%s,rdap=%s,tls=%s}",
@@ -971,7 +715,7 @@ async def main():
         runtime_profile_settings.get("env", {}).get("PHISHING_HASH_ACTIVE_PAGES_FLOOR", "NA"),
     )
     logger.info(
-        "Stage1 lane topology | tiered_fast_path=%s | dns_reuse=%s | final_domain_dns_fallback=%s | fetch={start=%s,max=%s,floor=%s,conn=%s,keepalive=%s,per_host=%s} | cpu_workers=%s | enrich={dns=%s,rdap=%s,tls=%s} | queues={fetch=%s,cpu=%s,parse=%s,score=%s,enrich=%s,result=%s}",
+        "Stage1 lane topology | tiered_fast_path=%s | dns_reuse=%s | final_domain_dns_fallback=%s | fetch={start=%s,max=%s,floor=%s,conn=%s,keepalive=%s,per_host=%s} | cpu_workers=%s | enrich={dns=%s,rdap=%s,tls=%s} | queues={fetch=%s,cpu=%s,enrich=%s,result=%s}",
         stage1_http_config.get("stage1_enable_tiered_fast_path", False),
         True,
         True,
@@ -987,8 +731,6 @@ async def main():
         stage1_http_config.get("stage1_enrich_tls_concurrency", "NA"),
         stage1_http_config.get("stage1_fetch_queue_max", "NA"),
         stage1_http_config.get("stage1_cpu_queue_max", "NA"),
-        stage1_http_config.get("stage1_parse_queue_max", "NA"),
-        stage1_http_config.get("stage1_score_queue_max", "NA"),
         stage1_http_config.get("stage1_enrich_queue_max", "NA"),
         stage1_http_config.get("stage1_result_queue_max", "NA"),
     )

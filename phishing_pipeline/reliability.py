@@ -580,32 +580,34 @@ def _append_csv_rows(path: str, fieldnames: tuple[str, ...] | list[str], rows: l
         raise last_exc
 
 
-def _copy_csv_atomic(src_path: str, dst_path: str, fieldnames: tuple[str, ...] | list[str]) -> None:
-    if not os.path.exists(src_path):
-        _write_csv_atomic(dst_path, fieldnames, [])
-        return
-    directory = os.path.dirname(dst_path) or "."
-    os.makedirs(directory, exist_ok=True)
-    last_exc: BaseException | None = None
-    for attempt_index in range(_CSV_WRITE_RETRY_ATTEMPTS):
-        temp_path = f"{dst_path}.{os.getpid()}.{threading.get_ident()}.{attempt_index}.tmp"
-        try:
-            with open(src_path, "r", newline="", encoding="utf-8") as src, open(temp_path, "w", newline="", encoding="utf-8") as dst:
-                shutil.copyfileobj(src, dst)
-            _replace_file_atomic(temp_path, dst_path)
-            return
-        except Exception as exc:
-            last_exc = exc
-            try:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-            except Exception:
-                pass
-            if attempt_index >= (_CSV_WRITE_RETRY_ATTEMPTS - 1) or not _is_retryable_filesystem_error(exc):
-                raise
-            time.sleep(_retryable_write_delay(attempt_index))
-    if last_exc is not None:
-        raise last_exc
+# UNUSED_IN_CURRENT_WORKFLOW: definition-only private copy helper; current reliability writers
+# use _write_csv_atomic(), sync_run_artifact(), and append/export paths instead.
+# def _copy_csv_atomic(src_path: str, dst_path: str, fieldnames: tuple[str, ...] | list[str]) -> None:
+#     if not os.path.exists(src_path):
+#         _write_csv_atomic(dst_path, fieldnames, [])
+#         return
+#     directory = os.path.dirname(dst_path) or "."
+#     os.makedirs(directory, exist_ok=True)
+#     last_exc: BaseException | None = None
+#     for attempt_index in range(_CSV_WRITE_RETRY_ATTEMPTS):
+#         temp_path = f"{dst_path}.{os.getpid()}.{threading.get_ident()}.{attempt_index}.tmp"
+#         try:
+#             with open(src_path, "r", newline="", encoding="utf-8") as src, open(temp_path, "w", newline="", encoding="utf-8") as dst:
+#                 shutil.copyfileobj(src, dst)
+#             _replace_file_atomic(temp_path, dst_path)
+#             return
+#         except Exception as exc:
+#             last_exc = exc
+#             try:
+#                 if os.path.exists(temp_path):
+#                     os.remove(temp_path)
+#             except Exception:
+#                 pass
+#             if attempt_index >= (_CSV_WRITE_RETRY_ATTEMPTS - 1) or not _is_retryable_filesystem_error(exc):
+#                 raise
+#             time.sleep(_retryable_write_delay(attempt_index))
+#     if last_exc is not None:
+#         raise last_exc
 
 
 def _write_json_atomic(path: str, payload: Any) -> None:

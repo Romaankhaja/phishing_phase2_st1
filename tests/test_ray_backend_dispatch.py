@@ -234,3 +234,16 @@ class RayBackendDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(target["redirect_promoted"])
         self.assertEqual(target["effective_url"], "https://login.example.com/start")
         self.assertEqual(target["effective_host"], "login.example.com")
+
+    def test_effective_detection_target_promotes_failed_cross_domain_final_url(self):
+        target = pipeline._resolve_effective_detection_target(
+            {
+                "Identified Phishing/Suspected Domain Name": "https://crsor.info",
+                "final_landing_url": "https://dcc.crsorgi.gov.in.crsor.info/crs/",
+                "fetch_status": "failed",
+            }
+        )
+
+        self.assertTrue(target["redirect_promoted"])
+        self.assertEqual(target["effective_url"], "https://dcc.crsorgi.gov.in.crsor.info/crs/")
+        self.assertEqual(target["effective_host"], "dcc.crsorgi.gov.in.crsor.info")

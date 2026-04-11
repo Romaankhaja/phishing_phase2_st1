@@ -750,6 +750,9 @@ def move_screenshot_to_evidence(domain_url, pdf_path):
 # ------------------------------------------------------------------
 # Classification (infra + visual)
 # ------------------------------------------------------------------
+# UNUSED_IN_PROD_RAY_FLOW: shadowed duplicate retained only in history; the precision-first definition below
+# replaces this entire body at module import time, so this block is unreachable in the live pipeline.
+'''
 def reclassify_label(domain, registrar, host, dns, ocr_text_from_csv, tvc_brand_spoofed=False):
     """
     Re-classifies the label using heuristics.
@@ -800,6 +803,7 @@ def reclassify_label(domain, registrar, host, dns, ocr_text_from_csv, tvc_brand_
 
     # Default to Legitimate ONLY if valid data exists and no red flags found
     return "Legitimate"
+'''
 
 
 # Override the legacy helper above with the current precision-first policy.
@@ -905,16 +909,18 @@ def _normalize_evidence_tier(row: dict) -> str:
     return "weak_evidence"
 
 
-def _is_suspicious_infra(registrar, hosting_isp):
-    reg = str(registrar or "").lower()
-    isp = str(hosting_isp or "").lower()
-    return any(r in reg for r in SUSPICIOUS_REGISTRARS) or any(h in isp for h in SUSPICIOUS_HOSTS)
-
-
-def _is_trusted_infra(registrar, hosting_isp):
-    reg = str(registrar or "").lower()
-    isp = str(hosting_isp or "").lower()
-    return any(r in reg for r in TRUSTED_REGISTRARS) or any(h in isp for h in TRUSTED_HOSTS)
+# UNUSED_IN_CURRENT_WORKFLOW: unused private helpers; current hybrid classification
+# evaluates infrastructure trust inline and never calls these wrappers.
+# def _is_suspicious_infra(registrar, hosting_isp):
+#     reg = str(registrar or "").lower()
+#     isp = str(hosting_isp or "").lower()
+#     return any(r in reg for r in SUSPICIOUS_REGISTRARS) or any(h in isp for h in SUSPICIOUS_HOSTS)
+#
+#
+# def _is_trusted_infra(registrar, hosting_isp):
+#     reg = str(registrar or "").lower()
+#     isp = str(hosting_isp or "").lower()
+#     return any(r in reg for r in TRUSTED_REGISTRARS) or any(h in isp for h in TRUSTED_HOSTS)
 
 
 def _as_bool_flag(value) -> bool:
@@ -969,15 +975,25 @@ def _registered_domain_value(host: str) -> str:
 def _resolve_effective_detection_target(row: dict) -> dict[str, str | bool]:
     original_url = str(row.get("Identified Phishing/Suspected Domain Name", "") or "").strip()
     final_landing_url = str(row.get("final_landing_url", "") or "").strip()
-    fetch_status = str(row.get("fetch_status", "") or "").strip().lower()
     original_host = _normalize_host_value(original_url)
     final_host = _normalize_host_value(final_landing_url)
+    original_labels = [label for label in original_host.split(".") if label]
+    final_labels = [label for label in final_host.split(".") if label]
+    same_tree_nested_redirect = bool(
+        original_host
+        and final_host
+        and final_host.endswith(f".{original_host}")
+        and len(final_labels) - len(original_labels) >= 2
+    )
     redirect_promoted = bool(
-        fetch_status in {"fetched", "fetched_visual_missing"}
-        and final_landing_url
+        final_landing_url
         and final_host
         and final_host != original_host
-        and _registered_domain_value(final_host) != _registered_domain_value(original_host)
+        and (
+            _registered_domain_value(final_host) != _registered_domain_value(original_host)
+            or _as_bool_flag(row.get("deceptive_host_embedding"))
+            or same_tree_nested_redirect
+        )
     )
     effective_url = final_landing_url if redirect_promoted else (original_url or final_landing_url)
     effective_host = final_host if redirect_promoted else (original_host or final_host)
@@ -990,6 +1006,53 @@ def _resolve_effective_detection_target(row: dict) -> dict[str, str | bool]:
         "effective_url": str(effective_url or ""),
         "effective_host": str(effective_host or ""),
     }
+
+
+def _resolve_redirect_target_flags(row: dict) -> dict[str, str | bool]:
+    target_info = _resolve_effective_detection_target(row)
+    redirect_changed = bool(target_info.get("redirect_promoted"))
+    redirect_host = str(target_info.get("effective_host", "") or "")
+    redirect_spoof = bool(redirect_changed and _as_bool_flag(row.get("deceptive_host_embedding")))
+    return {
+        "redirect_changed": redirect_changed,
+        "redirect_spoof": redirect_spoof,
+        "redirect_host": redirect_host,
+    }
+
+
+def _row_path_markers(row: dict) -> set[str]:
+    markers: set[str] = set()
+    for key in ("admission_path", "admission_reason", "survival_path"):
+        raw = str(row.get(key, "") or "")
+        markers.update(part.strip() for part in raw.split("|") if part.strip())
+    return markers
+
+
+def _requires_registration_only_enrichment(row: dict) -> bool:
+    return "dns_not_mapped_lexical_passthrough" in _row_path_markers(row)
+
+
+def _build_output_remarks(
+    *,
+    row: dict,
+    classification: str,
+    evidence_tier: str,
+    hosting_ip: str = "NA",
+) -> str:
+    hosting_ip_text = str(hosting_ip or "").strip().upper()
+    if _requires_registration_only_enrichment(row) and hosting_ip_text in {"", "NA", "N/A", "NONE"}:
+        return "not_mapped_to_ip; webpage rendering skipped because the domain did not resolve to an active IP."
+    redirect_flags = _resolve_redirect_target_flags(row)
+    redirect_host = str(redirect_flags.get("redirect_host", "") or "")
+    if bool(redirect_flags.get("redirect_spoof")) and redirect_host:
+        return f"redirect_target_spoofs_cse; redirected_to={redirect_host}."
+    if bool(redirect_flags.get("redirect_changed")) and redirect_host and classification in {"Phishing", "Suspected"}:
+        return f"redirected_to={redirect_host}; lexical_redirect_suspected."
+    if classification == "Legitimate":
+        return "non_aligned_or_weak_cse_similarity; NA values are due to privacy issues."
+    if evidence_tier == "weak_evidence":
+        return "weak_or_single_signal_match; NA values are due to privacy issues."
+    return "NA values are due to privacy issues."
 
 
 _REVIEW_QUEUE_KEY_COLUMNS = [
@@ -1303,6 +1366,9 @@ def _hybrid_hash_decision(
         return decision
 
     parked_sale_signal = _has_parked_sale_evidence(row)
+    redirect_flags = _resolve_redirect_target_flags(row)
+    redirect_changed = bool(redirect_flags.get("redirect_changed"))
+    redirect_spoof = bool(redirect_flags.get("redirect_spoof"))
     network_corroborated = _has_network_corroboration(
         row,
         registrar=registrar,
@@ -1317,6 +1383,18 @@ def _hybrid_hash_decision(
     )
 
     if not fetched:
+        if lexical_survivor and redirect_spoof:
+            decision["classification"] = "Phishing"
+            decision["emit_output"] = True
+            decision["classification_gate_reason"] = "redirected_cse_spoof_host"
+            decision["non_lexical_corroboration_count"] = 1 + int(parked_sale_signal) + int(network_corroborated)
+            return decision
+        if lexical_survivor and redirect_changed:
+            decision["classification"] = "Suspected"
+            decision["emit_output"] = True
+            decision["classification_gate_reason"] = "redirected_lexical_suspected"
+            decision["non_lexical_corroboration_count"] = 1 + int(parked_sale_signal) + int(network_corroborated)
+            return decision
         if lexical_survivor and (parked_sale_signal or network_corroborated):
             decision["classification"] = "Suspected"
             decision["emit_output"] = True
@@ -1376,6 +1454,20 @@ def _hybrid_hash_decision(
     ]
     non_lexical_corroboration_count = sum(1 for flag in non_lexical_corroborators if flag)
     decision["non_lexical_corroboration_count"] = non_lexical_corroboration_count
+
+    if lexical_survivor and redirect_spoof:
+        decision["classification"] = "Phishing"
+        decision["emit_output"] = True
+        decision["classification_gate_reason"] = "redirected_cse_spoof_host"
+        decision["non_lexical_corroboration_count"] = max(non_lexical_corroboration_count, 1)
+        return decision
+
+    if lexical_survivor and redirect_changed:
+        decision["classification"] = "Suspected"
+        decision["emit_output"] = True
+        decision["classification_gate_reason"] = "redirected_lexical_suspected"
+        decision["non_lexical_corroboration_count"] = max(non_lexical_corroboration_count, 1)
+        return decision
 
     if strict_lexical_hit and strong_direct_evidence:
         decision["classification"] = "Phishing"
@@ -1676,7 +1768,8 @@ async def _run_hash_only_pipeline(
         source_workbook = str(row.get("source_workbook", "") or "")
         confidence_band = row.get("confidence_band", "Low")
         evidence_tier = _normalize_evidence_tier(row)
-        if fetch_status not in eligible_fetch_statuses:
+        registration_only_enrichment = _requires_registration_only_enrichment(row)
+        if fetch_status not in eligible_fetch_statuses and not registration_only_enrichment:
             classification_decision = _hybrid_hash_decision(
                 row,
                 registrar="NA",
@@ -1726,7 +1819,12 @@ async def _run_hash_only_pipeline(
                     "Date of detection (DD-MM-YYYY)": datetime.now().strftime("%d-%m-%Y"),
                     "Time of detection (HH-MM-SS)": datetime.now().strftime("%H:%M:%S"),
                     "Date of Post (If detection is from Source: social media)": "NA",
-                    "Remarks": "weak_or_single_signal_match; NA values are due to privacy issues.",
+                    "Remarks": _build_output_remarks(
+                        row=row,
+                        classification=classification,
+                        evidence_tier=evidence_tier,
+                        hosting_ip="NA",
+                    ),
                 }
             async with records_lock:
                 if flagged_output and record is not None:
@@ -1897,11 +1995,14 @@ async def _run_hash_only_pipeline(
             "tvc_spoof_strong": False,
         }
 
-        try:
-            net_feats = await extract_network_features_async(domain_url)
-        except Exception as exc:
-            logger.warning("Hash-only network feature extraction failed for %s: %s", domain_url, exc)
+        if registration_only_enrichment:
             net_feats = {}
+        else:
+            try:
+                net_feats = await extract_network_features_async(domain_url)
+            except Exception as exc:
+                logger.warning("Hash-only network feature extraction failed for %s: %s", domain_url, exc)
+                net_feats = {}
 
         brand_model_top1 = "NA"
         brand_model_confidence = 0.0
@@ -1916,15 +2017,16 @@ async def _run_hash_only_pipeline(
         resolved_ip = None
         if net_feats.get("ip_address"):
             resolved_ip = str(net_feats.get("ip_address"))
-        async with dns_sem:
-            try:
-                loop = asyncio.get_running_loop()
-                resolved_ip = await asyncio.wait_for(
-                    loop.run_in_executor(None, socket.gethostbyname, host),
-                    timeout=3.0,
-                )
-            except Exception:
-                pass
+        if not registration_only_enrichment:
+            async with dns_sem:
+                try:
+                    loop = asyncio.get_running_loop()
+                    resolved_ip = await asyncio.wait_for(
+                        loop.run_in_executor(None, socket.gethostbyname, host),
+                        timeout=3.0,
+                    )
+                except Exception:
+                    pass
 
         reg_data = None
         registration_lookup_status = "unknown"
@@ -1969,7 +2071,12 @@ async def _run_hash_only_pipeline(
                 "Date of detection (DD-MM-YYYY)": detection_date,
                 "Time of detection (HH-MM-SS)": detection_time_str,
                 "Date of Post (If detection is from Source: social media)": "NA",
-                "Remarks": "weak_or_single_signal_match; NA values are due to privacy issues.",
+                "Remarks": _build_output_remarks(
+                    row=row,
+                    classification="Suspected",
+                    evidence_tier=evidence_tier,
+                    hosting_ip="NA",
+                ),
             }
             async with records_lock:
                 records.append(record)
@@ -2078,7 +2185,7 @@ async def _run_hash_only_pipeline(
                 classify_progress.mark_completed(final_status="completed")
             return
 
-        if reg_data is None and resolved_ip is not None:
+        if reg_data is None and (resolved_ip is not None or registration_only_enrichment):
             async with whois_sem:
                 await whois_rate_limiter.acquire()
                 try:
@@ -2230,12 +2337,11 @@ async def _run_hash_only_pipeline(
             "Date of detection (DD-MM-YYYY)": detection_date,
             "Time of detection (HH-MM-SS)": detection_time_str,
             "Date of Post (If detection is from Source: social media)": "NA",
-            "Remarks": (
-                "non_aligned_or_weak_cse_similarity; NA values are due to privacy issues."
-                if classification == "Legitimate"
-                else "weak_or_single_signal_match; NA values are due to privacy issues."
-                if evidence_tier == "weak_evidence"
-                else "NA values are due to privacy issues."
+            "Remarks": _build_output_remarks(
+                row=row,
+                classification=classification,
+                evidence_tier=evidence_tier,
+                hosting_ip=ip,
             ),
         }
         async with records_lock:

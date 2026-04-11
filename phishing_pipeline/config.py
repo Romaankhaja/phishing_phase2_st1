@@ -1,10 +1,14 @@
+import copy
 import os
 import sys
+from typing import Any
 
 try:
     import psutil  # type: ignore
 except Exception:  # pragma: no cover
     psutil = None
+
+_LAST_RAY_CLAMP_LOG_SIGNATURE: str = ""
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
@@ -53,6 +57,38 @@ APPLICATION_ID = "ISS_NLP"
 
 # Evidence folder format as per PS-02
 EVIDENCE_DIR  = os.path.join(BASE_DIR, f"PS-02_{APPLICATION_ID}_Evidences")
+
+PATHS_CONFIG = {
+    "base_dir": BASE_DIR,
+    "uploads_dir": UPLOADS_DIR,
+    "root_dir": ROOT_DIR,
+    "features_csv": FEATURES_CSV,
+    "features_enrich_csv": FEATURES_ENRICH,
+    "final_output_csv": FINAL_OUTPUT,
+    "checkpoint_csv": CHECKPOINT_CSV,
+    "models_dir": MODELS_DIR,
+    "model_label_path": MODEL_LABEL_PATH,
+    "model_source_path": MODEL_SOURCE_PATH,
+    "encoder_label_path": ENCODER_LABEL_PATH,
+    "source_classes_path": SOURCE_CLASSES_PATH,
+    "feature_columns_path": FEATURE_COLUMNS_PATH,
+    "scaler_path": SCALER_PATH,
+    "imputer_path": IMPUTER_PATH,
+    "geolite_dir": GEOLITE_DIR,
+    "asn_db_path": ASN_DB_PATH,
+    "city_db_path": CITY_DB_PATH,
+    "whitelists_dir": WHITELISTS_DIR,
+    "holdout_sets_dir": HOLDOUT_SETS_DIR,
+    "output_dir": OUTPUT_DIR,
+    "checkpoints_csv": CHECKPOINTS_CSV,
+    "pipeline_run_results_csv": PIPELINE_RUN_RESULTS_CSV,
+    "pipeline_stage_events_csv": PIPELINE_STAGE_EVENTS_CSV,
+    "run_manifest_csv": RUN_MANIFEST_CSV,
+    "hash_export_dir": HASH_EXPORT_DIR,
+    "screens_dir": SCREENS_DIR,
+    "application_id": APPLICATION_ID,
+    "evidence_dir": EVIDENCE_DIR,
+}
 
 # Limits
 MAX_VARIANTS = 40
@@ -192,9 +228,470 @@ RELIABILITY_CONFIG = {
     "max_worker_restarts": 2,
 }
 
+PIPELINE_STAGE_CONFIG = {
+    "stage0": {
+        "lexical_workers": 12,
+        "batch_size": 512,
+        "inflight_batches": 8,
+        "execution_mode": "streaming-concurrent",
+        "progress_log_interval_seconds": 10,
+        "adaptive_downshift": True,
+    },
+    "stage1_http": copy.deepcopy(STAGE1_HTTP_CONFIG),
+    "hash": copy.deepcopy(HASH_STAGE_CONFIG),
+    "classify": {
+        "failed_fetch_suspected_min": None,
+        "failed_fetch_review_min": None,
+        "ocr_batch_size": 32,
+        "ocr_batch_delay_ms": 25,
+    },
+    "ray": copy.deepcopy(RAY_RUNTIME_CONFIG),
+    "reliability": copy.deepcopy(RELIABILITY_CONFIG),
+}
 
-def resolve_stage1_http_config(overrides: dict | None = None) -> dict:
-    config = dict(STAGE1_HTTP_CONFIG)
+RUNTIME_PROFILE_NAMES = (
+    "auto",
+    "default",
+    "cpu-safe",
+    "cpu-recall",
+    "cpu-fast",
+    "server-balanced",
+    "server-throughput",
+)
+
+RUNTIME_PROFILE_CONFIG: dict[str, dict[str, Any]] = {
+    "cpu-safe": {
+        "env": {
+            "PHISHING_HASH_PAGES": 16,
+            "PHISHING_HASH_PAGE_CONCURRENCY": 4,
+            "PHISHING_HASH_HTTP_LIMIT": 64,
+            "PHISHING_HASH_AUX_NET_LIMIT": 24,
+            "PHISHING_HASH_ACTIVE_PAGES_FLOOR": 6,
+            "PHISHING_LEXICAL_WORKERS": 8,
+            "PHISHING_LEXICAL_BATCH_SIZE": 256,
+            "PHISHING_LEXICAL_INFLIGHT_BATCHES": 8,
+            "PHISHING_SHORTLIST_EXECUTION_MODE": "legacy-batch",
+            "PHISHING_HASH_PROGRESS_LOG_INTERVAL_SECONDS": 10,
+            "PHISHING_HASH_ADAPTIVE_DOWNSHIFT": "true",
+        },
+        "stage1_http": {
+            "concurrency": 96,
+            "http_concurrency": 96,
+            "dns_concurrency": 96,
+            "rdap_concurrency": 4,
+            "tls_concurrency": 16,
+            "stage1_fetch_concurrency_start": 96,
+            "stage1_fetch_concurrency_max": 192,
+            "stage1_fetch_concurrency_floor": 32,
+            "stage1_http_connection_limit": 192,
+            "stage1_http_keepalive_limit": 96,
+            "stage1_per_host_limit": 4,
+            "stage1_cpu_workers": 4,
+            "stage1_parse_workers": 4,
+            "stage1_enrich_dns_concurrency": 96,
+            "stage1_enrich_rdap_concurrency": 4,
+            "stage1_enrich_tls_concurrency": 16,
+            "stage1_fetch_queue_max": 4000,
+            "stage1_cpu_queue_max": 2000,
+            "stage1_parse_queue_max": 2000,
+            "stage1_score_queue_max": 2000,
+            "stage1_enrich_queue_max": 2000,
+            "stage1_result_queue_max": 2000,
+            "stage1_control_interval_seconds": 2.0,
+        },
+        "reliability": {},
+    },
+    "server-balanced": {
+        "env": {
+            "PHISHING_HASH_PAGES": 16,
+            "PHISHING_HASH_PAGE_CONCURRENCY": 2,
+            "PHISHING_HASH_HTTP_LIMIT": 192,
+            "PHISHING_HASH_AUX_NET_LIMIT": 96,
+            "PHISHING_HASH_ACTIVE_PAGES_FLOOR": 4,
+            "PHISHING_LEXICAL_WORKERS": 16,
+            "PHISHING_LEXICAL_BATCH_SIZE": 1024,
+            "PHISHING_LEXICAL_INFLIGHT_BATCHES": 8,
+            "PHISHING_SHORTLIST_EXECUTION_MODE": "streaming-concurrent",
+            "PHISHING_HASH_PROGRESS_LOG_INTERVAL_SECONDS": 10,
+            "PHISHING_HASH_ADAPTIVE_DOWNSHIFT": "true",
+            "PHISHING_RAY_STAGE0_BATCH_SIZE": 1024,
+            "PHISHING_RAY_STAGE0_INFLIGHT": 4,
+            "PHISHING_RAY_STAGE1_FETCH_ACTORS": 12,
+            "PHISHING_RAY_STAGE1_ENRICH_ACTORS": 6,
+            "PHISHING_RAY_HASH_BROWSER_ACTORS": 8,
+            "PHISHING_RAY_HASH_TABS_PER_ACTOR": 2,
+            "PHISHING_RAY_HASH_FINALIZE_BATCH": 32,
+            "PHISHING_RAY_CLASSIFY_ACTORS": 8,
+            "PHISHING_RAY_CLASSIFY_INFLIGHT": 8,
+            "PHISHING_RAY_OCR_ACTORS": 1,
+            "PHISHING_RAY_STAGE1_FETCH_ACTOR_MAX_CONCURRENCY": 4,
+            "PHISHING_RAY_STAGE1_ENRICH_ACTOR_MAX_CONCURRENCY": 2,
+            "PHISHING_RAY_STAGE1_PENDING_CAP": 48,
+            "PHISHING_RAY_HASH_PENDING_CAP": 16,
+            "PHISHING_RAY_STAGE1_HTTP_CONNECTION_CAP": 192,
+            "PHISHING_RAY_STAGE1_HTTP_KEEPALIVE_CAP": 96,
+            "PHISHING_RAY_OCR_BATCH_SIZE": 32,
+            "PHISHING_RAY_OCR_BATCH_DELAY_MS": 25,
+            "PHISHING_RAY_PREWARM_MODE": "staged",
+            "PHISHING_RAY_PREWARM_ACTORS": "true",
+            "PHISHING_RAY_ENABLE_DYNAMIC_CONTROL": "true",
+            "PHISHING_RAY_TARGET_CPU_UTILIZATION": "0.82",
+            "PHISHING_RAY_CPU_HEADROOM_CORES": "6",
+        },
+        "stage1_http": {
+            "concurrency": 96,
+            "http_concurrency": 192,
+            "dns_concurrency": 192,
+            "rdap_concurrency": 16,
+            "tls_concurrency": 64,
+            "stage1_target_urls_per_sec": 1200,
+            "stage1_fetch_concurrency_start": 48,
+            "stage1_fetch_concurrency_max": 192,
+            "stage1_fetch_concurrency_floor": 24,
+            "stage1_http_connection_limit": 192,
+            "stage1_http_keepalive_limit": 96,
+            "stage1_per_host_limit": 4,
+            "stage1_cpu_workers": 12,
+            "stage1_parse_workers": 12,
+            "stage1_enrich_dns_concurrency": 192,
+            "stage1_enrich_rdap_concurrency": 16,
+            "stage1_enrich_tls_concurrency": 64,
+            "stage1_fetch_queue_max": 4000,
+            "stage1_cpu_queue_max": 2000,
+            "stage1_parse_queue_max": 2000,
+            "stage1_score_queue_max": 2000,
+            "stage1_enrich_queue_max": 2000,
+            "stage1_result_queue_max": 4000,
+            "stage1_control_interval_seconds": 2.0,
+        },
+        "reliability": {
+            "append_flush_interval_seconds": 10,
+            "append_flush_row_interval": 10000,
+            "snapshot_flush_interval_seconds": 60,
+            "snapshot_flush_row_interval": 50000,
+        },
+    },
+    "server-throughput": {
+        "env": {
+            "PHISHING_HASH_PAGES": 48,
+            "PHISHING_HASH_PAGE_CONCURRENCY": 4,
+            "PHISHING_HASH_HTTP_LIMIT": 384,
+            "PHISHING_HASH_AUX_NET_LIMIT": 192,
+            "PHISHING_HASH_ACTIVE_PAGES_FLOOR": 16,
+            "PHISHING_LEXICAL_WORKERS": 32,
+            "PHISHING_LEXICAL_BATCH_SIZE": 2048,
+            "PHISHING_LEXICAL_INFLIGHT_BATCHES": 16,
+            "PHISHING_SHORTLIST_EXECUTION_MODE": "streaming-concurrent",
+            "PHISHING_HASH_PROGRESS_LOG_INTERVAL_SECONDS": 10,
+            "PHISHING_HASH_ADAPTIVE_DOWNSHIFT": "true",
+            "PHISHING_RAY_STAGE0_BATCH_SIZE": 2048,
+            "PHISHING_RAY_STAGE0_INFLIGHT": 16,
+            "PHISHING_RAY_STAGE1_FETCH_ACTORS": 24,
+            "PHISHING_RAY_STAGE1_ENRICH_ACTORS": 12,
+            "PHISHING_RAY_HASH_BROWSER_ACTORS": 12,
+            "PHISHING_RAY_HASH_TABS_PER_ACTOR": 4,
+            "PHISHING_RAY_HASH_FINALIZE_BATCH": 64,
+            "PHISHING_RAY_CLASSIFY_ACTORS": 16,
+            "PHISHING_RAY_CLASSIFY_INFLIGHT": 64,
+            "PHISHING_RAY_OCR_ACTORS": 1,
+            "PHISHING_RAY_STAGE1_FETCH_ACTOR_MAX_CONCURRENCY": 8,
+            "PHISHING_RAY_STAGE1_ENRICH_ACTOR_MAX_CONCURRENCY": 6,
+            "PHISHING_RAY_STAGE1_PENDING_CAP": 384,
+            "PHISHING_RAY_HASH_PENDING_CAP": 96,
+            "PHISHING_RAY_STAGE1_HTTP_CONNECTION_CAP": 1536,
+            "PHISHING_RAY_STAGE1_HTTP_KEEPALIVE_CAP": 768,
+            "PHISHING_RAY_OCR_BATCH_SIZE": 32,
+            "PHISHING_RAY_OCR_BATCH_DELAY_MS": 25,
+            "PHISHING_RAY_PREWARM_ACTORS": "true",
+        },
+        "stage1_http": {
+            "concurrency": 384,
+            "http_concurrency": 1536,
+            "dns_concurrency": 512,
+            "rdap_concurrency": 32,
+            "tls_concurrency": 128,
+            "stage1_target_urls_per_sec": 2500,
+            "stage1_fetch_concurrency_start": 384,
+            "stage1_fetch_concurrency_max": 1536,
+            "stage1_fetch_concurrency_floor": 96,
+            "stage1_http_connection_limit": 1536,
+            "stage1_http_keepalive_limit": 768,
+            "stage1_per_host_limit": 4,
+            "stage1_cpu_workers": 24,
+            "stage1_parse_workers": 24,
+            "stage1_enrich_dns_concurrency": 512,
+            "stage1_enrich_rdap_concurrency": 32,
+            "stage1_enrich_tls_concurrency": 128,
+            "stage1_fetch_queue_max": 12000,
+            "stage1_cpu_queue_max": 8000,
+            "stage1_parse_queue_max": 8000,
+            "stage1_score_queue_max": 6000,
+            "stage1_enrich_queue_max": 8000,
+            "stage1_result_queue_max": 12000,
+            "stage1_control_interval_seconds": 2.0,
+        },
+        "reliability": {
+            "append_flush_interval_seconds": 10,
+            "append_flush_row_interval": 10000,
+            "snapshot_flush_interval_seconds": 60,
+            "snapshot_flush_row_interval": 50000,
+        },
+    },
+    "cpu-fast": {
+        "env": {
+            "PHISHING_HASH_PAGES": 24,
+            "PHISHING_HASH_PAGE_CONCURRENCY": 4,
+            "PHISHING_HASH_HTTP_LIMIT": 96,
+            "PHISHING_HASH_AUX_NET_LIMIT": 40,
+            "PHISHING_HASH_ACTIVE_PAGES_FLOOR": 8,
+            "PHISHING_LEXICAL_WORKERS": 12,
+            "PHISHING_LEXICAL_BATCH_SIZE": 512,
+            "PHISHING_LEXICAL_INFLIGHT_BATCHES": 12,
+            "PHISHING_SHORTLIST_EXECUTION_MODE": "streaming-concurrent",
+            "PHISHING_HASH_PROGRESS_LOG_INTERVAL_SECONDS": 10,
+            "PHISHING_HASH_ADAPTIVE_DOWNSHIFT": "true",
+        },
+        "stage1_http": {
+            "concurrency": 144,
+            "http_concurrency": 144,
+            "dns_concurrency": 144,
+            "rdap_concurrency": 8,
+            "tls_concurrency": 24,
+            "stage1_fetch_concurrency_start": 192,
+            "stage1_fetch_concurrency_max": 384,
+            "stage1_fetch_concurrency_floor": 48,
+            "stage1_http_connection_limit": 384,
+            "stage1_http_keepalive_limit": 128,
+            "stage1_per_host_limit": 4,
+            "stage1_cpu_workers": 6,
+            "stage1_parse_workers": 6,
+            "stage1_enrich_dns_concurrency": 144,
+            "stage1_enrich_rdap_concurrency": 8,
+            "stage1_enrich_tls_concurrency": 24,
+            "stage1_fetch_queue_max": 6000,
+            "stage1_cpu_queue_max": 3000,
+            "stage1_parse_queue_max": 3000,
+            "stage1_score_queue_max": 3000,
+            "stage1_enrich_queue_max": 3000,
+            "stage1_result_queue_max": 3000,
+            "stage1_control_interval_seconds": 2.0,
+        },
+        "reliability": {},
+    },
+}
+
+ENV_BINDINGS = {
+    "PHISHING_HASH_PAGES": {"section": "hash", "key": "hash_pages", "type": "int"},
+    "PHISHING_HASH_PAGE_CONCURRENCY": {"section": "hash", "key": "hash_page_concurrency", "type": "int"},
+    "PHISHING_HASH_HTTP_LIMIT": {"section": "hash", "key": "hash_http_limit", "type": "int"},
+    "PHISHING_HASH_AUX_NET_LIMIT": {"section": "hash", "key": "hash_aux_net_limit", "type": "int"},
+    "PHISHING_HASH_ACTIVE_PAGES_FLOOR": {"section": "hash", "key": "hash_active_pages_floor", "type": "int"},
+    "PHISHING_HASH_PROGRESS_LOG_INTERVAL_SECONDS": {"section": "hash", "key": "hash_progress_log_interval_seconds", "type": "int"},
+    "PHISHING_LEXICAL_WORKERS": {"section": "stage0", "key": "lexical_workers", "type": "int"},
+    "PHISHING_LEXICAL_BATCH_SIZE": {"section": "stage0", "key": "batch_size", "type": "int"},
+    "PHISHING_LEXICAL_INFLIGHT_BATCHES": {"section": "stage0", "key": "inflight_batches", "type": "int"},
+    "PHISHING_SHORTLIST_EXECUTION_MODE": {"section": "stage0", "key": "execution_mode", "type": "str"},
+    "PHISHING_HASH_ADAPTIVE_DOWNSHIFT": {"section": "stage0", "key": "adaptive_downshift", "type": "bool"},
+    **{
+        env_name: {"section": "ray", "key": config_key, "type": "auto"}
+        for env_name, config_key in RAY_ENV_TO_CONFIG_KEY.items()
+    },
+}
+
+CLI_OVERRIDE_KEYS = (
+    "runtime_profile",
+    "telemetry_mode",
+    "trace_record_key",
+    "trace_url",
+    "stage1_failure_policy",
+    "stall_threshold_seconds",
+)
+
+
+def probe_runtime_resources() -> dict[str, Any]:
+    cpu_cores = os.cpu_count() or 4
+    ram_gb = 0.0
+    vram_gb = 0.0
+
+    if psutil is not None:
+        try:
+            ram_gb = float(psutil.virtual_memory().total / (1024 ** 3))
+        except Exception:
+            ram_gb = 0.0
+
+    try:
+        import torch  # type: ignore
+
+        if torch.cuda.is_available():
+            vram_gb = float(torch.cuda.get_device_properties(0).total_memory / (1024 ** 3))
+    except Exception:
+        vram_gb = 0.0
+
+    return {
+        "cpu_cores": int(cpu_cores),
+        "ram_gb": float(ram_gb),
+        "vram_gb": float(vram_gb),
+        "platform": sys.platform,
+    }
+
+
+def _resolve_auto_runtime_profile(resource_info: dict[str, Any] | None = None) -> str:
+    resource_info = dict(resource_info or probe_runtime_resources())
+    cpu_cores = int(resource_info.get("cpu_cores", 0) or 0)
+    ram_gb = float(resource_info.get("ram_gb", 0.0) or 0.0)
+    vram_gb = float(resource_info.get("vram_gb", 0.0) or 0.0)
+
+    if cpu_cores >= 32 and ram_gb >= 128.0:
+        return "server-balanced"
+    if cpu_cores <= 16 or ram_gb < 16.0 or (0.0 < vram_gb <= 6.0):
+        return "cpu-safe"
+    return "cpu-fast"
+
+
+def resolve_runtime_profile(
+    profile_name: str,
+    *,
+    resource_info: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    requested_profile = str(profile_name or "auto").strip().lower()
+    if requested_profile not in RUNTIME_PROFILE_NAMES:
+        raise ValueError(f"runtime profile must be one of {sorted(RUNTIME_PROFILE_NAMES)}")
+    resource_info = dict(resource_info or probe_runtime_resources())
+    resolved_profile = (
+        _resolve_auto_runtime_profile(resource_info)
+        if requested_profile in {"auto", "default"}
+        else requested_profile
+    )
+    if resolved_profile == "cpu-recall":
+        resolved_profile = "server-throughput"
+    selected = RUNTIME_PROFILE_CONFIG[resolved_profile]
+    return {
+        "name": resolved_profile,
+        "requested_profile": requested_profile,
+        "resolved_profile": resolved_profile,
+        "resource_info": resource_info,
+        "env": copy.deepcopy(selected.get("env") or {}),
+        "stage1_http": copy.deepcopy(selected.get("stage1_http") or {}),
+        "reliability": copy.deepcopy(selected.get("reliability") or {}),
+    }
+
+
+def apply_runtime_profile_env(settings: dict[str, Any]) -> None:
+    for key, value in (settings.get("env") or {}).items():
+        os.environ[str(key)] = str(value)
+
+
+def _coerce_env_binding_value(value: Any, value_type: str) -> Any:
+    if value_type == "int":
+        return int(value)
+    if value_type == "float":
+        return float(value)
+    if value_type == "bool":
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+    if value_type == "str":
+        return str(value)
+    return value
+
+
+def _resolve_stage_env_overrides(
+    *,
+    section_name: str,
+    runtime_profile_settings: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    env_overrides = dict((runtime_profile_settings or {}).get("env") or {})
+    resolved: dict[str, Any] = {}
+    for env_name, metadata in ENV_BINDINGS.items():
+        if str(metadata.get("section", "") or "") != section_name:
+            continue
+        if env_name not in env_overrides:
+            continue
+        resolved[str(metadata["key"])] = _coerce_env_binding_value(
+            env_overrides[env_name],
+            str(metadata.get("type", "auto") or "auto"),
+        )
+    return resolved
+
+
+def resolve_reliability_config(
+    overrides: dict[str, Any] | None = None,
+    *,
+    profile_name: str | None = None,
+    resource_info: dict[str, Any] | None = None,
+    runtime_profile_settings: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    config = copy.deepcopy(PIPELINE_STAGE_CONFIG["reliability"])
+    settings = runtime_profile_settings
+    if settings is None and profile_name:
+        settings = resolve_runtime_profile(profile_name, resource_info=resource_info)
+    config.update(copy.deepcopy((settings or {}).get("reliability") or {}))
+    for key, value in dict(overrides or {}).items():
+        if value is None:
+            continue
+        config[key] = value
+    return config
+
+
+def resolve_stage_config(
+    overrides: dict[str, Any] | None = None,
+    *,
+    profile_name: str | None = None,
+    resource_info: dict[str, Any] | None = None,
+    runtime_profile_settings: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    settings = runtime_profile_settings
+    if settings is None and profile_name:
+        settings = resolve_runtime_profile(profile_name, resource_info=resource_info)
+    overrides = dict(overrides or {})
+    stage0_config = copy.deepcopy(PIPELINE_STAGE_CONFIG["stage0"])
+    stage0_config.update(_resolve_stage_env_overrides(section_name="stage0", runtime_profile_settings=settings))
+    stage0_config.update(copy.deepcopy(overrides.get("stage0") or {}))
+    classify_config = copy.deepcopy(PIPELINE_STAGE_CONFIG["classify"])
+    classify_config.update(copy.deepcopy(overrides.get("classify") or {}))
+    return {
+        "paths": copy.deepcopy(PATHS_CONFIG),
+        "runtime_profile": copy.deepcopy(settings or {}),
+        "stage0": stage0_config,
+        "stage1_http": resolve_stage1_http_config(
+            copy.deepcopy(overrides.get("stage1_http") or {}),
+            profile_name=profile_name,
+            resource_info=resource_info,
+            runtime_profile_settings=settings,
+        ),
+        "hash": resolve_hash_stage_config(
+            copy.deepcopy(overrides.get("hash") or {}),
+            profile_name=profile_name,
+            resource_info=resource_info,
+            runtime_profile_settings=settings,
+        ),
+        "classify": classify_config,
+        "ray": resolve_ray_runtime_config(
+            copy.deepcopy(overrides.get("ray") or {}),
+            runtime_profile_settings=settings,
+            resource_info=resource_info,
+        ),
+        "reliability": resolve_reliability_config(
+            copy.deepcopy(overrides.get("reliability") or {}),
+            profile_name=profile_name,
+            resource_info=resource_info,
+            runtime_profile_settings=settings,
+        ),
+    }
+
+
+def resolve_stage1_http_config(
+    overrides: dict | None = None,
+    *,
+    profile_name: str | None = None,
+    resource_info: dict[str, Any] | None = None,
+    runtime_profile_settings: dict[str, Any] | None = None,
+) -> dict:
+    config = copy.deepcopy(PIPELINE_STAGE_CONFIG["stage1_http"])
+    settings = runtime_profile_settings
+    if settings is None and profile_name:
+        settings = resolve_runtime_profile(profile_name, resource_info=resource_info)
+    config.update(copy.deepcopy((settings or {}).get("stage1_http") or {}))
     for key, value in (overrides or {}).items():
         if value is None:
             continue
@@ -213,8 +710,18 @@ def resolve_stage1_http_config(overrides: dict | None = None) -> dict:
     return config
 
 
-def resolve_hash_stage_config(overrides: dict | None = None) -> dict:
-    config = dict(HASH_STAGE_CONFIG)
+def resolve_hash_stage_config(
+    overrides: dict | None = None,
+    *,
+    profile_name: str | None = None,
+    resource_info: dict[str, Any] | None = None,
+    runtime_profile_settings: dict[str, Any] | None = None,
+) -> dict:
+    config = copy.deepcopy(PIPELINE_STAGE_CONFIG["hash"])
+    settings = runtime_profile_settings
+    if settings is None and profile_name:
+        settings = resolve_runtime_profile(profile_name, resource_info=resource_info)
+    config.update(_resolve_stage_env_overrides(section_name="hash", runtime_profile_settings=settings))
     for key, value in (overrides or {}).items():
         if value is None:
             continue
@@ -397,26 +904,39 @@ def _clamp_ray_budget(config: dict[str, object], *, cpu_cores: int) -> dict[str,
     }
 
 
-def resolve_ray_runtime_config(overrides: dict | None = None) -> dict:
-    cpu_cores = os.cpu_count() or 4
-    hash_pages = max(1, int(os.getenv("PHISHING_HASH_PAGES", HASH_STAGE_CONFIG["hash_pages"])))
+def resolve_ray_runtime_config(
+    overrides: dict | None = None,
+    *,
+    runtime_profile_settings: dict[str, Any] | None = None,
+    resource_info: dict[str, Any] | None = None,
+) -> dict:
+    resource_info = dict(resource_info or {})
+    cpu_cores = int(resource_info.get("cpu_cores", 0) or (os.cpu_count() or 4))
+    profile_env = dict((runtime_profile_settings or {}).get("env") or {})
+    hash_pages_default = profile_env.get("PHISHING_HASH_PAGES", HASH_STAGE_CONFIG["hash_pages"])
+    hash_pages = max(1, int(os.getenv("PHISHING_HASH_PAGES", hash_pages_default)))
     local_mode_env = os.getenv("PHISHING_RAY_LOCAL_MODE", "").strip().lower()
     explicit_local_mode = (
         local_mode_env in {"1", "true", "yes", "on"}
         if local_mode_env
         else None
     )
-    total_ram_gb = 0.0
-    available_ram_gb = 0.0
-    if psutil is not None:
+    total_ram_gb = float(resource_info.get("ram_gb", 0.0) or 0.0)
+    available_ram_gb = float(resource_info.get("available_ram_gb", 0.0) or 0.0)
+    if psutil is not None and (not total_ram_gb or not available_ram_gb):
         try:
             vm = psutil.virtual_memory()
-            total_ram_gb = float(vm.total / (1024 ** 3))
-            available_ram_gb = float(vm.available / (1024 ** 3))
+            if not total_ram_gb:
+                total_ram_gb = float(vm.total / (1024 ** 3))
+            if not available_ram_gb:
+                available_ram_gb = float(vm.available / (1024 ** 3))
         except Exception:
-            total_ram_gb = 0.0
-            available_ram_gb = 0.0
+            total_ram_gb = total_ram_gb or 0.0
+            available_ram_gb = available_ram_gb or 0.0
     config = dict(RAY_RUNTIME_CONFIG)
+    for env_name, config_key in RAY_ENV_TO_CONFIG_KEY.items():
+        if env_name in profile_env and os.getenv(env_name) is None:
+            config[config_key] = profile_env[env_name]
     overrides = dict(overrides or {})
     explicit_keys = {key for key, value in overrides.items() if value is not None}
     explicit_env_keys = {
@@ -673,10 +1193,59 @@ def resolve_ray_runtime_config(overrides: dict | None = None) -> dict:
         bool(config.get("budget_clamped", False)),
     )
     if bool(config.get("budget_clamped", False)):
-        _cfg_logger.warning(
-            "Ray runtime clamp applied | adjustments=%s",
-            ", ".join(str(item) for item in list(config.get("budget_adjustments") or [])),
-        )
+        raw_adjustments = [str(item) for item in list(config.get("budget_adjustments") or []) if str(item)]
+        reduced: dict[str, dict[str, str]] = {}
+        ordered_keys: list[str] = []
+        for item in raw_adjustments:
+            left, _, reason_part = item.partition(" (")
+            key, _, transition = left.partition(":")
+            key = key.strip()
+            transition = transition.strip()
+            reason = reason_part.rstrip(")").strip()
+            if not key:
+                key = left.strip() or "unknown"
+            if key not in reduced:
+                reduced[key] = {"first": transition, "last": transition, "reason": reason}
+                ordered_keys.append(key)
+            else:
+                reduced[key]["last"] = transition or reduced[key]["last"]
+                if reason:
+                    reduced[key]["reason"] = reason
+
+        compact_adjustments: list[str] = []
+        for key in ordered_keys:
+            info = reduced.get(key, {})
+            first = str(info.get("first", "") or "")
+            last = str(info.get("last", "") or "")
+            reason = str(info.get("reason", "") or "")
+            if "->" in first:
+                start_value = first.split("->", 1)[0].strip()
+            else:
+                start_value = first
+            if "->" in last:
+                end_value = last.rsplit("->", 1)[-1].strip()
+            else:
+                end_value = last
+            transition = start_value if not end_value or start_value == end_value else f"{start_value}->{end_value}"
+            compact_adjustments.append(f"{key}:{transition}" + (f" ({reason})" if reason else ""))
+
+        signature = "|".join(compact_adjustments)
+        global _LAST_RAY_CLAMP_LOG_SIGNATURE
+        if signature != _LAST_RAY_CLAMP_LOG_SIGNATURE:
+            _LAST_RAY_CLAMP_LOG_SIGNATURE = signature
+            preview = ", ".join(compact_adjustments[:10])
+            hidden = max(0, len(compact_adjustments) - 10)
+            if hidden > 0:
+                preview = f"{preview}, ... (+{hidden} more)"
+            _cfg_logger.warning(
+                "Ray runtime clamp applied | fields_changed=%d | actor=%.1f/%.1f | total=%.1f/%.1f | %s",
+                len(compact_adjustments),
+                actor_cpu_demand,
+                float(config.get("actor_cpu_budget", 0.0) or 0.0),
+                total_demand,
+                float(config.get("planned_total_cpu_budget", 0.0) or 0.0),
+                preview,
+            )
 
     return config
 

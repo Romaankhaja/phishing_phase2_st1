@@ -3,10 +3,26 @@ from types import SimpleNamespace
 from unittest import mock
 
 import main_controller
-from phishing_pipeline.config import resolve_ray_runtime_config
+from phishing_pipeline.config import (
+    FINAL_OUTPUT,
+    PATHS_CONFIG,
+    resolve_ray_runtime_config,
+    resolve_reliability_config,
+    resolve_runtime_profile,
+    resolve_stage1_http_config,
+    resolve_stage_config,
+)
 
 
 class RuntimeProfileTests(unittest.TestCase):
+    def test_config_runtime_profile_matches_controller_wrapper(self):
+        resource_info = {"cpu_cores": 48, "ram_gb": 250.0, "vram_gb": 80.0, "platform": "linux"}
+
+        direct = resolve_runtime_profile("auto", resource_info=resource_info)
+        via_controller = main_controller._resolve_runtime_profile_settings("auto", resource_info=resource_info)
+
+        self.assertEqual(direct, via_controller)
+
     def test_auto_runtime_profile_resolves_server_balanced_for_large_host(self):
         settings = main_controller._resolve_runtime_profile_settings(
             "auto",
@@ -72,6 +88,43 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertLessEqual(float(config["total_cpu_demand"]), float(config["planned_total_cpu_budget"]))
         self.assertGreaterEqual(int(config["stage1_fetch_actors"]), 4)
         self.assertGreaterEqual(int(config["classify_inflight"]), 8)
+
+    def test_stage_config_resolvers_apply_profile_overrides_from_config_module(self):
+        resource_info = {"cpu_cores": 48, "ram_gb": 250.0, "vram_gb": 0.0, "platform": "linux"}
+        runtime_profile = resolve_runtime_profile("auto", resource_info=resource_info)
+        stage_config = resolve_stage_config(
+            profile_name="auto",
+            resource_info=resource_info,
+            runtime_profile_settings=runtime_profile,
+        )
+
+        self.assertEqual("server-balanced", stage_config["runtime_profile"]["resolved_profile"])
+        self.assertEqual(192, stage_config["stage1_http"]["http_concurrency"])
+        self.assertEqual(10, stage_config["reliability"]["append_flush_interval_seconds"])
+        self.assertEqual(16, stage_config["stage0"]["lexical_workers"])
+
+    def test_paths_config_keeps_legacy_final_output_alias(self):
+        self.assertEqual(PATHS_CONFIG["final_output_csv"], FINAL_OUTPUT)
+
+    def test_resolve_reliability_config_applies_profile_overlay(self):
+        settings = resolve_runtime_profile(
+            "server-balanced",
+            resource_info={"cpu_cores": 48, "ram_gb": 250.0, "vram_gb": 0.0, "platform": "linux"},
+        )
+        config = resolve_reliability_config(runtime_profile_settings=settings)
+
+        self.assertEqual(10, config["append_flush_interval_seconds"])
+        self.assertEqual(10000, config["append_flush_row_interval"])
+
+    def test_resolve_stage1_http_config_applies_profile_overlay(self):
+        settings = resolve_runtime_profile(
+            "cpu-safe",
+            resource_info={"cpu_cores": 12, "ram_gb": 8.0, "vram_gb": 4.0, "platform": "win32"},
+        )
+        config = resolve_stage1_http_config(runtime_profile_settings=settings)
+
+        self.assertEqual(96, config["concurrency"])
+        self.assertEqual(16, config["tls_concurrency"])
 
 
 if __name__ == "__main__":

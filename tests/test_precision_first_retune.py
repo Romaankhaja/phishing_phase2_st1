@@ -370,7 +370,7 @@ class Stage3DecisionRetuneTests(unittest.TestCase):
         self.assertEqual(decision["classification"], "Phishing")
         self.assertTrue(decision["emit_output"])
 
-    def test_embedded_host_below_brand_evidence_threshold_stays_suspected(self):
+    def test_redirected_spoof_host_promotes_to_phishing(self):
         decision = pipeline._hybrid_hash_decision(
             row={
                 "fetch_status": "fetched",
@@ -391,8 +391,49 @@ class Stage3DecisionRetuneTests(unittest.TestCase):
             dns_records="NA",
         )
 
+        self.assertEqual(decision["classification"], "Phishing")
+        self.assertTrue(decision["emit_output"])
+        self.assertEqual(decision["classification_gate_reason"], "redirected_cse_spoof_host")
+
+    def test_redirected_non_spoof_host_stays_suspected(self):
+        decision = pipeline._hybrid_hash_decision(
+            row={
+                "fetch_status": "fetched",
+                "strict_lexical_hit": True,
+                "lexical_score_pass": True,
+                "fallback_rank_only": False,
+                "hash_anchor": False,
+                "deceptive_host_embedding": False,
+                "direct_brand_evidence_count": 0,
+                "content_spoof_strong": False,
+                "signal_hit_keywords": False,
+                "Identified Phishing/Suspected Domain Name": "https://crsor.info",
+                "final_landing_url": "https://example-landing.net/welcome",
+                "final_domain": "example-landing.net",
+            },
+            registrar="NA",
+            hosting_isp="NA",
+            dns_records="NA",
+        )
+
         self.assertEqual(decision["classification"], "Suspected")
         self.assertTrue(decision["emit_output"])
+        self.assertEqual(decision["classification_gate_reason"], "redirected_lexical_suspected")
+
+    def test_redirected_spoof_host_remarks_include_final_target(self):
+        remarks = pipeline._build_output_remarks(
+            row={
+                "Identified Phishing/Suspected Domain Name": "https://crsor.info",
+                "final_landing_url": "https://dcc.crsorgi.gov.in.crsor.info/crs/",
+                "deceptive_host_embedding": True,
+            },
+            classification="Phishing",
+            evidence_tier="weak_evidence",
+            hosting_ip="1.2.3.4",
+        )
+
+        self.assertIn("redirect_target_spoofs_cse", remarks)
+        self.assertIn("dcc.crsorgi.gov.in.crsor.info", remarks)
 
     def test_high_brand_evidence_without_deceptive_embedding_stays_suspected(self):
         decision = pipeline._hybrid_hash_decision(
