@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -197,7 +199,7 @@ class RayBackendDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config["hash_finalize_batch"], 32)
         self.assertEqual(config["classify_actors"], 8)
         self.assertEqual(config["classify_inflight"], 8)
-        self.assertEqual(config["ocr_actors"], 1)
+        self.assertEqual(config["ocr_actors"], 4)
         self.assertEqual(config["ocr_batch_size"], 32)
         self.assertEqual(config["ocr_batch_delay_ms"], 25)
         self.assertEqual(config["stage1_fetch_actor_max_concurrency"], 4)
@@ -208,6 +210,52 @@ class RayBackendDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config["stage1_http_keepalive_cap"], 96)
         self.assertTrue(config["prewarm_actors"])
         self.assertEqual(config["prewarm_mode"], "staged")
+
+    async def test_pipeline_skips_non_legacy_checkpoint_schema_during_resume(self):
+        holdout_df = pd.DataFrame(
+            [
+                {
+                    "Identified Phishing/Suspected Domain Name": "https://example.com",
+                    "Legitimate Domains": "legit.example",
+                    "Cooresponding CSE": "Example CSE",
+                    "hash_score": 88.0,
+                    "fetch_status": "fetched",
+                }
+            ]
+        )
+        whitelist_df = pd.DataFrame({"Legitimate Domains": ["legit.example"]})
+        sentinel = pd.DataFrame([{"Application_ID": "x"}])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            output_dir = tmpdir_path / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "holdout.csv").write_text(holdout_df.to_csv(index=False), encoding="utf-8")
+            checkpoint_path = output_dir / "checkpoints.csv"
+            pd.DataFrame(
+                [{"record_key": "abc", "stage_name": "classify", "final_pipeline_status": "completed"}]
+            ).to_csv(checkpoint_path, index=False)
+
+            with (
+                mock.patch.object(pipeline, "ROOT_DIR", str(tmpdir_path)),
+                mock.patch.object(pipeline, "CHECKPOINT_CSV", str(checkpoint_path)),
+                mock.patch.object(pipeline.pd, "read_excel", return_value=whitelist_df),
+                mock.patch("phishing_pipeline.ray_runtime.run_hash_only_pipeline_with_ray", new=mock.AsyncMock(return_value=sentinel)) as ray_impl,
+                mock.patch.object(pipeline.logger, "warning") as warning_log,
+            ):
+                result = await pipeline.run_pipeline(
+                    holdout_folder="ignored",
+                    ps02_whitelist_file="ignored.xlsx",
+                    use_existing_holdout=True,
+                    pipeline_mode="hash_only",
+                    execution_backend="ray",
+                    resume=True,
+                )
+
+        self.assertIs(result, sentinel)
+        ray_impl.assert_awaited_once()
+        warning_messages = [str(call.args[0]) for call in warning_log.call_args_list if call.args]
+        self.assertFalse(any("Could not read legacy checkpoint CSV" in message for message in warning_messages))
 
     def test_effective_detection_target_promotes_cross_domain_final_url(self):
         target = pipeline._resolve_effective_detection_target(

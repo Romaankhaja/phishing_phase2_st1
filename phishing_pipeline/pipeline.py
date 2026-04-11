@@ -21,6 +21,7 @@ from dateutil import parser
 import warnings
 from urllib.parse import urlparse
 from fpdf import FPDF
+from typing import Any
 
 # Suppress noisy sklearn warnings that clutter progress bars
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
@@ -930,6 +931,10 @@ def _as_bool_flag(value) -> bool:
 
 
 _REPLAY_EMPTY_TEXT_VALUES = {"", "nan", "none", "null", "na"}
+_LEGACY_CHECKPOINT_REQUIRED_COLUMNS = {
+    "Identified Phishing/Suspected Domain Name",
+    "Phishing/Suspected Domains (i.e. Class Label)",
+}
 
 
 def _normalize_replayed_text(value) -> str:
@@ -951,6 +956,21 @@ def _normalize_replayed_columns(df: pd.DataFrame, columns: list[str]) -> pd.Data
         if column in df.columns:
             df[column] = df[column].map(_normalize_replayed_text)
     return df
+
+
+def _looks_like_legacy_checkpoint_columns(columns: Any) -> bool:
+    normalized_columns = {str(column or "").strip() for column in list(columns if columns is not None else [])}
+    return _LEGACY_CHECKPOINT_REQUIRED_COLUMNS.issubset(normalized_columns)
+
+
+def _legacy_checkpoint_csv_has_submission_schema(path: str) -> bool:
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        header_df = pd.read_csv(path, nrows=0)
+    except Exception:
+        return False
+    return _looks_like_legacy_checkpoint_columns(header_df.columns)
 
 
 def _normalize_host_value(value: str) -> str:
@@ -2832,15 +2852,21 @@ async def run_pipeline(
     # ── Resume from checkpoint if a previous run was interrupted ──────────
     done_domains = set()
     if checkpoint_store is None and resume and not force_reprocess and os.path.exists(CHECKPOINT_CSV):
-        try:
-            df_ckpt = pd.read_csv(CHECKPOINT_CSV)
-            done_domains = set(
-                df_ckpt["Identified Phishing/Suspected Domain Name"]
-                .astype(str).str.strip().str.lower()
+        if _legacy_checkpoint_csv_has_submission_schema(CHECKPOINT_CSV):
+            try:
+                df_ckpt = pd.read_csv(CHECKPOINT_CSV)
+                done_domains = set(
+                    df_ckpt["Identified Phishing/Suspected Domain Name"]
+                    .astype(str).str.strip().str.lower()
+                )
+                logger.info("Resuming from legacy checkpoint CSV: %d domains already completed", len(done_domains))
+            except Exception as e:
+                logger.warning("Could not read legacy checkpoint CSV, starting fresh: %s", e)
+        else:
+            logger.info(
+                "Skipping legacy checkpoint resume for %s because it does not match the legacy submission schema",
+                CHECKPOINT_CSV,
             )
-            logger.info("Resuming from legacy checkpoint CSV: %d domains already completed", len(done_domains))
-        except Exception as e:
-            logger.warning("Could not read legacy checkpoint CSV, starting fresh: %s", e)
 
     if done_domains:
         df_filtered = df_filtered[

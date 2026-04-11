@@ -629,10 +629,6 @@ async def main():
         run_context.run_output_dir,
         run_context.latest_output_dir,
     )
-    if execution_backend == "ray" and checkpoint_store is not None:
-        checkpoint_store.close()
-        checkpoint_store = None
-
     # --- Ray debug startup diagnostic ---
     if getattr(args, "ray_debug", False) and execution_backend == "ray":
         resource_info = _probe_runtime_resources()

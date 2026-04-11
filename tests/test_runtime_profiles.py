@@ -53,12 +53,37 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(32, config["hash_finalize_batch"])
         self.assertEqual(8, config["classify_actors"])
         self.assertEqual(8, config["classify_inflight"])
+        self.assertEqual(4, config["ocr_actors"])
         self.assertEqual(48, config["stage1_pending_cap"])
         self.assertEqual(16, config["hash_pending_cap"])
         self.assertEqual(192, config["stage1_http_connection_cap"])
         self.assertEqual(96, config["stage1_http_keepalive_cap"])
         self.assertEqual("staged", config["prewarm_mode"])
         self.assertTrue(config["enable_dynamic_control"])
+
+    def test_resolve_ray_runtime_config_keeps_server_env_minima_under_budget(self):
+        fake_vm = SimpleNamespace(total=int(250 * 1024 ** 3), available=int(220 * 1024 ** 3))
+        env = {
+            "PHISHING_RAY_HASH_BROWSER_ACTORS": "8",
+            "PHISHING_RAY_HASH_TABS_PER_ACTOR": "2",
+            "PHISHING_RAY_STAGE1_FETCH_ACTOR_MAX_CONCURRENCY": "4",
+            "PHISHING_RAY_OCR_ACTORS": "4",
+            "PHISHING_RAY_PREWARM_ACTORS": "true",
+        }
+        with (
+            mock.patch.dict("os.environ", env, clear=True),
+            mock.patch("phishing_pipeline.config.psutil", new=SimpleNamespace(virtual_memory=lambda: fake_vm)),
+            mock.patch("phishing_pipeline.config.os.cpu_count", return_value=48),
+        ):
+            config = resolve_ray_runtime_config()
+
+        self.assertTrue(config["server_mode"])
+        self.assertGreaterEqual(config["hash_browser_actors"], 8)
+        self.assertGreaterEqual(config["hash_tabs_per_actor"], 2)
+        self.assertGreaterEqual(config["stage1_fetch_actor_max_concurrency"], 4)
+        self.assertGreaterEqual(config["ocr_actors"], 4)
+        self.assertTrue(config["prewarm_actors"])
+        self.assertLessEqual(float(config["total_cpu_demand"]), float(config["planned_total_cpu_budget"]))
 
     def test_resolve_ray_runtime_config_clamps_cpu_budget(self):
         fake_vm = SimpleNamespace(total=int(250 * 1024 ** 3), available=int(220 * 1024 ** 3))

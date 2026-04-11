@@ -6177,78 +6177,101 @@ async def _gpu_microbatch_scorer(
 ###############################################
 
 def _build_progress_postfix(metrics):
+    counters = _resolve_hash_metric_counters(metrics)
     elapsed = max(float(metrics.get("stage_elapsed_s", 0.0)), 1e-6)
     if str(metrics.get("hash_execution_mode", "")).strip().lower() == "legacy_shards":
         return {
-            "proc": metrics.get("processed", 0),
+            "proc": counters["hash_finalized"],
+            "deep": counters["deep_attempted"],
             "ok": metrics.get("hashed_success", 0),
             "fail": metrics.get("fetch_failed", 0),
             "tout": metrics.get("fetch_timed_out", 0),
-            "match": metrics.get("final_matches_above_threshold", 0),
+            "match": counters["final_matches_total"],
             "gpu_batches": metrics.get("gpu_batches_flushed", 0),
             "gpu_items": metrics.get("gpu_items_scored", 0),
             "gpu_queue": metrics.get("gpu_queue_depth", 0),
             "active_fetch": metrics.get("active_fetch_limit", 0),
-            "urls_per_sec": round(metrics.get("processed", 0) / elapsed, 2),
+            "urls_per_sec": round(counters["hash_finalized"] / elapsed, 2),
         }
     return {
-        "proc": metrics.get("processed", 0),
+        "proc": counters["hash_finalized"],
+        "deep": counters["deep_attempted"],
         "render": metrics.get("render_completed", 0),
         "aux": metrics.get("aux_completed", 0),
         "ok": metrics.get("hashed_success", 0),
         "fail": metrics.get("fetch_failed", 0),
         "tout": metrics.get("fetch_timed_out", 0),
-        "match": metrics.get("final_matches_above_threshold", 0),
+        "match": counters["final_matches_total"],
         "final_q": metrics.get("gpu_queue_depth", 0),
         "render_q": metrics.get("render_queue_depth", 0),
         "aux_q": metrics.get("aux_queue_depth", 0),
         "active": metrics.get("active_fetch_limit", 0),
         "live": metrics.get("live_page_workers", 0),
         "phase": metrics.get("phase", "running"),
-        "urls_per_sec": round(metrics.get("processed", 0) / elapsed, 2),
+        "urls_per_sec": round(counters["hash_finalized"] / elapsed, 2),
+    }
+
+
+def _resolve_hash_metric_counters(metrics: dict[str, Any]) -> dict[str, int]:
+    deep_attempted = int(metrics.get("deep_attempted", 0) or 0)
+    hash_finalized = int(metrics.get("hash_finalized", metrics.get("processed", 0)) or 0)
+    final_matches_total = int(
+        metrics.get("final_matches_total", metrics.get("final_matches_above_threshold", 0)) or 0
+    )
+    metrics["hash_finalized"] = hash_finalized
+    metrics["final_matches_total"] = final_matches_total
+    if "deep_attempted" not in metrics:
+        metrics["deep_attempted"] = deep_attempted
+    return {
+        "deep_attempted": deep_attempted,
+        "hash_finalized": hash_finalized,
+        "final_matches_total": final_matches_total,
     }
 
 
 def _log_hashing_periodic_status(metrics, accepted_count):
-    processed = int(metrics.get("processed", 0))
-    if processed <= 0:
+    counters = _resolve_hash_metric_counters(metrics)
+    hash_finalized = counters["hash_finalized"]
+    if hash_finalized <= 0:
         return
-    timeout_ratio = metrics.get("fetch_timed_out", 0) / max(1, processed)
-    success_ratio = metrics.get("hashed_success", 0) / max(1, processed)
+    timeout_ratio = metrics.get("fetch_timed_out", 0) / max(1, hash_finalized)
+    success_ratio = metrics.get("hashed_success", 0) / max(1, hash_finalized)
     if str(metrics.get("hash_execution_mode", "")).strip().lower() == "legacy_shards":
         _hash_logger.info(
-            "Hashing progress | processed=%d/%d | ok=%d | fail=%d | tout=%d | match=%d | "
+            "Hashing progress | hash_finalized=%d/%d | deep_attempted=%d | ok=%d | fail=%d | tout=%d | final_matches=%d | "
             "gpu_batches=%d | gpu_items=%d | gpu_queue=%d | active_fetch_limit=%d | avg_gpu_batch=%.2f | "
             "urls_per_sec=%.2f | success_ratio=%.3f | timeout_ratio=%.3f",
-            processed,
+            hash_finalized,
             accepted_count,
+            counters["deep_attempted"],
             metrics.get("hashed_success", 0),
             metrics.get("fetch_failed", 0),
             metrics.get("fetch_timed_out", 0),
-            metrics.get("final_matches_above_threshold", 0),
+            counters["final_matches_total"],
             metrics.get("gpu_batches_flushed", 0),
             metrics.get("gpu_items_scored", 0),
             metrics.get("gpu_queue_depth", 0),
             metrics.get("active_fetch_limit", 0),
             metrics.get("avg_gpu_batch_size", 0.0),
-            processed / max(float(metrics.get("stage_elapsed_s", 0.0)), 1e-6),
+            hash_finalized / max(float(metrics.get("stage_elapsed_s", 0.0)), 1e-6),
             success_ratio,
             timeout_ratio,
         )
         return
     _hash_logger.info(
-        "Hashing progress | phase=%s | processed=%d/%d | render=%d | aux=%d | ok=%d | fail=%d | tout=%d | match=%d | "
+        "Hashing progress | phase=%s | hash_finalized=%d/%d | deep_attempted=%d | render=%d | aux=%d | ok=%d | fail=%d | tout=%d | final_matches=%d | "
         "queues={render=%d,aux=%d,final=%d} | nodes_alive=%d | live_pages=%d | active_pages=%d | shutdown={expected=%d,drained=%d} | "
         "finalized=%d | avg_finalize_batch=%.2f | urls_per_sec=%.2f | success_ratio=%.3f | timeout_ratio=%.3f | fd=%d/%d | ram=%.1f%% | target=%.1f | limiting_lane=%s",
         metrics.get("phase", "running"),
-        processed,
+        hash_finalized,
         accepted_count,
+        counters["deep_attempted"],
         metrics.get("render_completed", 0),
         metrics.get("aux_completed", 0),
         metrics.get("hashed_success", 0),
         metrics.get("fetch_failed", 0),
         metrics.get("fetch_timed_out", 0),
-        metrics.get("final_matches_above_threshold", 0),
+        counters["final_matches_total"],
         metrics.get("render_queue_depth", 0),
         metrics.get("aux_queue_depth", 0),
         metrics.get("gpu_queue_depth", 0),
@@ -6259,7 +6282,7 @@ def _log_hashing_periodic_status(metrics, accepted_count):
         metrics.get("shutdown_sentinels_drained", 0),
         metrics.get("gpu_items_scored", 0),
         metrics.get("avg_gpu_batch_size", 0.0),
-        processed / max(float(metrics.get("stage_elapsed_s", 0.0)), 1e-6),
+        hash_finalized / max(float(metrics.get("stage_elapsed_s", 0.0)), 1e-6),
         success_ratio,
         timeout_ratio,
         metrics.get("fd_count", 0),
@@ -6277,20 +6300,22 @@ def _log_hashing_metrics_summary(
     shortlisted_results=None,
     typo_min_score=None,
 ):
+    counters = _resolve_hash_metric_counters(metrics)
     _hash_logger.info(
-        "Hashing shortlist completed | processed=%d | "
+        "Hashing shortlist completed | deep_attempted=%d | hash_finalized=%d | "
         "hashed_success=%d | fetch_failed=%d | fetch_timed_out=%d | "
-        "final_matches=%d | gpu_batches=%d | gpu_items=%d | avg_gpu_batch=%.1f | urls_per_sec=%.2f | "
+        "final_matches_total=%d | gpu_batches=%d | gpu_items=%d | avg_gpu_batch=%.1f | urls_per_sec=%.2f | "
         "threshold=%s | elapsed=%.1fs",
-        metrics["processed"],
+        counters["deep_attempted"],
+        counters["hash_finalized"],
         metrics["hashed_success"],
         metrics["fetch_failed"],
         metrics["fetch_timed_out"],
-        metrics["final_matches_above_threshold"],
+        counters["final_matches_total"],
         metrics["gpu_batches_flushed"],
         metrics.get("gpu_items_scored", 0),
         metrics["avg_gpu_batch_size"],
-        metrics["processed"] / max(elapsed, 1e-6),
+        counters["hash_finalized"] / max(elapsed, 1e-6),
         threshold,
         elapsed,
     )
@@ -6335,14 +6360,17 @@ def _commit_terminal_hash_outcome(
     prefetch_admitted_failures,
     hash_progress,
 ):
+    counters = _resolve_hash_metric_counters(metrics)
     if payload_outcome["decision_row"] is not None:
         decision_rows.append(payload_outcome["decision_row"])
     admitted_prefetch_match = payload_outcome["admitted_prefetch_match"]
     if admitted_prefetch_match is not None:
         metrics["final_matches_above_threshold"] += 1
+        metrics["final_matches_total"] = counters["final_matches_total"] + 1
         prefetch_admitted_failures.append(admitted_prefetch_match)
     metrics[payload_outcome["metric_key"]] += 1
     metrics["processed"] += 1
+    metrics["hash_finalized"] = counters["hash_finalized"] + 1
     metrics["finalized"] += 1
     hash_progress.mark_completed(final_status=payload_outcome["metric_key"])
 
@@ -6355,15 +6383,18 @@ def _commit_legacy_shard_fetch_outcome(
     prefetch_admitted_failures,
     hash_progress=None,
 ):
+    counters = _resolve_hash_metric_counters(metrics)
     if payload_outcome["decision_row"] is not None:
         decision_rows.append(payload_outcome["decision_row"])
     admitted_prefetch_match = payload_outcome["admitted_prefetch_match"]
     if admitted_prefetch_match is not None:
         metrics["final_matches_above_threshold"] += 1
+        metrics["final_matches_total"] = counters["final_matches_total"] + 1
         prefetch_admitted_failures.append(admitted_prefetch_match)
     if payload_outcome["queue_payload"] is None:
         metrics[payload_outcome["metric_key"]] += 1
         metrics["processed"] += 1
+        metrics["hash_finalized"] = counters["hash_finalized"] + 1
         metrics["finalized"] += 1
         if hash_progress is not None:
             hash_progress.mark_completed(final_status=payload_outcome["metric_key"])
@@ -10763,6 +10794,7 @@ def _finish_hashing_shortlist_output(
     import pandas as pd
 
     elapsed = time.perf_counter() - t0
+    counters = _resolve_hash_metric_counters(metrics)
     resolved_shortlist_debug_csv = get_run_artifact_path(
         run_context,
         "stage0_lexical_decisions_csv",
@@ -10788,25 +10820,27 @@ def _finish_hashing_shortlist_output(
     metrics["aux_queue_depth"] = 0
     print(
         f"\nHashing shortlist completed in {elapsed:.1f}s "
-        f"({metrics['processed']} processed, "
-        f"{metrics['final_matches_above_threshold']} matched)"
+        f"(deep_attempted={counters['deep_attempted']} "
+        f"hash_finalized={counters['hash_finalized']} "
+        f"final_matches_total={counters['final_matches_total']})"
     )
     print(
         "Hashing metrics: "
-        f"processed={metrics['processed']} "
+        f"deep_attempted={counters['deep_attempted']} "
         + (
             ""
             if str(metrics.get("hash_execution_mode", "")).strip().lower() == "legacy_shards"
             else f"render={metrics.get('render_completed', 0)} aux={metrics.get('aux_completed', 0)} "
         )
+        + f"hash_finalized={counters['hash_finalized']} "
         + f"hashed_success={metrics['hashed_success']} "
         f"fetch_failed={metrics['fetch_failed']} "
         f"fetch_timed_out={metrics['fetch_timed_out']} "
         f"gpu_batches_flushed={metrics['gpu_batches_flushed']} "
         f"gpu_items_scored={metrics['gpu_items_scored']} "
         f"avg_gpu_batch_size={metrics['avg_gpu_batch_size']:.1f} "
-        f"urls_per_sec={metrics['processed'] / max(elapsed, 1e-6):.2f} "
-        f"final_matches={metrics['final_matches_above_threshold']}"
+        f"urls_per_sec={counters['hash_finalized'] / max(elapsed, 1e-6):.2f} "
+        f"final_matches_total={counters['final_matches_total']}"
     )
     _log_hashing_metrics_summary(
         metrics,

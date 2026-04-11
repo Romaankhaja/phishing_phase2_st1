@@ -1,12 +1,9 @@
 {
-  "completed_at": "2026-04-11T05:07:56+00:00",
+  "completed_at": "",
   "fatal_error_message": "",
   "fatal_error_type": "",
   "fatal_stage": "",
-  "final_decision_counts": {
-    "Phishing": 1,
-    "Suspected": 11
-  },
+  "final_decision_counts": {},
   "latest_output_dir": "c:\\Users\\SATWIK\\Documents\\Phishing\\output\\latest",
   "metadata_json": {
     "limit_whitelisted": null,
@@ -101,20 +98,21 @@
     "whitelist": "C:\\Users\\SATWIK\\Documents\\Phishing\\data\\whitelists\\Stage_2_Legitimate_Domains_80.xlsx"
   },
   "pipeline_status_counts": {
-    "completed": 12
+    "filtered_lexical_miss": 13,
+    "pending": 5186
   },
-  "run_id": "run_20260411T050441Z",
-  "run_output_dir": "c:\\Users\\SATWIK\\Documents\\Phishing\\output\\runs\\run_20260411T050441Z",
-  "started_at": "2026-04-11T05:04:41+00:00",
-  "status": "completed",
+  "run_id": "run_20260411T085310Z",
+  "run_output_dir": "c:\\Users\\SATWIK\\Documents\\Phishing\\output\\runs\\run_20260411T085310Z",
+  "started_at": "2026-04-11T08:53:10+00:00",
+  "status": "running",
   "telemetry_mode": "sampled",
   "totals": {
-    "stage_events": 43,
-    "stage_metrics": 35,
+    "stage_events": 131,
+    "stage_metrics": 7,
     "stall_events": 0,
-    "terminal_records": 12,
-    "tracked_records": 12,
+    "terminal_records": 13,
+    "tracked_records": 5199,
     "worker_heartbeats": 0
   },
-  "updated_at": "2026-04-11T05:07:56+00:00"
+  "updated_at": "2026-04-11T08:53:37+00:00"
 }

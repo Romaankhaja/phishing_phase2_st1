@@ -270,7 +270,9 @@ async def run_hashing_shortlist_with_ray_impl(
     render_trace_rows: list[dict[str, Any]] = []
     render_trace_written = False
     metrics = {
+        "deep_attempted": 0,
         "processed": 0,
+        "hash_finalized": 0,
         "render_completed": 0,
         "aux_completed": 0,
         "finalized": 0,
@@ -278,6 +280,7 @@ async def run_hashing_shortlist_with_ray_impl(
         "fetch_failed": 0,
         "fetch_timed_out": 0,
         "final_matches_above_threshold": 0,
+        "final_matches_total": 0,
         "gpu_batches_flushed": 0,
         "gpu_items_scored": 0,
         "avg_gpu_batch_size": 0.0,
@@ -678,6 +681,7 @@ async def run_hashing_shortlist_with_ray_impl(
         )
 
     async def _admit_to_hash(raw_url: str, normalized_url: str, source_workbook: str, progress_key: str) -> None:
+        metrics["deep_attempted"] = int(metrics.get("deep_attempted", 0) or 0) + 1
         hash_backlog.append((raw_url, normalized_url, source_workbook, progress_key))
 
     async def _schedule_stage1_fetch(record: dict[str, Any]) -> None:
@@ -1576,15 +1580,16 @@ async def run_hashing_shortlist_with_ray_impl(
             results.extend(prefetch_admitted_failures)
         _refresh_progress_bar(progress_bar)
         logger.info(
-            "Ray shortlist complete | stage0={hits=%d,misses=%d,skipped=%d,batches=%d,avg_batch_ms=%.1f} | stage1=%s | hash={processed=%d,matched=%d}",
+            "Ray shortlist complete | stage0={hits=%d,misses=%d,skipped=%d,batches=%d,avg_batch_ms=%.1f} | stage1=%s | hash={deep_attempted=%d,hash_finalized=%d,final_matches_total=%d}",
             stage0_hits,
             stage0_misses,
             stage0_skipped,
             stage0_batches_completed,
             stage0_latency_sum_ms / max(1, stage0_batches_completed),
             stage1_progress,
-            int(metrics.get("processed", 0) or 0),
-            int(metrics.get("final_matches_above_threshold", 0) or 0),
+            int(metrics.get("deep_attempted", 0) or 0),
+            int(metrics.get("hash_finalized", metrics.get("processed", 0)) or 0),
+            int(metrics.get("final_matches_total", metrics.get("final_matches_above_threshold", 0)) or 0),
         )
         if render_trace_rows:
             trace_path = comparison._write_ray_render_trace_debug(render_trace_rows, run_context=run_context)

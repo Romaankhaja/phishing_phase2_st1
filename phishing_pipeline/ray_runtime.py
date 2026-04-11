@@ -747,6 +747,13 @@ class _HashOnlyClassifierActorImpl:
         self._failed_fetch_suspected_min = failed_fetch_suspected_min
         self._failed_fetch_review_min = failed_fetch_review_min
         self._client = httpx.AsyncClient(follow_redirects=True, timeout=10.0)
+        self._infrastructure_cache: dict[str, dict[str, Any]] = {
+            "resolved_ip_by_host": {},
+            "rdap_by_host": {},
+            "whois_by_host": {},
+            "dns_by_host": {},
+            "geoip_by_ip": {},
+        }
         try:
             (
                 self._brand_model,
@@ -790,6 +797,7 @@ class _HashOnlyClassifierActorImpl:
             failed_fetch_review_min=self._failed_fetch_review_min,
             ocr_worker=ocr_worker,
             whois_actor=whois_actor,
+            infrastructure_cache=self._infrastructure_cache,
         )
 
     async def close(self) -> None:

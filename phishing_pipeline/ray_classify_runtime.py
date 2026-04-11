@@ -112,6 +112,69 @@ def _build_classify_progress_postfix(
     return build_compact_postfix(fields)
 
 
+_INFRA_EMPTY_VALUES = {"", "na", "n/a", "none", "null", "nan"}
+
+
+def _normalize_infra_text(value: Any) -> str:
+    if value is None:
+        return "NA"
+    try:
+        if pd.isna(value):
+            return "NA"
+    except Exception:
+        pass
+    text = str(value).strip()
+    if not text or text.lower() in _INFRA_EMPTY_VALUES:
+        return "NA"
+    return text
+
+
+def _first_row_infra_value(row: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        if key not in row:
+            continue
+        value = _normalize_infra_text(row.get(key))
+        if value != "NA":
+            return value
+    return "NA"
+
+
+def _resolve_row_infrastructure_seed(row: dict[str, Any]) -> dict[str, str]:
+    return {
+        "reg_date": _first_row_infra_value(row, "reg_date", "Domain Registration Date"),
+        "registrar": _first_row_infra_value(row, "registrar", "Registrar Name"),
+        "registrant_name": _first_row_infra_value(
+            row,
+            "registrant_name",
+            "Registrant Name or Registrant Organisation",
+        ),
+        "registrant_country": _first_row_infra_value(row, "registrant_country", "Registrant Country"),
+        "name_servers": _first_row_infra_value(row, "name_servers", "Name Servers"),
+        "ip": _first_row_infra_value(row, "hosting_ip", "Hosting IP", "ip_address", "resolved_ip"),
+        "hosting_isp": _first_row_infra_value(row, "hosting_isp", "Hosting ISP"),
+        "hosting_country": _first_row_infra_value(row, "hosting_country", "Hosting Country"),
+        "dns_records": _first_row_infra_value(row, "dns_records", "DNS Records (if any)"),
+        "registration_lookup_status": _first_row_infra_value(row, "registration_lookup_status"),
+    }
+
+
+def _aggregate_ocr_stats(stats_rows: list[dict[str, Any]] | None) -> dict[str, Any]:
+    aggregate = {
+        "ready": True,
+        "queue_depth": 0,
+        "batches_processed": 0,
+        "items_processed": 0,
+        "last_batch_size": 0,
+    }
+    for stats in list(stats_rows or []):
+        aggregate["ready"] = bool(aggregate["ready"]) and bool(stats.get("ready", False))
+        aggregate["queue_depth"] += int(stats.get("queue_depth", 0) or 0)
+        aggregate["batches_processed"] += int(stats.get("batches_processed", 0) or 0)
+        aggregate["items_processed"] += int(stats.get("items_processed", 0) or 0)
+        aggregate["last_batch_size"] += int(stats.get("last_batch_size", 0) or 0)
+    return aggregate
+
+
 async def classify_hash_only_row_impl(
     *,
     row: dict[str, Any],
@@ -128,6 +191,7 @@ async def classify_hash_only_row_impl(
     failed_fetch_review_min: float | None,
     ocr_worker: Any,
     whois_actor: Any,
+    infrastructure_cache: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     import dns.resolver
     import tldextract
@@ -150,6 +214,14 @@ async def classify_hash_only_row_impl(
     stage_started_at = utc_now_iso()
     stage_started_monotonic = time.perf_counter()
     registration_only_enrichment = pipeline_module._requires_registration_only_enrichment(row)
+    infrastructure_cache = dict(infrastructure_cache or {})
+    resolved_ip_cache = infrastructure_cache.setdefault("resolved_ip_by_host", {})
+    rdap_cache = infrastructure_cache.setdefault("rdap_by_host", {})
+    whois_cache = infrastructure_cache.setdefault("whois_by_host", {})
+    dns_cache = infrastructure_cache.setdefault("dns_by_host", {})
+    geoip_cache = infrastructure_cache.setdefault("geoip_by_ip", {})
+    row_infra = _resolve_row_infrastructure_seed(row)
+    model_needs_network_features = bool(feature_cols and scaler is not None and imputer is not None)
 
     def _event(status: str, *, error_type: str = "", error_message: str = "") -> dict[str, Any]:
         return {
@@ -406,11 +478,13 @@ async def classify_hash_only_row_impl(
     )
     if registration_only_enrichment:
         net_feats = {}
-    else:
+    elif model_needs_network_features:
         try:
             net_feats = await extract_network_features_async(domain_url)
         except Exception:
             net_feats = {}
+    else:
+        net_feats = {}
     brand_model_top1 = "NA"
     brand_model_confidence = 0.0
     domain_model_top1 = "Unknown"
@@ -421,11 +495,22 @@ async def classify_hash_only_row_impl(
     model_input_error = ""
     model_usable = False
 
-    resolved_ip = str(net_feats.get("ip_address") or "") or None
-    if not registration_only_enrichment:
+    resolved_ip = None
+    seed_ip = _normalize_infra_text(row_infra.get("ip"))
+    if seed_ip != "NA":
+        resolved_ip = seed_ip
+    elif str(net_feats.get("ip_address") or "").strip():
+        resolved_ip = str(net_feats.get("ip_address") or "").strip()
+    elif str(resolved_ip_cache.get(host, "") or "").strip():
+        resolved_ip = str(resolved_ip_cache.get(host, "") or "").strip()
+    if resolved_ip is not None and host:
+        resolved_ip_cache[host] = resolved_ip
+    if resolved_ip is None and not registration_only_enrichment:
         try:
             loop = asyncio.get_running_loop()
             resolved_ip = await asyncio.wait_for(loop.run_in_executor(None, socket.gethostbyname, host), timeout=3.0)
+            if resolved_ip and host:
+                resolved_ip_cache[host] = str(resolved_ip)
         except Exception:
             pass
 
@@ -435,18 +520,42 @@ async def classify_hash_only_row_impl(
         return pipeline_module.RDAP_DIRECT_URLS.get(tld, pipeline_module.RDAP_FALLBACK_URL)
 
     reg_data = None
-    registration_lookup_status = "unknown"
-    try:
-        resp = await client.get(f"{_get_rdap_url(host)}{host}")
-        if resp.status_code == 200:
-            reg_data = pipeline_module._parse_rdap_to_fields(resp.json())
-            registration_lookup_status = "registered"
-        elif resp.status_code == 404:
-            registration_lookup_status = "not_registered"
-        else:
-            registration_lookup_status = f"rdap_http_{resp.status_code}"
-    except Exception:
-        pass
+    registration_lookup_status = str(row_infra.get("registration_lookup_status", "") or "").strip().lower()
+    if registration_lookup_status in {"", "na", "n/a", "none", "null", "nan"}:
+        registration_lookup_status = "unknown"
+    if any(row_infra.get(field, "NA") != "NA" for field in ("reg_date", "registrar", "registrant_name", "registrant_country", "name_servers")):
+        reg_data = {
+            "reg_date": row_infra.get("reg_date", "NA"),
+            "registrar": row_infra.get("registrar", "NA"),
+            "registrant_name": row_infra.get("registrant_name", "NA"),
+            "registrant_country": row_infra.get("registrant_country", "NA"),
+            "name_servers": row_infra.get("name_servers", "NA"),
+        }
+        if registration_lookup_status == "unknown":
+            registration_lookup_status = "reused_from_row"
+    elif registration_lookup_status == "not_registered":
+        reg_data = None
+    elif host in rdap_cache:
+        cached_rdap = dict(rdap_cache.get(host) or {})
+        reg_data = dict(cached_rdap.get("reg_data") or {}) or None
+        registration_lookup_status = str(cached_rdap.get("status") or "unknown")
+    else:
+        try:
+            resp = await client.get(f"{_get_rdap_url(host)}{host}")
+            if resp.status_code == 200:
+                reg_data = pipeline_module._parse_rdap_to_fields(resp.json())
+                registration_lookup_status = "registered"
+            elif resp.status_code == 404:
+                registration_lookup_status = "not_registered"
+            else:
+                registration_lookup_status = f"rdap_http_{resp.status_code}"
+        except Exception:
+            pass
+        if host:
+            rdap_cache[host] = {
+                "status": registration_lookup_status,
+                "reg_data": dict(reg_data) if isinstance(reg_data, dict) else None,
+            }
 
     if registration_lookup_status == "not_registered":
         output_record = _record(
@@ -558,39 +667,52 @@ async def classify_hash_only_row_impl(
         )
 
     if reg_data is None and (resolved_ip is not None or registration_only_enrichment):
-        if whois_actor is not None:
-            await _ray_get(whois_actor.acquire.remote())
-        try:
-            loop = asyncio.get_running_loop()
-            w = await asyncio.wait_for(loop.run_in_executor(None, whois.whois, host), timeout=5.0)
-            if w:
-                creation_date = w.creation_date[0] if isinstance(w.creation_date, list) and w.creation_date else w.creation_date
-                reg_data = {
-                    "reg_date": str(creation_date) if creation_date else "NA",
-                    "registrar": w.registrar or "NA",
-                    "registrant_name": w.name or w.org or getattr(w, "registrant_name", None) or "NA",
-                    "registrant_country": w.country or "NA",
-                    "name_servers": ";".join(str(ns) for ns in w.name_servers) if w.name_servers else "NA",
-                }
-        except Exception:
-            pass
+        if host in whois_cache:
+            reg_data = dict(whois_cache.get(host) or {}) or None
+        else:
+            if whois_actor is not None:
+                await _ray_get(whois_actor.acquire.remote())
+            try:
+                loop = asyncio.get_running_loop()
+                w = await asyncio.wait_for(loop.run_in_executor(None, whois.whois, host), timeout=5.0)
+                if w:
+                    creation_date = w.creation_date[0] if isinstance(w.creation_date, list) and w.creation_date else w.creation_date
+                    reg_data = {
+                        "reg_date": str(creation_date) if creation_date else "NA",
+                        "registrar": w.registrar or "NA",
+                        "registrant_name": w.name or w.org or getattr(w, "registrant_name", None) or "NA",
+                        "registrant_country": w.country or "NA",
+                        "name_servers": ";".join(str(ns) for ns in w.name_servers) if w.name_servers else "NA",
+                    }
+                if host:
+                    whois_cache[host] = dict(reg_data) if isinstance(reg_data, dict) else {}
+            except Exception:
+                if host:
+                    whois_cache[host] = {}
 
-    dns_records = "NA"
-    if resolved_ip is not None:
-        try:
-            loop = asyncio.get_running_loop()
-            def _resolve_sync() -> str:
-                values: list[str] = []
-                for qtype in ("A", "NS", "MX", "CNAME"):
-                    try:
-                        answers = dns.resolver.resolve(host, qtype, lifetime=2.0)
-                        values.extend(f"{qtype}:{answer.to_text()}" for answer in answers)
-                    except Exception:
-                        continue
-                return ";".join(values) if values else "NA"
-            dns_records = await loop.run_in_executor(None, _resolve_sync)
-        except Exception:
-            pass
+    dns_records = row_infra.get("dns_records", "NA")
+    if dns_records == "NA" and resolved_ip is not None:
+        if host in dns_cache:
+            dns_records = str(dns_cache.get(host) or "NA")
+        else:
+            try:
+                loop = asyncio.get_running_loop()
+
+                def _resolve_sync() -> str:
+                    values: list[str] = []
+                    for qtype in ("A", "NS", "MX", "CNAME"):
+                        try:
+                            answers = dns.resolver.resolve(host, qtype, lifetime=2.0)
+                            values.extend(f"{qtype}:{answer.to_text()}" for answer in answers)
+                        except Exception:
+                            continue
+                    return ";".join(values) if values else "NA"
+
+                dns_records = await loop.run_in_executor(None, _resolve_sync)
+            except Exception:
+                dns_records = "NA"
+            if host:
+                dns_cache[host] = dns_records
 
     rd = reg_data or {}
     reg_date = rd.get("reg_date", "NA")
@@ -598,12 +720,30 @@ async def classify_hash_only_row_impl(
     registrant_name = rd.get("registrant_name", "NA")
     registrant_country = rd.get("registrant_country", "NA")
     name_servers = rd.get("name_servers", "NA")
-    geo_input = pd.DataFrame([{"url": domain_url, "ip_address": resolved_ip or "NA"}])
-    geo_dict = enrich_with_geoip(geo_input, ASN_DB_PATH, CITY_DB_PATH).iloc[0].to_dict()
-    ip = str(geo_dict.get("ip_address") or (resolved_ip or "NA"))
-    hosting_isp = str(geo_dict.get("asn_org", "NA")) if geo_dict.get("asn_org") and not pd.isna(geo_dict.get("asn_org")) else "NA"
-    hosting_country = str(geo_dict.get("country", "NA")) if geo_dict.get("country") and not pd.isna(geo_dict.get("country")) else "NA"
-    if feature_cols and scaler is not None and imputer is not None:
+    geo_dict: dict[str, Any] = {"ip_address": resolved_ip or "NA"}
+    ip = row_infra.get("ip", "NA")
+    if ip == "NA" and resolved_ip is not None:
+        ip = str(resolved_ip)
+    hosting_isp = row_infra.get("hosting_isp", "NA")
+    hosting_country = row_infra.get("hosting_country", "NA")
+    geo_cache_key = _normalize_infra_text(resolved_ip or ip or "")
+    if geo_cache_key == "NA":
+        geo_cache_key = ""
+    if geo_cache_key and geo_cache_key in geoip_cache:
+        cached_geo = dict(geoip_cache.get(geo_cache_key) or {})
+        geo_dict.update(cached_geo)
+    elif geo_cache_key and (ip == "NA" or hosting_isp == "NA" or hosting_country == "NA"):
+        geo_input = pd.DataFrame([{"url": domain_url, "ip_address": resolved_ip or ip or "NA"}])
+        cached_geo = enrich_with_geoip(geo_input, ASN_DB_PATH, CITY_DB_PATH).iloc[0].to_dict()
+        geoip_cache[geo_cache_key] = dict(cached_geo)
+        geo_dict.update(cached_geo)
+    if ip == "NA":
+        ip = str(geo_dict.get("ip_address") or (resolved_ip or "NA"))
+    if hosting_isp == "NA":
+        hosting_isp = str(geo_dict.get("asn_org", "NA")) if geo_dict.get("asn_org") and not pd.isna(geo_dict.get("asn_org")) else "NA"
+    if hosting_country == "NA":
+        hosting_country = str(geo_dict.get("country", "NA")) if geo_dict.get("country") and not pd.isna(geo_dict.get("country")) else "NA"
+    if model_needs_network_features:
         try:
             x_frame = pipeline_module._build_hash_only_model_frame(row, net_feats, geo_dict, imputer)
             x_imp = imputer.transform(x_frame)
@@ -1011,6 +1151,8 @@ async def run_hash_only_pipeline_with_ray_impl(
     classify_progress = ProgressTracker(total=len(rows_to_process))
     progress_stop = asyncio.Event()
     classify_started_monotonic = time.perf_counter()
+    last_debug_flush_monotonic = classify_started_monotonic
+    last_debug_flush_completed = 0
     controller_state["classify_live_inflight"] = min(
         classify_inflight_cap,
         max(classify_inflight_floor, int(controller_state.get("classify_live_inflight", classify_inflight_floor) or classify_inflight_floor)),
@@ -1060,6 +1202,30 @@ async def run_hash_only_pipeline_with_ray_impl(
         )
         progress_bar.refresh()
 
+    def _flush_debug_artifacts(*, force: bool = False) -> None:
+        nonlocal last_debug_flush_monotonic, last_debug_flush_completed
+        completed = classify_progress.completed
+        now = time.perf_counter()
+        if not force:
+            enough_rows = (completed - last_debug_flush_completed) >= 128
+            enough_time = (now - last_debug_flush_monotonic) >= 30.0
+            if not ((stage2_rows or stage3_rows) and (enough_rows or enough_time)):
+                return
+        pipeline_module._write_debug_csv(
+            stage2_rows,
+            stage2_debug_path,
+            run_context=run_context,
+            artifact_key="stage2_model_debug_csv",
+        )
+        pipeline_module._write_debug_csv(
+            stage3_rows,
+            stage3_debug_path,
+            run_context=run_context,
+            artifact_key="stage3_classification_debug_csv",
+        )
+        last_debug_flush_monotonic = now
+        last_debug_flush_completed = completed
+
     async def _progress_monitor(progress_bar: Any | None, started_monotonic: float) -> None:
         nonlocal ocr_progress_stats
         if progress_bar is None:
@@ -1067,7 +1233,8 @@ async def run_hash_only_pipeline_with_ray_impl(
         while not progress_stop.is_set():
             if ocr_actors:
                 try:
-                    ocr_progress_stats = dict(await _ray_get(ocr_actors[0].stats.remote()) or {})
+                    stats_rows = await _ray_get([actor.stats.remote() for actor in ocr_actors])
+                    ocr_progress_stats = _aggregate_ocr_stats([dict(item or {}) for item in list(stats_rows or [])])
                 except Exception:
                     ocr_progress_stats = {}
             progress_bar.set_postfix(
@@ -1291,6 +1458,7 @@ async def run_hash_only_pipeline_with_ray_impl(
                 classify_progress.mark_completed(
                     final_status="review_only" if bool(result.get("review_sink")) else "completed"
                 )
+            _flush_debug_artifacts()
             _submit_until_cap()
             _refresh_progress_bar(progress_bar)
         merged_review_df = pipeline_module._merge_review_queue_frames(existing_review_df, pd.DataFrame(review_rows))
@@ -1305,18 +1473,7 @@ async def run_hash_only_pipeline_with_ray_impl(
         flagged_df.to_csv(filtered_output_path, index=False, encoding="utf-8")
         sync_run_artifact(run_context, "final_output_csv", src_path=final_output_path, best_effort=True)
         sync_run_artifact(run_context, "final_output_filtered_csv", src_path=filtered_output_path, best_effort=True)
-        pipeline_module._write_debug_csv(
-            stage2_rows,
-            stage2_debug_path,
-            run_context=run_context,
-            artifact_key="stage2_model_debug_csv",
-        )
-        pipeline_module._write_debug_csv(
-            stage3_rows,
-            stage3_debug_path,
-            run_context=run_context,
-            artifact_key="stage3_classification_debug_csv",
-        )
+        _flush_debug_artifacts(force=True)
         if checkpoint_actor is not None:
             checkpoint_actor.export_all.remote()
         _refresh_progress_bar(progress_bar)
