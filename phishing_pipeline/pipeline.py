@@ -992,9 +992,30 @@ def _registered_domain_value(host: str) -> str:
     return registered or normalized_host
 
 
+def _is_invalid_public_output_url(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    return lowered.startswith(("about:", "javascript:", "data:", "file:", "blob:", "chrome:", "edge:"))
+
+
+def _coalesce_public_output_url(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if not text or _is_invalid_public_output_url(text):
+            continue
+        return text
+    return ""
+
+
 def _resolve_effective_detection_target(row: dict) -> dict[str, str | bool]:
-    original_url = str(row.get("Identified Phishing/Suspected Domain Name", "") or "").strip()
-    final_landing_url = str(row.get("final_landing_url", "") or "").strip()
+    original_url = _coalesce_public_output_url(
+        row.get("Identified Phishing/Suspected Domain Name", ""),
+        row.get("raw_url", ""),
+        row.get("normalized_url", ""),
+    )
+    final_landing_url = _coalesce_public_output_url(row.get("final_landing_url", ""))
     original_host = _normalize_host_value(original_url)
     final_host = _normalize_host_value(final_landing_url)
     original_labels = [label for label in original_host.split(".") if label]
@@ -3286,7 +3307,7 @@ def package_results(output_file=FINAL_OUTPUT, zip_path="PS-02_ISS_NLP_Submission
     Packages the final output Excel file and the evidence folder into
     a zip file matching the required submission structure.
     """
-    import zipfile, os, pathlib, shutil
+    import csv, json, zipfile, os, pathlib, shutil
     
     # --- Define the paths for the new zip structure ---
     submission_root_folder = "PS-02_ISS_NLP_Submission"
@@ -3340,10 +3361,69 @@ def package_results(output_file=FINAL_OUTPUT, zip_path="PS-02_ISS_NLP_Submission
         logger.error("❌ No output CSV file found to package: %s", csv_to_use)
         return
 
+    def _load_authoritative_submission_records() -> list[dict[str, Any]]:
+        checkpoint_path = os.path.join(os.path.dirname(os.path.abspath(output_file)), "checkpoints.csv")
+        if not os.path.exists(checkpoint_path):
+            checkpoint_path = CHECKPOINT_CSV
+        if not os.path.exists(checkpoint_path):
+            return []
+        latest_rows: dict[str, dict[str, str]] = {}
+        try:
+            with open(checkpoint_path, newline="", encoding="utf-8") as fh:
+                for row in csv.DictReader(fh):
+                    record_key = str(row.get("record_key", "") or "").strip()
+                    if not record_key:
+                        continue
+                    latest_rows[record_key] = dict(row)
+        except Exception:
+            logger.exception("Failed to load authoritative checkpoint records for packaging")
+            return []
+        records: list[dict[str, Any]] = []
+        for row in latest_rows.values():
+            if str(row.get("final_pipeline_status", "") or "").strip() != "completed":
+                continue
+            payload = str(row.get("submission_record_json", "") or "").strip()
+            if not payload:
+                continue
+            try:
+                item = dict(json.loads(payload) or {})
+            except Exception:
+                continue
+            sanitized_identified_url = _coalesce_public_output_url(
+                item.get("Identified Phishing/Suspected Domain Name", ""),
+                row.get("raw_url", ""),
+                row.get("normalized_url", ""),
+            )
+            item["Identified Phishing/Suspected Domain Name"] = sanitized_identified_url or "NA"
+            records.append(item)
+        records.sort(
+            key=lambda item: (
+                str(item.get("Identified Phishing/Suspected Domain Name", "") or ""),
+                str(item.get("Critical Sector Entity Name", "") or ""),
+            )
+        )
+        return records
+
+    def _load_packaging_dataframe() -> tuple[pd.DataFrame, str]:
+        authoritative_records = _load_authoritative_submission_records()
+        if authoritative_records:
+            logger.info(
+                "Using authoritative checkpoint submission records for packaging: %d rows",
+                len(authoritative_records),
+            )
+            return (
+                pd.DataFrame(authoritative_records).replace(r"^\s*$", "NA", regex=True),
+                "checkpoint_records",
+            )
+        return (
+            pd.read_csv(csv_to_use, dtype=str, keep_default_na=False).replace(r"^\s*$", "NA", regex=True),
+            csv_to_use,
+        )
+
     # --- Convert the final CSV into the required submission Excel schema ---
+    referenced_evidence_files: set[str] = set()
     try:
-        df_final_output = pd.read_csv(csv_to_use, dtype=str, keep_default_na=False)
-        df_final_output = df_final_output.replace(r"^\s*$", "NA", regex=True)
+        df_final_output, packaging_source = _load_packaging_dataframe()
 
         def _mapped_series(source_name: str) -> pd.Series:
             if source_name in df_final_output.columns:
@@ -3360,7 +3440,7 @@ def package_results(output_file=FINAL_OUTPUT, zip_path="PS-02_ISS_NLP_Submission
         submission_df = pd.DataFrame(
             {
                 "Identified Domain Name": _mapped_series("Identified Phishing/Suspected Domain Name"),
-                "Corresponding CSE Name": _mapped_series("Corresponding CSE Domain Name"),
+                "Corresponding CSE Name": _mapped_series("Critical Sector Entity Name"),
                 "IP Address": _mapped_series("Hosting IP"),
                 "Hosting ISP": _mapped_series("Hosting ISP"),
                 "Hosting Country": _mapped_series("Hosting Country"),
@@ -3388,6 +3468,11 @@ def package_results(output_file=FINAL_OUTPUT, zip_path="PS-02_ISS_NLP_Submission
             ],
         )
         submission_df = submission_df.replace(r"^\s*$", "NA", regex=True)
+        referenced_evidence_files = {
+            os.path.basename(str(value).replace("\\", "/"))
+            for value in submission_df["Evidence File Path"].tolist()
+            if str(value or "").strip() and str(value or "").strip().upper() != "NA"
+        }
         submission_df.to_excel(local_excel_path, index=False)
         logger.info("✅ Converted final output CSV to %s", excel_file_name)
     except Exception as e:
@@ -3411,8 +3496,12 @@ def package_results(output_file=FINAL_OUTPUT, zip_path="PS-02_ISS_NLP_Submission
         
         # 1) Add the Evidence folder and all its contents
         if os.path.exists(EVIDENCE_DIR):
+            skipped_evidence_files = 0
             for root, _, files in os.walk(EVIDENCE_DIR):
                 for file in files:
+                    if file not in referenced_evidence_files:
+                        skipped_evidence_files += 1
+                        continue
                     filepath = os.path.join(root, file)
                     # Arcname places it inside the new structure
                     arcname = os.path.join(submission_root_folder, evidence_folder_name, file)
@@ -3420,6 +3509,8 @@ def package_results(output_file=FINAL_OUTPUT, zip_path="PS-02_ISS_NLP_Submission
                     shutil.copy2(filepath, os.path.join(submission_evidence_dir, file))
                     files_added_count += 1
             logger.info("Added %d evidence files.", files_added_count)
+            if skipped_evidence_files:
+                logger.info("Skipped %d unreferenced evidence files during packaging.", skipped_evidence_files)
         else:
             logger.warning("Evidence directory not found. Skipping: %s", EVIDENCE_DIR)
 
