@@ -139,7 +139,9 @@ def _decide_shortlist_controller_update(
         available_cpu < float(cpu_headroom_cores)
         and cpu_utilization > min(0.99, target_cpu_utilization + 0.12)
     )
-    event_loop_stalled = event_loop_lag_ms > 250.0
+    # Server mode uses higher thresholds — event loop lag from checkpoint I/O spikes
+    # are harmless when actual CPU is idle. 250ms is far too aggressive for servers.
+    event_loop_stalled = event_loop_lag_ms > (1500.0 if server_mode else 250.0)
     checkpoint_backlogged = checkpoint_pending_rows > 20000
     checkpoint_growing = checkpoint_backlog_growth > 2000
     local_pressure = cpu_headroom_low or cpu_utilization_high or event_loop_stalled or checkpoint_backlogged or checkpoint_growing
@@ -662,7 +664,7 @@ async def run_hashing_shortlist_with_ray_impl(
         hash_browser_actors.extend(
             [
                 primitives["HashBrowserActor"].options(
-                    num_cpus=1 if runtime_config.get("server_mode") else 0.5,
+                    num_cpus=0.5 if runtime_config.get("server_mode") else 0.5,
                     max_concurrency=int(runtime_config["hash_tabs_per_actor"]),
                 ).remote(
                     int(runtime_config["hash_tabs_per_actor"]),
@@ -689,7 +691,7 @@ async def run_hashing_shortlist_with_ray_impl(
         except Exception:
             pass
         hash_browser_actors[actor_slot] = primitives["HashBrowserActor"].options(
-            num_cpus=1 if runtime_config.get("server_mode") else 0.5,
+            num_cpus=0.5 if runtime_config.get("server_mode") else 0.5,
             max_concurrency=int(runtime_config["hash_tabs_per_actor"]),
         ).remote(
             int(runtime_config["hash_tabs_per_actor"]),
@@ -1061,17 +1063,83 @@ async def run_hashing_shortlist_with_ray_impl(
             return
         raise exc
 
-    async def _reap_stale_hash_render_tasks() -> None:
-        stale_refs: list[Any] = []
+    # --- Stale task age limits by kind (seconds) ---
+    _stale_age_limits: dict[str, float] = {
+        "hash_render": 90.0,
+        "stage1_fetch": 60.0,
+        "stage1_parse": 45.0,
+        "stage1_enrich": 45.0,
+        "hash_enrich": 60.0,
+        "hash_finalize": 45.0,
+    }
+    # --- Progress watchdog state ---
+    _last_progress_completed = shortlist_progress.completed
+    _last_progress_monotonic = time.perf_counter()
+    _stall_warning_logged = False
+    _stall_timeout_seconds = float(runtime_config.get("stall_timeout_seconds", 120) or 120)
+    _stall_emergency_seconds = float(runtime_config.get("stall_emergency_seconds", 300) or 300)
+
+    async def _reap_stale_tasks() -> None:
+        """Reap stale tasks across ALL task kinds, not just hash_render."""
+        nonlocal _last_progress_completed, _last_progress_monotonic, _stall_warning_logged
+        nonlocal hash_active_pages_cap
+        stale_refs_by_kind: dict[str, list[Any]] = {}
         now = time.perf_counter()
+
+        # --- Identify stale tasks ---
         for ref, (kind, context) in list(pending.items()):
-            if kind != "hash_render":
+            age_limit = _stale_age_limits.get(kind, 0.0)
+            if age_limit <= 0.0:
                 continue
             age_s = now - float(dict(context).get("submitted_monotonic", now) or now)
-            if age_s < 90.0:
+            if age_s < age_limit:
                 continue
-            stale_refs.append(ref)
-        for ref in stale_refs:
+            stale_refs_by_kind.setdefault(kind, []).append(ref)
+
+        # --- Reap stale stage1 tasks (fetch/parse/enrich) ---
+        for kind in ("stage1_fetch", "stage1_parse", "stage1_enrich"):
+            for ref in stale_refs_by_kind.get(kind, []):
+                pending_entry = pending.pop(ref, None)
+                _debug_pending_submit_times.pop(id(ref), None)
+                if pending_entry is None:
+                    continue
+                _, context = pending_entry
+                metrics.setdefault("stage1_stale_reaped", 0)
+                metrics["stage1_stale_reaped"] += 1
+                logger.warning("Reaped stale %s task | age_limit=%.0fs", kind, _stale_age_limits.get(kind, 0))
+                await _handle_stage_error(
+                    kind, context,
+                    RuntimeError(f"stale_{kind}_task: exceeded {_stale_age_limits.get(kind, 0):.0f}s age limit"),
+                )
+
+        # --- Reap stale hash_enrich tasks ---
+        for ref in stale_refs_by_kind.get("hash_enrich", []):
+            pending_entry = pending.pop(ref, None)
+            _debug_pending_submit_times.pop(id(ref), None)
+            if pending_entry is None:
+                continue
+            _, context = pending_entry
+            metrics.setdefault("hash_enrich_stale_reaped", 0)
+            metrics["hash_enrich_stale_reaped"] += 1
+            logger.warning("Reaped stale hash_enrich task | age_limit=%.0fs", _stale_age_limits.get("hash_enrich", 60))
+            await _handle_stage_error(
+                "hash_enrich", context,
+                RuntimeError(f"stale_hash_enrich_task: exceeded {_stale_age_limits.get('hash_enrich', 60):.0f}s age limit"),
+            )
+
+        # --- Reap stale hash_finalize tasks ---
+        for ref in stale_refs_by_kind.get("hash_finalize", []):
+            pending_entry = pending.pop(ref, None)
+            _debug_pending_submit_times.pop(id(ref), None)
+            if pending_entry is None:
+                continue
+            _, context = pending_entry
+            metrics.setdefault("hash_finalize_stale_reaped", 0)
+            metrics["hash_finalize_stale_reaped"] += 1
+            logger.warning("Reaped stale hash_finalize task | age_limit=%.0fs", _stale_age_limits.get("hash_finalize", 45))
+
+        # --- Reap stale hash_render tasks (original logic with retry + actor replacement) ---
+        for ref in stale_refs_by_kind.get("hash_render", []):
             pending_entry = pending.pop(ref, None)
             _debug_pending_submit_times.pop(id(ref), None)
             if pending_entry is None:
@@ -1093,12 +1161,96 @@ async def run_hashing_shortlist_with_ray_impl(
             metrics["browser_context_reset"] += 1
             metrics["browser_render_retry"] += 1
             if actor_slot >= 0:
-                await _replace_hash_browser_actor(actor_slot, reason="stale_hash_render_task")
+                try:
+                    await _replace_hash_browser_actor(actor_slot, reason="stale_hash_render_task")
+                except Exception:
+                    # Graceful degradation: reduce capacity instead of crashing
+                    logger.warning(
+                        "Failed to replace hash browser actor slot=%d, reducing hash_active_pages_cap from %d",
+                        actor_slot, hash_active_pages_cap,
+                    )
+                    hash_active_pages_cap = max(hash_active_pages_floor, hash_active_pages_cap - 1)
+                    controller_state["hash_active_pages_cap"] = hash_active_pages_cap
             artifact["attempt_count"] = attempt_count + 1
             artifact["submitted_monotonic"] = time.perf_counter()
             artifact["worker_id"] = f"hash-browser-{max(actor_slot, 0)}-{str(artifact.get('record_key', '') or '')[:8] or 'item'}"
             actor_index = actor_slot if 0 <= actor_slot < len(hash_browser_actors) else 0
             _track_pending(hash_browser_actors[actor_index].render.remote(artifact), "hash_render", artifact)
+
+        # --- Finalize buffer safety valve ---
+        finalize_batch_size = max(1, int(runtime_config["hash_finalize_batch"]))
+        if len(finalize_buffer) >= (2 * finalize_batch_size):
+            has_pending_finalize = any(kind == "hash_finalize" for kind, _ in pending.values())
+            if has_pending_finalize:
+                logger.info(
+                    "Finalize buffer safety valve: buffer=%d exceeds 2x batch=%d, but finalize task pending — waiting",
+                    len(finalize_buffer), finalize_batch_size,
+                )
+            else:
+                logger.warning(
+                    "Finalize buffer safety valve triggered: force-flushing %d items (2x batch=%d exceeded)",
+                    len(finalize_buffer), finalize_batch_size,
+                )
+                await _flush_finalize_buffer(
+                    finalize_buffer=finalize_buffer,
+                    pending=pending,
+                    threshold=threshold,
+                    scoring_config=scoring_config,
+                )
+                _ensure_debug_submit_times()
+
+        # --- Progress watchdog ---
+        current_completed = shortlist_progress.completed
+        if current_completed > _last_progress_completed:
+            _last_progress_completed = current_completed
+            _last_progress_monotonic = now
+            _stall_warning_logged = False
+        else:
+            stall_duration = now - _last_progress_monotonic
+            if stall_duration >= _stall_emergency_seconds:
+                logger.error(
+                    "🚨 EMERGENCY STALL DRAIN | no progress for %.0fs (limit=%.0fs) | completed=%d/%d "
+                    "| pending=%d | stage1_backlog=%d | hash_backlog=%d | finalize=%d | "
+                    "FORCE-DRAINING pending tasks to prevent infinite hang",
+                    stall_duration, _stall_emergency_seconds,
+                    current_completed, shortlist_progress.total,
+                    len(pending), len(stage1_backlog), len(hash_backlog), len(finalize_buffer),
+                )
+                # Force-drain: fail all pending tasks to unblock the pipeline
+                for ref in list(pending.keys()):
+                    entry = pending.pop(ref, None)
+                    _debug_pending_submit_times.pop(id(ref), None)
+                    if entry is None:
+                        continue
+                    kind, context = entry
+                    try:
+                        await _handle_stage_error(
+                            kind, context,
+                            RuntimeError(f"emergency_stall_drain: no progress for {stall_duration:.0f}s"),
+                        )
+                    except Exception:
+                        logger.exception("Error during emergency stall drain for %s", kind)
+                stage1_backlog.clear()
+                hash_backlog.clear()
+                _last_progress_monotonic = now
+            elif stall_duration >= _stall_timeout_seconds and not _stall_warning_logged:
+                _stall_warning_logged = True
+                kind_counts: dict[str, int] = {}
+                oldest_ages: dict[str, float] = {}
+                for ref, (kind, _ctx) in pending.items():
+                    kind_counts[kind] = kind_counts.get(kind, 0) + 1
+                    submit_time = _debug_pending_submit_times.get(id(ref), (kind, now))[1]
+                    age = now - submit_time
+                    if kind not in oldest_ages or age > oldest_ages[kind]:
+                        oldest_ages[kind] = round(age, 1)
+                logger.error(
+                    "⚠️ STALL WARNING | no progress for %.0fs (emergency at %.0fs) | completed=%d/%d "
+                    "| pending=%d by_kind=%s | oldest_age=%s | stage1_backlog=%d | hash_backlog=%d",
+                    stall_duration, _stall_emergency_seconds,
+                    current_completed, shortlist_progress.total,
+                    len(pending), kind_counts, oldest_ages,
+                    len(stage1_backlog), len(hash_backlog),
+                )
 
     def _refresh_progress_bar(progress_bar: Any | None) -> None:
         if progress_bar is None:
@@ -1214,14 +1366,15 @@ async def run_hashing_shortlist_with_ray_impl(
             cpu_utilization = max(0.0, min(1.0, used_cpu / cluster_cpu)) if cluster_cpu > 0 else 0.0
             stage1_pending = _pending_count("stage1_fetch", "stage1_parse", "stage1_enrich")
             hash_pending = _pending_count("hash_render", "hash_enrich", "hash_finalize")
-            stage1_pressure_ratio = max(
-                stage1_pending / max(1, stage1_pending_cap),
-                len(stage1_backlog) / max(1, stage1_pending_cap),
-            )
-            hash_pressure_ratio = max(
-                hash_pending / max(1, hash_pending_cap),
-                len(hash_backlog) / max(1, hash_pending_cap),
-            )
+            # Only count ACTIVE inflight pressure for both stage1 and hash.
+            # Backlog depth should NOT count as pressure — it exists precisely
+            # because the pipeline needs more capacity, and counting it here
+            # permanently blocks the healthy_window upshift (was 392/48=8.17×).
+            stage1_pressure_ratio = stage1_pending / max(1, stage1_pending_cap)
+            # Only count ACTIVE inflight pressure, not queued backlog.
+            # The backlog exists precisely because we need more capacity;
+            # including it here permanently blocks the healthy_window upshift.
+            hash_pressure_ratio = hash_pending / max(1, hash_pending_cap)
             completed_now = shortlist_progress.completed
             completed_delta = max(0, completed_now - last_completed)
             last_completed = completed_now
@@ -1335,8 +1488,8 @@ async def run_hashing_shortlist_with_ray_impl(
                 _ensure_debug_submit_times()
                 if not pending:
                     break
-            await _reap_stale_hash_render_tasks()
-            ready, _ = await _ray_wait(list(pending.keys()), num_returns=min(8, len(pending)), timeout=1.0)
+            await _reap_stale_tasks()
+            ready, _ = await _ray_wait(list(pending.keys()), num_returns=min(32, len(pending)), timeout=1.0)
             if not ready:
                 metrics["stage_elapsed_s"] = time.perf_counter() - t0
                 _debug_consecutive_empty_waits += 1
