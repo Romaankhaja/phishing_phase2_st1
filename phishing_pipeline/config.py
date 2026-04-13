@@ -346,7 +346,7 @@ RUNTIME_PROFILE_CONFIG: dict[str, dict[str, Any]] = {
             "PHISHING_RAY_PREWARM_ACTORS": "true",
             "PHISHING_RAY_ENABLE_DYNAMIC_CONTROL": "true",
             "PHISHING_RAY_TARGET_CPU_UTILIZATION": "0.92",
-            "PHISHING_RAY_CPU_HEADROOM_CORES": "4",
+            "PHISHING_RAY_CPU_HEADROOM_CORES": "2",
         },
         "stage1_http": {
             "concurrency": 192,

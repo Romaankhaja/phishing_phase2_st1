@@ -214,14 +214,22 @@ def _decide_shortlist_controller_update(
         reason = ",".join(severe_reasons[:3])
     elif backlog_upshift_ready:
         next_state["healthy_streak"] = 0
+        changed = False
+        # Stage1 fetch and hash render are independent pipelines — allow
+        # stage1 to keep running even when browsers are slow.
+        if int(next_state.get("stage1_live_fetch_limit", stage1_fetch_limit_floor) or stage1_fetch_limit_floor) < stage1_fetch_limit_cap:
+            next_state["stage1_live_fetch_limit"] = min(
+                stage1_fetch_limit_cap,
+                int(next_state.get("stage1_live_fetch_limit", stage1_fetch_limit_floor) or stage1_fetch_limit_floor) + 16,
+            )
+            changed = True
         if int(next_state.get("hash_live_active_pages", hash_active_pages_cap) or hash_active_pages_cap) < hash_active_pages_cap:
             next_state["hash_live_active_pages"] = min(
                 hash_active_pages_cap,
                 int(next_state.get("hash_live_active_pages", hash_active_pages_cap) or hash_active_pages_cap) + 2,
             )
-            action = "upshift"
-        else:
-            action = "hold"
+            changed = True
+        action = "upshift" if changed else "hold"
         reason = "render_backlog"
     elif healthy_window:
         next_state["healthy_streak"] = int(next_state.get("healthy_streak", 0) or 0) + 1
@@ -237,13 +245,13 @@ def _decide_shortlist_controller_update(
             if int(next_state.get("stage1_live_fetch_limit", stage1_fetch_limit_floor) or stage1_fetch_limit_floor) < stage1_fetch_limit_cap:
                 next_state["stage1_live_fetch_limit"] = min(
                     stage1_fetch_limit_cap,
-                    int(next_state.get("stage1_live_fetch_limit", stage1_fetch_limit_floor) or stage1_fetch_limit_floor) + 24,
+                    int(next_state.get("stage1_live_fetch_limit", stage1_fetch_limit_floor) or stage1_fetch_limit_floor) + 16,
                 )
                 changed = True
             if int(next_state.get("hash_live_active_pages", hash_active_pages_floor) or hash_active_pages_floor) < hash_active_pages_cap:
                 next_state["hash_live_active_pages"] = min(
                     hash_active_pages_cap,
-                    int(next_state.get("hash_live_active_pages", hash_active_pages_floor) or hash_active_pages_floor) + 6,
+                    int(next_state.get("hash_live_active_pages", hash_active_pages_floor) or hash_active_pages_floor) + 4,
                 )
                 changed = True
             action = "upshift" if changed else "hold"
