@@ -1,0 +1,236 @@
+Traceback (most recent call last)::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  Γå│ Scanning: airindia.com
+  Γå│ Scanning: assam.census.gov.in
+  Γå│ Scanning: cats.census.gov.in
+  Γå│ Scanning: censusindia.gov.in
+  Γå│ Scanning: census.gov.in
+  Γå│ Scanning: vs_cmms.census.gov.in
+  Γå│ Scanning: crsorgi.gov.in
+  Γå│ Scanning: api.crsorgi.gov.in
+  Γå│ Scanning: dc.crsorgi.gov.in
+  Γå│ Scanning: canarabank.com
+  Γå│ Scanning: tracker.census.gov.in
+  Γå│ Scanning: api.census.gov.in
+  Γå│ Scanning: censussahayak.census.gov.in
+  Γå│ Scanning: chandigarh.census.gov.in
+  Γå│ Scanning: coalindia.in
+  Γå│ Scanning: apidel.census.gov.in
+  ΓÜá Error: vs_cmms.census.gov.in ΓÇö Page.goto: net::ERR_NAME_NOT_RESOLVED at https://vs_cmms.census.gov.in/
+Call log:
+  - navigating to "https://vs_cmms.census.gov.in/", waiting until "domcontentloaded"
+
+  Γå│ Scanning: dev.crsorgi.gov.in
+  ΓÜá Error: canarabank.com ΓÇö Page.goto: net::ERR_NAME_NOT_RESOLVED at https://canarabank.com/
+Call log:
+  - navigating to "https://canarabank.com/", waiting until "domcontentloaded"
+
+  Γå│ Scanning: dev-api.census.gov.in
+  ΓÜá Error: airindia.com ΓÇö Page.goto: net::ERR_HTTP2_PROTOCOL_ERROR at https://airindia.com/
+Call log:
+  - navigating to "https://airindia.com/", waiting until "domcontentloaded"
+
+  Γå│ Scanning: epurti.census.gov.in
+  ΓÜá Error: coalindia.in ΓÇö Page.goto: net::ERR_NAME_NOT_RESOLVED at https://coalindia.in/
+Call log:
+  - navigating to "https://coalindia.in/", waiting until "domcontentloaded"
+
+  Γå│ Scanning: failover.census.gov.in
+  ΓÜá Error: api.census.gov.in ΓÇö Page.goto: net::ERR_CONNECTION_RESET at https://api.census.gov.in/
+Call log:
+  - navigating to "https://api.census.gov.in/", waiting until "domcontentloaded"
+
+  Γå│ Scanning: geoportal.census.gov.in
+  ΓÜá Error: geoportal.census.gov.in ΓÇö Page.goto: net::ERR_CONNECTION_RESET at https://geoportal.census.gov.in/
+Call log:
+  - navigating to "https://geoportal.census.gov.in/", waiting until "domcontentloaded"
+
+  Γå│ Scanning: gujarat.census.gov.in
+  Γå│ Scanning: haryana.census.gov.in
+  Γå│ Scanning: icicicareers.com
+  Γå│ Scanning: infiniti.icicibank.com
+  ΓÜá Error: icicicareers.com ΓÇö Page.goto: net::ERR_NAME_NOT_RESOLVED at https://icicicareers.com/
+Call log:
+  - navigating to "https://icicicareers.com/", waiting until "domcontentloaded"
+
+  Γå│ Scanning: idfcfirstbank.com
+  Γå│ Scanning: incometax.gov.in
+  ΓÜá Error: incometax.gov.in ΓÇö Page.goto: net::ERR_NAME_NOT_RESOLVED at https://incometax.gov.in/
+Call log:
+  - navigating to "https://incometax.gov.in/", waiting until "domcontentloaded"
+
+  Γå│ Scanning: incometaxindiaefiling.gov.in
+  Γå│ Scanning: indianoilcgd.com
+  Γå│ Scanning: irctc.co.in
+  Γå│ Scanning: isro.gov.in
+  ΓÜá Error: isro.gov.in ΓÇö Page.goto: net::ERR_NAME_NOT_RESOLVED at https://isro.gov.in/
+Call log:
+  - navigating to "https://isro.gov.in/", waiting until "domcontentloaded"
+
+  Γå│ Scanning: sac.gov.in
+  Γå│ Scanning: iirs.gov.in
+  Γå│ Scanning: nrsc.gov.in
+  ΓÜá Error: sac.gov.in ΓÇö Page.goto: net::ERR_NAME_NOT_RESOLVED at https://sac.gov.in/
+Call log:
+  - navigating to "https://sac.gov.in/", waiting until "domcontentloaded"
+
+  Γå│ Scanning: intranet.census.gov.in
+  ΓÜá Error: irctc.co.in ΓÇö Page.goto: net::ERR_HTTP2_PROTOCOL_ERROR at https://irctc.co.in/
+Call log:
+  - navigating to "https://irctc.co.in/", waiting until "domcontentloaded"
+
+  Γå│ Scanning: jharkhand.census.gov.in
+  ΓÜá Error: nrsc.gov.in ΓÇö Page.goto: net::ERR_NAME_NOT_RESOLVED at https://nrsc.gov.in/
+Call log:
+  - navigating to "https://nrsc.gov.in/", waiting until "domcontentloaded"
+
+  Γå│ Scanning: karnataka.census.gov.in
+  Γå│ Scanning: uatdco.census.gov.in
+  Γå│ Scanning: language.census.gov.in
+  Γå│ Scanning: apilko.census.gov.in
+  ΓÜá Error: idfcfirstbank.com ΓÇö 'domain_simhashes'
+  Γå│ Scanning: load.census.gov.in
+  Γå│ Scanning: map.census.gov.in
+  Γå│ Scanning: mp.census.gov.in
+  Γå│ Scanning: maharashtra.census.gov.in
+  Γå│ Scanning: uatcensusindia.gov.in
+  File "C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "C:\Users\SATWIK\Documents\Phishing\phishing_pipeline\hashing_legit_domains.py", line 320, in <module>
+    asyncio.run(generate_hashes())
+  File "C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\asyncio\base_events.py", line 649, in 
+run_until_complete
+    return future.result()
+  File "C:\Users\SATWIK\Documents\Phishing\phishing_pipeline\hashing_legit_domains.py", line 309, in generate_hashes
+    print(f"Γ\x8f▒ Phase 1 (browsing) done in {browse_elapsed:.1f}s")
+  File "C:\Users\SATWIK\AppData\Local\Programs\Python\Python310\lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+UnicodeEncodeError: 'charmap' codec can't encode character '\x8f' in position 1: character maps to <undefined>
+  ΓÜá Error: uatcensusindia.gov.in ΓÇö Page.goto: net::ERR_NAME_NOT_RESOLVED at https://uatcensusindia.gov.in/
+Call log:
+  - navigating to "https://uatcensusindia.gov.in/", waiting until "domcontentloaded"
+
+  Γå│ Scanning: authwebmail.nic.in
+  Γå│ Scanning: odisha.census.gov.in
+  Γå│ Scanning: pbr.census.gov.in
+  Γå│ Scanning: prod.census.gov.in
+  Γå│ Scanning: punjab.census.gov.in
+  ΓÜá Error: tracker.census.gov.in ΓÇö Page.goto: net::ERR_CONNECTION_REFUSED at https://tracker.census.gov.in/
+Call log:
+  - navigating to "https://tracker.census.gov.in/", waiting until "domcontentloaded"
+
+  Γå│ Scanning: pnbint.com
+  ΓÜá Error: censussahayak.census.gov.in ΓÇö Page.goto: net::ERR_CONNECTION_REFUSED at https://censussahayak.census.gov.in/
+Call log:
+  - navigating to "https://censussahayak.census.gov.in/", waiting until "domcontentloaded"
+
+  Γå│ Scanning: rajasthan.census.gov.in
+  ΓÜá Error: incometaxindiaefiling.gov.in ΓÇö Page.goto: net::ERR_NAME_NOT_RESOLVED at https://incometaxindiaefiling.gov.in/
+Call log:
+  - navigating to "https://incometaxindiaefiling.gov.in/", waiting until "domcontentloaded"
+
+  Γå│ Scanning: rebit.org.in
+  Γå│ Scanning: se.census.gov.in
+  ΓÜá Error: pbr.census.gov.in ΓÇö Page.goto: net::ERR_CONNECTION_REFUSED at https://pbr.census.gov.in/
+Call log:
+  - navigating to "https://pbr.census.gov.in/", waiting until "domcontentloaded"
+
+  Γå│ Scanning: se.npr.gov.in
+  ΓÜá Error: se.npr.gov.in ΓÇö Page.goto: net::ERR_CONNECTION_RESET at https://se.npr.gov.in/
+Call log:
+  - navigating to "https://se.npr.gov.in/", waiting until "domcontentloaded"
+
+  Γå│ Scanning: srs.census.gov.in
+  Γå│ Scanning: sedel.census.gov.in
+  ΓÜá Error: rebit.org.in ΓÇö 'domain_simhashes'
+  Γå│ Scanning: orgi-sparrow.gov.in
+  Γå│ Scanning: tran.census.gov.in
+  Γå│ Scanning: tn.census.gov.in
+  Γå│ Scanning: test.census.gov.in
+  ΓÜá Error: infiniti.icicibank.com ΓÇö Page.goto: net::ERR_CONNECTION_RESET at https://infiniti.icicibank.com/
+Call log:
+  - navigating to "https://infiniti.icicibank.com/", waiting until "domcontentloaded"
+
+  Γå│ Scanning: census-test.census.gov.in
+  ΓÜá Error: indianoilcgd.com ΓÇö Page.goto: net::ERR_CONNECTION_TIMED_OUT at https://indianoilcgd.com/
+Call log:
+  - navigating to "https://indianoilcgd.com/", waiting until "domcontentloaded"
+
+  Γå│ Scanning: devtran.census.gov.in
+  ΓÜá Error: iirs.gov.in ΓÇö Page.goto: net::ERR_CONNECTION_TIMED_OUT at https://iirs.gov.in/
+Call log:
+  - navigating to "https://iirs.gov.in/", waiting until "domcontentloaded"
+
+  Γå│ Scanning: uatbooks.census.gov.in
+  Γå│ Scanning: uat.crsorgi.gov.in
+  ΓÜá Error: load.census.gov.in ΓÇö Page.goto: net::ERR_CONNECTION_REFUSED at https://load.census.gov.in/
+Call log:
+  - navigating to "https://load.census.gov.in/", waiting until "domcontentloaded"
+
+  Γå│ Scanning: uatdco.census.gov.in
+  Γå│ Scanning: uatsrs.census.gov.in
+  Γå│ Scanning: uat-api.census.gov.in
+  Γå│ Scanning: uatcrsapi.census.gov.in
+  ΓÜá Error: uat-api.census.gov.in ΓÇö Page.goto: net::ERR_CONNECTION_RESET at https://uat-api.census.gov.in/
+Call log:
+  - navigating to "https://uat-api.census.gov.in/", waiting until "domcontentloaded"
+
+  Γå│ Scanning: infrandc.census.gov.in
+  Γå│ Scanning: uatdco.census.gov.in
+  Γå│ Scanning: uidai.gov.in
+  Γå│ Scanning: vaptapi.census.gov.in
+  Γå│ Scanning: westbengal.census.gov.in
+  Γå│ Scanning: ana.crsorgi.gov.in
+  ΓÜá Error: prod.census.gov.in ΓÇö Page.goto: net::ERR_CONNECTION_REFUSED at https://prod.census.gov.in/
+Call log:
+  - navigating to "https://prod.census.gov.in/", waiting until "domcontentloaded"
+
+  Γå│ Scanning: apidel.census.gov.in
+  ΓÜá Error: authwebmail.nic.in ΓÇö Page.goto: net::ERR_CONNECTION_TIMED_OUT at https://authwebmail.nic.in/
+Call log:
+  - navigating to "https://authwebmail.nic.in/", waiting until "domcontentloaded"
+
+  Γå│ Scanning: books.census.gov.in
+  Γå│ Scanning: dchb.census.gov.in
+  Γå│ Scanning: npr.gov.in
+  ΓÜá Error: npr.gov.in ΓÇö Page.goto: net::ERR_CONNECTION_RESET at https://npr.gov.in/
+Call log:
+  - navigating to "https://npr.gov.in/", waiting until "domcontentloaded"
+
+  ΓÜá Error: pnbint.com ΓÇö Page.goto: net::ERR_CONNECTION_TIMED_OUT at https://pnbint.com/
+Call log:
+  - navigating to "https://pnbint.com/", waiting until "domcontentloaded"
+
+  ΓÜá Error: census-test.census.gov.in ΓÇö Page.goto: net::ERR_CONNECTION_REFUSED at https://census-test.census.gov.in/
+Call log:
+  - navigating to "https://census-test.census.gov.in/", waiting until "domcontentloaded"
+
+  ΓÜá Error: infrandc.census.gov.in ΓÇö Page.goto: net::ERR_CONNECTION_REFUSED at https://infrandc.census.gov.in/
+Call log:
+  - navigating to "https://infrandc.census.gov.in/", waiting until "domcontentloaded"
+
+  ΓÜá Error: vaptapi.census.gov.in ΓÇö Page.goto: net::ERR_CONNECTION_REFUSED at https://vaptapi.census.gov.in/
+Call log:
+  - navigating to "https://vaptapi.census.gov.in/", waiting until "domcontentloaded"
+
+  ΓÜá Error: rajasthan.census.gov.in ΓÇö Page.screenshot: Timeout 30000ms exceeded.
+Call log:
+  - taking page screenshot
+  - waiting for fonts to load...
+  - fonts loaded
+
+  ΓÜá Error: uidai.gov.in ΓÇö Page.screenshot: Timeout 30000ms exceeded.
+Call log:
+  - taking page screenshot
+  - waiting for fonts to load...
+
+  ΓÜá Error: punjab.census.gov.in ΓÇö Page.screenshot: Timeout 30000ms exceeded.
+Call log:
+  - taking page screenshot
+  - waiting for fonts to load...
+

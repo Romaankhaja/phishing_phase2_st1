@@ -127,33 +127,83 @@ def get_ssl_hash(domain):
 
 BASE_DIR = os.path.dirname(__file__)
 ROOT_DIR = os.path.dirname(BASE_DIR)
-EXCEL_PATH = os.path.join(ROOT_DIR, "data", "Stage_2_Legitimate_Domains.xlsx")
-
-df = pd.read_excel(EXCEL_PATH)
-df["CSE Name"] = df["CSE Name"].ffill()
-
 
 def clean_domain(url):
+    import pandas as pd
     if pd.isna(url):
         return None
-
     url = str(url).strip()
-
     if not url.startswith("http"):
         url = "https://" + url
-
+    from urllib.parse import urlparse
     return urlparse(url).netloc.lower()
 
+df_list = []
+import os
+import pandas as pd
 
-df["domain"] = df["Legitimate Domains/URLs"].apply(clean_domain)
+# File 1 (Stage 2)
+EXCEL_PATH = os.path.join(ROOT_DIR, "data", "Stage_2_Legitimate_Domains.xlsx")
+if os.path.exists(EXCEL_PATH):
+    df1 = pd.read_excel(EXCEL_PATH)
+    if "CSE Name" in df1.columns:
+        df1["CSE Name"] = df1["CSE Name"].ffill()
+        df1 = df1.rename(columns={"CSE Name": "entity", "Legitimate Domains/URLs": "raw_url"})
+        df_list.append(df1[["entity", "raw_url"]])
+
+# File 2 (Public URL)
+NEW_EXCEL_PATH = os.path.join(ROOT_DIR, "data", "whitelists", "Public URL & IPs-09-04-2026.xlsx")
+if os.path.exists(NEW_EXCEL_PATH):
+    df2 = pd.read_excel(NEW_EXCEL_PATH)
+    if "Application Name" in df2.columns:
+        df2["Application Name"] = df2["Application Name"].ffill()
+        df2 = df2.rename(columns={"Application Name": "entity", "Public URL": "raw_url"})
+        df_list.append(df2[["entity", "raw_url"]])
+
+if df_list:
+    df = pd.concat(df_list, ignore_index=True)
+else:
+    df = pd.DataFrame(columns=["entity", "raw_url"])
+
+df["domain"] = df["raw_url"].apply(clean_domain)
 df = df.dropna(subset=["domain"])
+df["entity"] = df["entity"].astype(str).str.strip()
+
+# Load Existing DB to skip processed domains
+DB_PATH = os.path.join(ROOT_DIR, "data", "entity_hash_db.json")
+existing_db = {}
+import json
+if os.path.exists(DB_PATH):
+    try:
+        with open(DB_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            for k, v in data.items():
+                if k == "_meta": continue
+                existing_db[k] = v
+    except Exception:
+        pass
+df["entity"] = df["entity"].astype(str).str.strip()
+
+# Load Existing DB to skip processed domains
+DB_PATH = os.path.join(ROOT_DIR, "data", "entity_hash_db.json")
+existing_db = {}
+import json
+if os.path.exists(DB_PATH):
+    try:
+        with open(DB_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            for k, v in data.items():
+                if k == "_meta": continue
+                existing_db[k] = v
+    except Exception:
+        pass
 
 
 ###############################################
 # MAIN (parallel)
 ###############################################
 
-entity_db = {}
+entity_db = existing_db.copy()
 
 
 async def _scan_domain(domain, entity, context, semaphore, aio_session, lock):
@@ -225,21 +275,25 @@ async def generate_hashes():
 
         all_tasks = []
 
-        for entity, group in df.groupby("CSE Name"):
+        for entity, group in df.groupby("entity"):
+            if entity not in entity_db:
+                entity_db[entity] = {
+                    "domains": [],
+                    "domain_simhashes": [],
+                    "page_phashes": [],
+                    "favicon_phashes": [],
+                    "ssl_simhashes": [],
+                    "keywords": []
+                }
 
-            entity_db[entity] = {
-                "domains": [],
-                "domain_simhashes": [],
-                "page_phashes": [],
-                "favicon_phashes": [],
-                "ssl_simhashes": [],
-                "keywords": []
-            }
+            processed = set(entity_db[entity].get("domains", []))
 
             for domain in group["domain"]:
-                all_tasks.append(
-                    _scan_domain(domain, entity, context, semaphore, aio_session, lock)
-                )
+                if domain not in processed:
+                    all_tasks.append(
+                        _scan_domain(domain, entity, context, semaphore, aio_session, lock)
+                    )
+                    processed.add(domain)
 
         total = len(all_tasks)
         print(f"ðŸš€ Scanning {total} domains with up to {MAX_CONCURRENT_PAGES} concurrent pages...")
@@ -262,22 +316,22 @@ async def generate_hashes():
 # RUN
 ###############################################
 
-asyncio.run(generate_hashes())
+if __name__ == "__main__":
+    asyncio.run(generate_hashes())
 
+    ###############################################
+    # SAVE
+    ###############################################
 
-###############################################
-# SAVE
-###############################################
+    output_payload = {
+        "_meta": {
+            "hash_schema_version": 2,
+        },
+        **entity_db,
+    }
 
-output_payload = {
-    "_meta": {
-        "hash_schema_version": 2,
-    },
-    **entity_db,
-}
-
-with open(os.path.join(os.path.dirname(BASE_DIR), "data", "entity_hash_db.json"), "w", encoding="utf-8") as f:
-    json.dump(output_payload, f, indent=4)
+    with open(DB_PATH, "w", encoding="utf-8") as f:
+        json.dump(output_payload, f, indent=4)
 
 
 print("âœ… DB GENERATED WITH SIMILARITY HASHES (schema v2)")
