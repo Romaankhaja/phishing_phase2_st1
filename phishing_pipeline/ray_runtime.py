@@ -299,10 +299,17 @@ class _MetricsActorImpl:
 
 class _CheckpointWriterActorImpl:
     def __init__(self, run_context: dict[str, Any]) -> None:
+        import concurrent.futures
         self._context = _run_context_from_value(run_context)
         if self._context is None:
             raise ValueError("run_context is required")
         self._store = CheckpointStore(self._context)
+        # Background thread for disk I/O — keeps the actor thread free to serve
+        # get_backlog_snapshot / upsert_url_result without blocking.
+        self._io_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="ckpt-io"
+        )
+        self._pending_export_future: concurrent.futures.Future | None = None
 
     def update_manifest(self, **patch: Any) -> None:
         self._store.update_manifest(**patch)
@@ -361,13 +368,33 @@ class _CheckpointWriterActorImpl:
         return self._store.snapshot_backlog()
 
     def export_all(self) -> None:
-        self._store.export_all(best_effort=True)
+        """Fire-and-forget async export — runs disk I/O on a background thread.
+
+        If a previous export is still running, this cycle is skipped.
+        The in-memory store always holds the complete dataset; the next
+        flush will write everything including any skipped rows.
+        """
+        if self._pending_export_future is not None and not self._pending_export_future.done():
+            return
+        self._pending_export_future = self._io_executor.submit(
+            self._store.export_all, best_effort=True
+        )
+
+    def _wait_pending_export(self, timeout: float = 30.0) -> None:
+        """Block until any in-flight background export completes."""
+        if self._pending_export_future is not None and not self._pending_export_future.done():
+            try:
+                self._pending_export_future.result(timeout=timeout)
+            except Exception:
+                pass
 
     def mark_completed(self) -> None:
+        self._wait_pending_export()
         self._store.mark_completed()
         self._store.export_all(best_effort=True)
 
     def mark_failed(self, *, stage: str, error_type: str = "", error_message: str = "") -> None:
+        self._wait_pending_export()
         self._store.update_manifest(
             status="failed",
             completed_at=utc_now_iso(),
@@ -378,7 +405,9 @@ class _CheckpointWriterActorImpl:
         self._store.export_all(best_effort=True)
 
     def close(self) -> None:
+        self._wait_pending_export()
         self._store.close()
+        self._io_executor.shutdown(wait=True)
 
 
 class _LookupCacheActorImpl:

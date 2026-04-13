@@ -753,9 +753,9 @@ def _estimate_ray_cpu_budget(config: dict[str, object]) -> tuple[float, float, f
     hash_finalize_batch = max(1, int(config.get("hash_finalize_batch", 1) or 1))
     server_mode = bool(config.get("server_mode"))
     # IO-bound actors need minimal CPU reservation on servers
-    fetch_actor_cpu = 0.10 if server_mode else 0.25
-    enrich_actor_cpu = 0.10 if server_mode else 0.25
-    browser_actor_cpu = 0.20 if server_mode else 0.50
+    fetch_actor_cpu = 0.05 if server_mode else 0.25
+    enrich_actor_cpu = 0.05 if server_mode else 0.25
+    browser_actor_cpu = 0.10 if server_mode else 0.50
     classify_actor_cpu = 0.35 if server_mode else 1.0
     ocr_actor_cpu = 0.50 if server_mode else 1.0
     actor_cpu_demand = (
@@ -1070,7 +1070,7 @@ def resolve_ray_runtime_config(
         "prewarm_mode": "staged",
         "enable_dynamic_control": True,
         "target_cpu_utilization": 0.92,
-        "cpu_headroom_cores": 4,
+        "cpu_headroom_cores": 2,
     }
     if server_mode:
         for key, value in server_defaults.items():

@@ -98,8 +98,8 @@
     "whitelist": "C:\\Users\\SATWIK\\Documents\\Phishing\\data\\whitelists\\Stage_2_Legitimate_Domains_80.xlsx"
   },
   "pipeline_status_counts": {
-    "filtered_lexical_miss": 40,
-    "pending": 1739
+    "filtered_lexical_miss": 47,
+    "pending": 1732
   },
   "run_id": "run_20260413T113749Z",
   "run_output_dir": "c:\\Users\\SATWIK\\Documents\\Phishing\\output\\runs\\run_20260413T113749Z",
@@ -107,12 +107,12 @@
   "status": "running",
   "telemetry_mode": "sampled",
   "totals": {
-    "stage_events": 289,
-    "stage_metrics": 82,
+    "stage_events": 438,
+    "stage_metrics": 96,
     "stall_events": 0,
-    "terminal_records": 40,
+    "terminal_records": 47,
     "tracked_records": 1779,
-    "worker_heartbeats": 3
+    "worker_heartbeats": 1
   },
-  "updated_at": "2026-04-13T12:18:08+00:00"
+  "updated_at": "2026-04-13T14:01:21+00:00"
 }

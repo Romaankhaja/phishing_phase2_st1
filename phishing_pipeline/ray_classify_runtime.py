@@ -1472,7 +1472,8 @@ async def run_hash_only_pipeline_with_ray_impl(
                 severe_reasons.append("cpu_headroom_low")
             if available_cpu < float(cpu_headroom_cores) and cpu_utilization > min(0.99, target_cpu_utilization + 0.12):
                 severe_reasons.append("cpu_utilization")
-            if event_loop_lag_ms > 250.0:
+            server_mode = bool(runtime_config.get("server_mode"))
+            if event_loop_lag_ms > (3000.0 if server_mode else 250.0):
                 severe_reasons.append("event_loop_lag")
             if checkpoint_pending_rows > 20000:
                 severe_reasons.append("checkpoint_backlog")
@@ -1500,12 +1501,12 @@ async def run_hash_only_pipeline_with_ray_impl(
                 )
                 if dynamic_control_enabled and healthy_window:
                     controller_state["healthy_streak"] = int(controller_state.get("healthy_streak", 0) or 0) + 1
-                    if int(controller_state["healthy_streak"]) >= 2:
+                    if int(controller_state["healthy_streak"]) >= 1:
                         controller_state["healthy_streak"] = 0
                         if int(controller_state["classify_live_inflight"]) < classify_inflight_cap:
                             controller_state["classify_live_inflight"] = min(
                                 classify_inflight_cap,
-                                int(controller_state["classify_live_inflight"]) + 4,
+                                int(controller_state["classify_live_inflight"]) + 12,
                             )
                             controller_state["action"] = "upshift"
                             controller_state["reason"] = "healthy_window"

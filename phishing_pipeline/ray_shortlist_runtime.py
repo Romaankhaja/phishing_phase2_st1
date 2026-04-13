@@ -141,7 +141,7 @@ def _decide_shortlist_controller_update(
     )
     # Server mode uses higher thresholds — event loop lag from checkpoint I/O spikes
     # are harmless when actual CPU is idle. 250ms is far too aggressive for servers.
-    event_loop_stalled = event_loop_lag_ms > (1500.0 if server_mode else 250.0)
+    event_loop_stalled = event_loop_lag_ms > (3000.0 if server_mode else 250.0)
     checkpoint_backlogged = checkpoint_pending_rows > 20000
     checkpoint_growing = checkpoint_backlog_growth > 2000
     local_pressure = cpu_headroom_low or cpu_utilization_high or event_loop_stalled or checkpoint_backlogged or checkpoint_growing
@@ -153,7 +153,7 @@ def _decide_shortlist_controller_update(
         severe_reasons.append("cpu_utilization")
     if event_loop_stalled:
         severe_reasons.append("event_loop_lag")
-    if stage1_pressure_ratio > 0.75:
+    if stage1_pressure_ratio > 0.85:
         severe_reasons.append("stage1_pressure")
     if finalize_buffer_depth > (2 * max(1, int(hash_finalize_batch_size))):
         severe_reasons.append("hash_finalize_backlog")
@@ -225,7 +225,7 @@ def _decide_shortlist_controller_update(
         reason = "render_backlog"
     elif healthy_window:
         next_state["healthy_streak"] = int(next_state.get("healthy_streak", 0) or 0) + 1
-        if int(next_state["healthy_streak"]) >= 2:
+        if int(next_state["healthy_streak"]) >= 1:
             next_state["healthy_streak"] = 0
             changed = False
             if int(next_state.get("stage0_live_inflight", stage0_inflight_floor) or stage0_inflight_floor) < stage0_inflight_cap:
@@ -237,13 +237,13 @@ def _decide_shortlist_controller_update(
             if int(next_state.get("stage1_live_fetch_limit", stage1_fetch_limit_floor) or stage1_fetch_limit_floor) < stage1_fetch_limit_cap:
                 next_state["stage1_live_fetch_limit"] = min(
                     stage1_fetch_limit_cap,
-                    int(next_state.get("stage1_live_fetch_limit", stage1_fetch_limit_floor) or stage1_fetch_limit_floor) + 8,
+                    int(next_state.get("stage1_live_fetch_limit", stage1_fetch_limit_floor) or stage1_fetch_limit_floor) + 24,
                 )
                 changed = True
             if int(next_state.get("hash_live_active_pages", hash_active_pages_floor) or hash_active_pages_floor) < hash_active_pages_cap:
                 next_state["hash_live_active_pages"] = min(
                     hash_active_pages_cap,
-                    int(next_state.get("hash_live_active_pages", hash_active_pages_floor) or hash_active_pages_floor) + 2,
+                    int(next_state.get("hash_live_active_pages", hash_active_pages_floor) or hash_active_pages_floor) + 6,
                 )
                 changed = True
             action = "upshift" if changed else "hold"
