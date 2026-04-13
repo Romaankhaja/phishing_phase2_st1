@@ -1,5 +1,6 @@
 {
   "args": {
+    "classify_hash_floor": 25.0,
     "domain_sim_threshold": 0.8,
     "failed_fetch_review_min": null,
     "failed_fetch_suspected_min": null,

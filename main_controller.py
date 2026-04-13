@@ -426,6 +426,10 @@ async def main():
                         help="Weight for keyword overlap contribution (default=10)")
     parser.add_argument("--shortlist-debug-csv", type=str, default=os.path.join("output", "stage1_lexical_debug.csv"),
                         help="Path for Stage 1 lexical/debug CSV (default=output/stage1_lexical_debug.csv)")
+    parser.add_argument("--classify-hash-floor", type=_non_negative_float, default=40.0,
+                        help="Minimum hash_score to send a holdout URL to Stage 2 classify (OCR/WHOIS). "
+                             "URLs below this floor are auto-classified as Legitimate unless they have "
+                             "strict_lexical_hit, hash_anchor, or stage1_passthrough. Set to 0 to disable. (default=25)")
     parser.add_argument("--stage-smoke-test", type=_stage_smoke_mode, default="off",
                         help="Optional partial-run mode: off, fetch, lexical, score, classify, all (default=off)")
     parser.add_argument("--runtime-profile", type=_runtime_profile, default="auto",
@@ -912,6 +916,7 @@ async def main():
                     keep_fetch_failed_strict_lexical=args.keep_fetch_failed_strict_lexical,
                     failed_fetch_suspected_min=args.failed_fetch_suspected_min,
                     failed_fetch_review_min=args.failed_fetch_review_min,
+                    classify_hash_floor=args.classify_hash_floor,
                     run_context=run_context,
                     checkpoint_store=checkpoint_store,
                     resume=args.resume,
@@ -1027,6 +1032,7 @@ async def main():
                     keep_fetch_failed_strict_lexical=args.keep_fetch_failed_strict_lexical,
                     failed_fetch_suspected_min=args.failed_fetch_suspected_min,
                     failed_fetch_review_min=args.failed_fetch_review_min,
+                    classify_hash_floor=args.classify_hash_floor,
                     run_context=run_context,
                     checkpoint_store=checkpoint_store,
                     resume=args.resume,

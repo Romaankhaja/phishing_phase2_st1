@@ -79,6 +79,8 @@ def _is_browser_lifecycle_error(exc: BaseException | None) -> bool:
             "browser has been closed",
             "context has been closed",
             "page has been closed",
+            "playwright is closed",
+            "connection closed",
         )
     )
 
@@ -593,6 +595,8 @@ class _HashBrowserActorImpl:
         self._context_resets = 0
         self._render_retries = 0
         self._render_retry_exhausted = 0
+        self._pages_rendered = 0
+        self._recycle_threshold = 250
 
     async def _reset_browser(self, *, reason: str = "") -> None:
         async with self._lock:
@@ -661,6 +665,11 @@ class _HashBrowserActorImpl:
 
         await self._ensure_browser()
         async with self._page_semaphore:
+            self._pages_rendered += 1
+            if self._pages_rendered >= self._recycle_threshold and not self._page_semaphore.locked():
+                await self._reset_browser(reason="periodic_context_flush")
+                self._pages_rendered = 0
+
             browser_retry_taken = False
             for attempt_index in range(2):
                 page = None
@@ -691,7 +700,10 @@ class _HashBrowserActorImpl:
                     raise
                 finally:
                     if page is not None and not page.is_closed():
-                        await page.close()
+                        try:
+                            await asyncio.wait_for(page.close(), timeout=3.0)
+                        except Exception:
+                            await self._reset_browser(reason="stuck_page_close")
             raise RuntimeError("browser_actor_failure_after_retry: render loop exhausted")
 
     async def stats(self) -> dict[str, Any]:

@@ -13,7 +13,7 @@
     "cpu_headroom_cores": 6,
     "critical_memory_mode": true,
     "debug_mode": false,
-    "detected_available_ram_gb": 0.93,
+    "detected_available_ram_gb": 1.02,
     "detected_total_ram_gb": 7.74,
     "enable_dynamic_control": true,
     "hash_browser_actors": 1,

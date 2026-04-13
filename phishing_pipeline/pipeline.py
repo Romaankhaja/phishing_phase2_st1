@@ -2737,6 +2737,7 @@ async def run_pipeline(
     keep_fetch_failed_strict_lexical=False,
     failed_fetch_suspected_min=None,
     failed_fetch_review_min=None,
+    classify_hash_floor: float = 25.0,
     run_context: RunContext | None = None,
     checkpoint_store: CheckpointStore | None = None,
     resume: bool = False,
@@ -2896,6 +2897,48 @@ async def run_pipeline(
         ]
         logger.info("%d domains remaining after legacy checkpoint resume", len(df_filtered))
 
+    # ── Stage 2 admission gate: filter by hash_score floor ─────────────────
+    classify_hash_floor = float(classify_hash_floor or 0.0)
+    if classify_hash_floor > 0 and "hash_score" in df_filtered.columns:
+        df_filtered["hash_score"] = pd.to_numeric(df_filtered["hash_score"], errors="coerce").fillna(0.0)
+
+        def _bypass_floor(row) -> bool:
+            """URLs with strong lexical evidence bypass the hash floor."""
+            return (
+                _as_bool_flag(row.get("strict_lexical_hit"))
+                or _as_bool_flag(row.get("hash_anchor"))
+                or _as_bool_flag(row.get("stage1_passthrough"))
+                or _as_bool_flag(row.get("typo_anchor"))
+                or _as_bool_flag(row.get("content_spoof_strong"))
+            )
+
+        bypass_mask = df_filtered.apply(_bypass_floor, axis=1)
+        score_mask = df_filtered["hash_score"] >= classify_hash_floor
+        admission_mask = score_mask | bypass_mask
+
+        df_below_floor = df_filtered[~admission_mask].copy()
+        df_filtered = df_filtered[admission_mask].copy()
+
+        logger.info(
+            "Stage 2 hash-floor gate | floor=%.1f | admitted=%d | below_floor_skipped=%d | bypass_lexical=%d",
+            classify_hash_floor,
+            len(df_filtered),
+            len(df_below_floor),
+            int(bypass_mask.sum()) - int((score_mask & bypass_mask).sum()),
+        )
+
+        # Write skipped URLs to a separate CSV for audit
+        if not df_below_floor.empty:
+            below_floor_csv = get_run_artifact_path(
+                run_context,
+                "stage2_below_floor_csv",
+                os.path.join("output", "stage2_below_floor_skipped.csv"),
+            )
+            os.makedirs(os.path.dirname(below_floor_csv), exist_ok=True)
+            df_below_floor.to_csv(below_floor_csv, index=False, encoding="utf-8")
+            sync_run_artifact(run_context, "stage2_below_floor_csv", src_path=below_floor_csv, best_effort=True)
+            logger.info("Stage 2 below-floor URLs written to %s (%d rows)", below_floor_csv, len(df_below_floor))
+
     if pipeline_mode == "hash_only":
         if resolved_backend == "ray":
             from .ray_runtime import run_hash_only_pipeline_with_ray
@@ -2931,6 +2974,57 @@ async def run_pipeline(
             pipeline_time,
             len(df_out),
         )
+        if classify_hash_floor > 0 and not df_below_floor.empty:
+            import json
+            from .utils import _coalesce_public_output_url, FINAL_OUTPUT, FILTERED_OUTPUT
+            from .checkpoint import make_record_key
+            skipped_records = []
+            for _, row in df_below_floor.iterrows():
+                original_url = str(row.get("Identified Phishing/Suspected Domain Name", row.get("url", "")))
+                raw_url = str(row.get("raw_url", original_url))
+                normalized_url = str(row.get("normalized_url", original_url)).strip().lower()
+                source_workbook = str(row.get("source_workbook", ""))
+                sanitized_url = _coalesce_public_output_url(original_url, raw_url, normalized_url) or "NA"
+                
+                record = {col: "NA" for col in _submission_record_columns()}
+                record["Application_ID"] = str(row.get("Application_ID", "ISS_NLP"))
+                record["Source of detection"] = str(row.get("Source of detection", "NLP"))
+                record["Identified Phishing/Suspected Domain Name"] = sanitized_url
+                
+                if "Cooresponding CSE" in row:
+                    record["Critical Sector Entity Name"] = str(row["Cooresponding CSE"])
+                if "Legitimate Domains" in row:
+                    record["Corresponding CSE Domain Name"] = str(row["Legitimate Domains"])
+                    
+                record["Phishing/Suspected Domains (i.e. Class Label)"] = "Suspected"
+                record["Remarks"] = "weak_or_single_signal_match; NA values are due to privacy issues."
+                
+                if checkpoint_store is not None:
+                    try:
+                        checkpoint_store.upsert_url_result({
+                            "record_key": make_record_key(normalized_url, source_workbook),
+                            "raw_url": raw_url,
+                            "normalized_url": normalized_url,
+                            "source_workbook": source_workbook,
+                            "final_pipeline_status": "completed",
+                            "final_decision": "Suspected",
+                            "submission_record_json": json.dumps(record)
+                        })
+                    except Exception:
+                        pass
+                skipped_records.append(record)
+                
+            df_dropped_formatted = pd.DataFrame(skipped_records, columns=_submission_record_columns())
+            df_out = pd.concat([df_out, df_dropped_formatted], ignore_index=True)
+            
+            output_file_path = get_run_artifact_path(run_context, "final_output_csv", FINAL_OUTPUT)
+            output_filtered_path = get_run_artifact_path(run_context, "final_output_filtered_csv", FILTERED_OUTPUT)
+            df_out.to_csv(output_file_path, index=False, encoding="utf-8")
+            flagged_df = df_out[
+                df_out["Phishing/Suspected Domains (i.e. Class Label)"].isin(["Phishing", "Suspected"])
+            ].copy()
+            flagged_df.to_csv(output_filtered_path, index=False, encoding="utf-8")
+
         return df_out
 
     # Define a temp file path inside the phishing_pipeline folder
