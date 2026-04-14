@@ -1,5 +1,5 @@
 {
-  "completed_at": "2026-04-13T18:09:24+00:00",
+  "completed_at": "2026-04-14T10:17:03+00:00",
   "fatal_error_message": "",
   "fatal_error_type": "",
   "fatal_stage": "",
@@ -21,7 +21,7 @@
         "cpu_headroom_cores": 6,
         "critical_memory_mode": true,
         "debug_mode": false,
-        "detected_available_ram_gb": 0.8,
+        "detected_available_ram_gb": 0.53,
         "detected_total_ram_gb": 7.74,
         "enable_dynamic_control": true,
         "hash_browser_actors": 1,
@@ -240,9 +240,9 @@
     "whitelist": "C:\\Users\\SATWIK\\Documents\\Phishing\\data\\whitelists\\Stage_2_Legitimate_Domains_80.xlsx"
   },
   "pipeline_status_counts": {},
-  "run_id": "run_20260413T180410Z",
-  "run_output_dir": "c:\\Users\\SATWIK\\Documents\\Phishing\\output\\runs\\run_20260413T180410Z",
-  "started_at": "2026-04-13T18:04:10+00:00",
+  "run_id": "run_20260414T101026Z",
+  "run_output_dir": "c:\\Users\\SATWIK\\Documents\\Phishing\\output\\runs\\run_20260414T101026Z",
+  "started_at": "2026-04-14T10:10:26+00:00",
   "status": "completed",
   "telemetry_mode": "sampled",
   "totals": {
@@ -253,5 +253,5 @@
     "tracked_records": 0,
     "worker_heartbeats": 0
   },
-  "updated_at": "2026-04-13T18:09:24+00:00"
+  "updated_at": "2026-04-14T10:17:03+00:00"
 }

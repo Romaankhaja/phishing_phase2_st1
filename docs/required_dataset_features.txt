@@ -1,0 +1,58 @@
+To allow the phishing pipeline to bypass expensive online fetching steps (browser rendering, network calls, and scraping), your upstream dataset needs to explicitly provide the features that are currently extracted dynamically.
+
+By analyzing the `comparison.py`, `utils.py`, `stage1_http_analyzer.py`, and `rdap_utils.py` modules, below is the comprehensive list of feature column names you should include in your input data.
+
+=========================================================
+1. Network & DNS Features
+=========================================================
+These features circumvent the need to send DNS queries and perform GeoIP lookups:
+
+- ip_address       : The resolved primary IPv4/IPv6 address of the domain.
+- resolved_ips     : A list or semicolon-separated string of all resolved A/AAAA records.
+- dns_answer_count : Total number of DNS records found.
+- asn              : The Autonomous System Number.
+- asn_org          : The organization associated with the ASN (crucial for checking against suspicious providers).
+- country          : GeoIP country code of the server.
+
+=========================================================
+2. WHOIS / RDAP Features
+=========================================================
+Providing these fields bypasses the slow calls to `rdap.org` and WHOIS resolvers:
+
+- rdap_reg_date      : The creation/registration date of the domain (ISO date format).
+- rdap_age_days      : Integer representing the domain's age in days.
+- registrar          : The registrar organization string.
+- registrant_name    : The domain owner's name.
+- registrant_country : The country of registration.
+- name_servers       : A list or semicolon-separated string of the domain's Name Servers.
+
+=========================================================
+3. SSL / TLS Features
+=========================================================
+These fields prevent the code from imitating an SSL handshake against the domain:
+
+- cert_cn     : The Common Name of the SSL certificate.
+- cert_san    : A list or semicolon-separated string of Subject Alternative Names.
+- cert_issuer : The Organization Name (O) of the Certificate Issuer (heavily used for suspicious issuer detection).
+
+=========================================================
+4. Hash Features (Perceptual & SimHashes)
+=========================================================
+Providing these pre-computed hex hashes allows you to bypass image processing, OCR routines, and payload simhashing:
+
+- domain_hash      : A SimHash generated from the domain string using 3-character n-grams (char3).
+- html_hash        : (or `page_hash`) A SimHash generated from the raw HTML payload (word level).
+- favicon_hash     : A perceptual hash (pHash) of the site's favicon image.
+- ssl_hash         : A SimHash generated from the concatenated SSL identity properties.
+- logo_hash        : (Optional) A perceptual hash of the domain's logo if your visual extraction relies on it.
+
+=========================================================
+5. Essential HTML Metadata (Bypassing HTTP Fetches)
+=========================================================
+If you want to fully bypass the HTTP fetching stage, the pipeline also relies on a few surface-level HTML metadata fields for scoring:
+
+- title_text          : The page `<title>` tag text.
+- meta_description    : The `<meta name="description">` text.
+- page_has_login_form : Boolean/Integer indicating if a `<form>` matching login properties exists.
+- redirect_chain      : A list of domains or URLs showing the redirect hops.
+- final_url           : The final landing URL (used to detect evasion).
