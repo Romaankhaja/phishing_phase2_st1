@@ -26,106 +26,35 @@ _EXPORT_WARNING_INTERVAL_SECONDS = 30.0
 _DEFAULT_TELEMETRY_MODE = "sampled"
 _ALLOWED_TELEMETRY_MODES = {"sampled", "full", "debug"}
 
-RUN_RESULT_COLUMNS = (
+PIPELINE_MONITOR_COLUMNS = (
     "run_id",
-    "record_key",
-    "source_workbook",
-    "raw_url",
-    "normalized_url",
-    "current_stage",
-    "stage_status",
-    "stage_error_type",
-    "stage_error_message",
-    "retry_count",
-    "timeout_hit",
-    "skipped_due_to_previous_failure",
-    "fallback_taken",
-    "worker_id",
-    "stage_started_at",
-    "stage_finished_at",
-    "duration_ms",
-    "stage0_status",
-    "stage1_status",
-    "dns_stage_status",
-    "hash_stage_status",
-    "classify_stage_status",
-    "final_pipeline_status",
-    "final_decision",
-    "failure_reason",
-    "processing_time_ms",
-    "submission_record_json",
-    "last_updated_at",
-)
-
-STAGE_EVENT_COLUMNS = (
-    "run_id",
-    "record_key",
-    "source_workbook",
-    "normalized_url",
-    "stage_name",
-    "attempt_index",
-    "worker_id",
-    "started_at",
-    "finished_at",
-    "duration_ms",
+    "emitted_at",
+    "stage",
+    "substage",
+    "event_kind",
     "status",
-    "error_type",
-    "error_message",
-    "retry_count",
-    "timeout_flag",
-    "fallback_taken",
-)
-
-RUN_MANIFEST_COLUMNS = (
-    "run_id",
-    "status",
-    "started_at",
-    "updated_at",
-    "completed_at",
-    "fatal_stage",
-    "fatal_error_type",
-    "fatal_error_message",
-    "metadata_json",
-    "checkpoint_dir",
-    "checkpoints_csv",
-    "url_result_events_csv",
-    "stage_events_csv",
-)
-
-WORKER_HEARTBEAT_COLUMNS = (
-    "stage_name",
     "worker_id",
     "record_key",
-    "state",
-    "task_kind",
-    "item_age_s",
-    "emitted_at",
-    "last_seen_at",
-    "details_json",
-)
-
-STAGE_METRIC_COLUMNS = (
-    "run_id",
-    "emitted_at",
-    "label",
-    "stage_name",
-    "worker_id",
-    "metric_kind",
-    "counters_json",
-    "gauges_json",
-    "latency_json",
-    "resource_snapshot_json",
-    "details_json",
-)
-
-STALL_EVENT_COLUMNS = (
-    "run_id",
-    "emitted_at",
-    "label",
-    "stage_name",
-    "severity",
+    "stage_elapsed_ms",
+    "interval_ms",
+    "items_total",
+    "items_completed",
+    "items_failed",
+    "items_skipped",
+    "items_pending",
+    "queue_depth",
+    "inflight",
+    "rate_per_sec",
+    "avg_latency_ms",
+    "max_latency_ms",
+    "cpu_percent",
+    "process_cpu_percent",
+    "rss_mb",
+    "ram_percent",
+    "used_cpu_cores",
+    "available_cpu_cores",
+    "bottleneck",
     "message",
-    "resource_snapshot_json",
     "details_json",
 )
 
@@ -274,19 +203,8 @@ class RunContext:
     output_dir: str
     run_output_dir: str
     latest_output_dir: str
-    checkpoints_csv: str
-    checkpoint_dir: str
-    run_results_csv: str
-    stage_events_csv: str
-    run_manifest_csv: str
-    run_manifest_json: str
-    run_summary_json: str
-    checkpoint_run_manifest_csv: str
-    url_result_events_csv: str
-    checkpoint_stage_events_csv: str
-    worker_heartbeats_csv: str
-    stage_metrics_csv: str
-    stall_events_csv: str
+    monitor_log_path: str
+    monitor_csv_path: str
     telemetry_mode: str = _DEFAULT_TELEMETRY_MODE
     trace_record_key: str = ""
     trace_url: str = ""
@@ -336,25 +254,13 @@ def build_run_context(
     )
     run_output_dir = artifact_paths["run_root"]
     latest_output_dir = artifact_paths["latest_root"]
-    checkpoints_csv = artifact_paths["checkpoints_csv"]
     return RunContext(
         run_id=resolved_run_id,
         output_dir=output_dir,
         run_output_dir=run_output_dir,
         latest_output_dir=latest_output_dir,
-        checkpoints_csv=checkpoints_csv,
-        checkpoint_dir="",
-        run_results_csv=artifact_paths["run_results_csv"],
-        stage_events_csv=artifact_paths["stage_events_csv"],
-        run_manifest_csv=artifact_paths["run_manifest_csv"],
-        run_manifest_json=artifact_paths["run_manifest_json"],
-        run_summary_json=artifact_paths["run_summary_json"],
-        checkpoint_run_manifest_csv=artifact_paths["run_manifest_csv"],
-        url_result_events_csv=checkpoints_csv,
-        checkpoint_stage_events_csv=artifact_paths["stage_events_csv"],
-        worker_heartbeats_csv=artifact_paths["worker_heartbeats_csv"],
-        stage_metrics_csv=artifact_paths["stage_metrics_csv"],
-        stall_events_csv=artifact_paths["stall_events_csv"],
+        monitor_log_path=artifact_paths.get("pipeline_monitor_log", ""),
+        monitor_csv_path=artifact_paths.get("pipeline_monitor_csv", ""),
         telemetry_mode=normalized_telemetry_mode,
         trace_record_key=str(trace_record_key or ""),
         trace_url=str(trace_url or ""),
@@ -388,15 +294,8 @@ def _build_run_artifact_maps(
     relpaths = {
         "run_root": "",
         "latest_root": "",
-        "checkpoints_csv": _artifact_relpath("events", "checkpoints.csv"),
-        "run_results_csv": _artifact_relpath("events", "pipeline_run_results.csv"),
-        "stage_events_csv": _artifact_relpath("events", "pipeline_stage_events.csv"),
-        "worker_heartbeats_csv": _artifact_relpath("events", "worker_heartbeats.csv"),
-        "stage_metrics_csv": _artifact_relpath("events", "stage_metrics.csv"),
-        "stall_events_csv": _artifact_relpath("events", "stall_events.csv"),
-        "run_manifest_csv": "run_manifest.csv",
-        "run_manifest_json": "run_manifest.json",
-        "run_summary_json": "run_summary.json",
+        "pipeline_monitor_log": _artifact_relpath("monitor", "pipeline_monitor.log"),
+        "pipeline_monitor_csv": _artifact_relpath("monitor", "pipeline_monitor.csv"),
         "effective_args_json": _artifact_relpath("config", "effective_args.json"),
         "effective_runtime_json": _artifact_relpath("config", "effective_runtime.json"),
         "input_manifest_csv": _artifact_relpath("config", "input_manifest.csv"),
@@ -431,15 +330,6 @@ def _build_run_artifact_maps(
     artifact_latest_paths["run_root"] = run_root
     artifact_latest_paths["latest_root"] = latest_root
     artifact_legacy_paths = {
-        "checkpoints_csv": [os.path.join(output_dir, "checkpoints.csv")],
-        "run_results_csv": [os.path.join(output_dir, "pipeline_run_results.csv")],
-        "stage_events_csv": [os.path.join(output_dir, "pipeline_stage_events.csv")],
-        "worker_heartbeats_csv": [os.path.join(output_dir, "worker_heartbeats.csv")],
-        "stage_metrics_csv": [os.path.join(output_dir, "stage_metrics.csv")],
-        "stall_events_csv": [os.path.join(output_dir, "stall_events.csv")],
-        "run_manifest_csv": [os.path.join(output_dir, "run_manifest.csv")],
-        "run_manifest_json": [os.path.join(output_dir, "run_manifest.json")],
-        "run_summary_json": [os.path.join(output_dir, "run_summary.json")],
         "holdout_csv": [os.path.join(output_dir, "holdout.csv")],
         "stage0_lexical_decisions_csv": [
             os.path.join(output_dir, "stage0_lexical_decisions.csv"),
@@ -766,293 +656,108 @@ class CheckpointStore:
         self._lock = threading.RLock()
         self._url_results: dict[str, dict[str, Any]] = {}
         self._worker_heartbeats: dict[tuple[str, str], dict[str, Any]] = {}
-        self._stage_events: list[dict[str, Any]] = []
-        self._stage_metrics: list[dict[str, Any]] = []
-        self._stall_events: list[dict[str, Any]] = []
-        self._stage_event_count_total = 0
-        self._stage_metric_count_total = 0
-        self._stall_event_count_total = 0
+        self._monitor_rows: list[dict[str, Any]] = []
         self._manifest: dict[str, Any] = {
             "run_id": self.context.run_id,
             "status": "running",
             "started_at": self.context.started_at,
             "updated_at": self.context.started_at,
-            "completed_at": "",
-            "fatal_stage": "",
-            "fatal_error_type": "",
-            "fatal_error_message": "",
             "metadata_json": dict(self.context.metadata),
-            "checkpoint_dir": "",
-            "checkpoints_csv": self.context.checkpoints_csv,
-            "url_result_events_csv": self.context.checkpoints_csv,
-            "stage_events_csv": self.context.stage_events_csv,
-            "worker_heartbeats_csv": self.context.worker_heartbeats_csv,
-            "stage_metrics_csv": self.context.stage_metrics_csv,
-            "stall_events_csv": self.context.stall_events_csv,
-            "run_manifest_json": self.context.run_manifest_json,
-            "run_summary_json": self.context.run_summary_json,
-            "run_output_dir": self.context.run_output_dir,
-            "latest_output_dir": self.context.latest_output_dir,
             "telemetry_mode": self.context.telemetry_mode,
         }
-        self._pending_result_events: list[dict[str, Any]] = []
-        self._pending_stage_events: list[dict[str, Any]] = []
-        self._pending_event_count = 0
-        self._append_dirty = False
-        self._snapshot_dirty = False
-        self._dirty_snapshot_updates = 0
-        self._heartbeat_dirty = False
-        self._last_append_flush_monotonic = time.monotonic()
-        self._last_snapshot_flush_monotonic = time.monotonic()
-        self._last_export_warning_monotonic = 0.0
-        self._load_existing_state()
         self.start_run(status="running", metadata=self.context.metadata)
 
     def _log_deferred_export_warning(self, operation: str, exc: BaseException) -> None:
-        now = time.monotonic()
-        if (now - self._last_export_warning_monotonic) < _EXPORT_WARNING_INTERVAL_SECONDS:
-            return
-        self._last_export_warning_monotonic = now
         logger.warning(
-            "Deferred checkpoint export due to transient file lock | run_id=%s | operation=%s | error=%s",
+            "Deferred monitor export due to transient file lock | run_id=%s | operation=%s | error=%s",
             self.context.run_id,
             operation,
             exc,
         )
 
-    def _load_existing_state(self) -> None:
-        with self._lock:
-            if self.context.run_manifest_json and os.path.exists(self.context.run_manifest_json):
-                try:
-                    with open(self.context.run_manifest_json, encoding="utf-8") as fh:
-                        manifest = json.load(fh)
-                    if isinstance(manifest, dict):
-                        manifest["metadata_json"] = _parse_json_field(manifest.get("metadata_json"), {})
-                        self._manifest.update(manifest)
-                except Exception:
-                    logger.exception("Failed to load existing run manifest JSON")
-            if self.context.run_manifest_csv and os.path.exists(self.context.run_manifest_csv):
-                try:
-                    with open(self.context.run_manifest_csv, newline="", encoding="utf-8") as fh:
-                        rows = list(csv.DictReader(fh))
-                    if rows:
-                        manifest = dict(rows[-1])
-                        manifest["metadata_json"] = _parse_json_field(manifest.get("metadata_json"), {})
-                        self._manifest.update(manifest)
-                except Exception:
-                    logger.exception("Failed to load existing run manifest CSV")
-
-            if self.context.checkpoints_csv and os.path.exists(self.context.checkpoints_csv):
-                try:
-                    with open(self.context.checkpoints_csv, newline="", encoding="utf-8") as fh:
-                        for row in csv.DictReader(fh):
-                            normalized = _coerce_int_fields(row, RUN_RESULT_INT_FIELDS)
-                            if str(normalized.get("run_id", "") or "") != self.context.run_id:
-                                continue
-                            record_key = str(normalized.get("record_key", "") or "")
-                            if record_key:
-                                self._url_results[record_key] = normalized
-                except Exception:
-                    logger.exception("Failed to load checkpoints CSV")
-
-            if self.context.stage_events_csv and os.path.exists(self.context.stage_events_csv):
-                try:
-                    with open(self.context.stage_events_csv, newline="", encoding="utf-8") as fh:
-                        for row in csv.DictReader(fh):
-                            item = _coerce_int_fields(dict(row), STAGE_EVENT_INT_FIELDS)
-                            if str(item.get("run_id", "") or "") != self.context.run_id:
-                                continue
-                            self._stage_event_count_total += 1
-                except Exception:
-                    logger.exception("Failed to load stage events CSV")
-            if self.context.worker_heartbeats_csv and os.path.exists(self.context.worker_heartbeats_csv):
-                try:
-                    with open(self.context.worker_heartbeats_csv, newline="", encoding="utf-8") as fh:
-                        for row in csv.DictReader(fh):
-                            stage_name = str(row.get("stage_name", "") or "")
-                            worker_id = str(row.get("worker_id", "") or "")
-                            if not stage_name or not worker_id:
-                                continue
-                            item = dict(row)
-                            item["details_json"] = _parse_json_field(item.get("details_json"), {})
-                            self._worker_heartbeats[(stage_name, worker_id)] = item
-                except Exception:
-                    logger.exception("Failed to load worker heartbeats CSV")
-            if self.context.stage_metrics_csv and os.path.exists(self.context.stage_metrics_csv):
-                try:
-                    with open(self.context.stage_metrics_csv, newline="", encoding="utf-8") as fh:
-                        for row in csv.DictReader(fh):
-                            if str(row.get("run_id", "") or "") != self.context.run_id:
-                                continue
-                            self._stage_metric_count_total += 1
-                except Exception:
-                    logger.exception("Failed to load stage metrics CSV")
-            if self.context.stall_events_csv and os.path.exists(self.context.stall_events_csv):
-                try:
-                    with open(self.context.stall_events_csv, newline="", encoding="utf-8") as fh:
-                        for row in csv.DictReader(fh):
-                            if str(row.get("run_id", "") or "") != self.context.run_id:
-                                continue
-                            self._stall_event_count_total += 1
-                except Exception:
-                    logger.exception("Failed to load stall events CSV")
+    def _append_monitor_event(self, row: dict[str, Any]) -> None:
+        event = {
+            "run_id": self.context.run_id,
+            "emitted_at": str(row.get("emitted_at") or utc_now_iso()),
+            "stage": str(row.get("stage", "")),
+            "substage": str(row.get("substage", "")),
+            "event_kind": str(row.get("event_kind", "")),
+            "status": str(row.get("status", "")),
+            "worker_id": str(row.get("worker_id", "")),
+            "record_key": str(row.get("record_key", "")),
+            "stage_elapsed_ms": row.get("stage_elapsed_ms", ""),
+            "interval_ms": row.get("interval_ms", ""),
+            "items_total": row.get("items_total", ""),
+            "items_completed": row.get("items_completed", ""),
+            "items_failed": row.get("items_failed", ""),
+            "items_skipped": row.get("items_skipped", ""),
+            "items_pending": row.get("items_pending", ""),
+            "queue_depth": row.get("queue_depth", ""),
+            "inflight": row.get("inflight", ""),
+            "rate_per_sec": row.get("rate_per_sec", ""),
+            "avg_latency_ms": row.get("avg_latency_ms", ""),
+            "max_latency_ms": row.get("max_latency_ms", ""),
+            "cpu_percent": row.get("cpu_percent", ""),
+            "process_cpu_percent": row.get("process_cpu_percent", ""),
+            "rss_mb": row.get("rss_mb", ""),
+            "ram_percent": row.get("ram_percent", ""),
+            "used_cpu_cores": row.get("used_cpu_cores", ""),
+            "available_cpu_cores": row.get("available_cpu_cores", ""),
+            "bottleneck": str(row.get("bottleneck", "")),
+            "message": str(row.get("message", "")),
+            "details_json": _parse_json_field(row.get("details_json"), {})
+        }
+        if isinstance(event["details_json"], dict):
+            event["details_json"] = json.dumps(event["details_json"], ensure_ascii=True, sort_keys=True)
+        self._monitor_rows.append(event)
 
     def start_run(self, *, status: str = "running", metadata: dict[str, Any] | None = None) -> None:
-        now = utc_now_iso()
         with self._lock:
-            self._manifest.update(
-                {
-                    "run_id": self.context.run_id,
-                    "status": status,
-                    "started_at": self._manifest.get("started_at") or self.context.started_at,
-                    "updated_at": now,
-                    "metadata_json": dict(metadata or self.context.metadata or {}),
-                    "checkpoint_dir": "",
-                    "checkpoints_csv": self.context.checkpoints_csv,
-                    "url_result_events_csv": self.context.checkpoints_csv,
-                    "stage_events_csv": self.context.stage_events_csv,
-                    "worker_heartbeats_csv": self.context.worker_heartbeats_csv,
-                    "stage_metrics_csv": self.context.stage_metrics_csv,
-                    "stall_events_csv": self.context.stall_events_csv,
-                    "run_manifest_json": self.context.run_manifest_json,
-                    "run_summary_json": self.context.run_summary_json,
-                    "run_output_dir": self.context.run_output_dir,
-                    "latest_output_dir": self.context.latest_output_dir,
-                    "telemetry_mode": self.context.telemetry_mode,
-                }
-            )
-            self._snapshot_dirty = True
-            self._dirty_snapshot_updates += 1
-        self._write_manifest_files(best_effort=True)
-        self._write_summary_files(best_effort=True)
+            self._manifest.update({
+                "status": status,
+                "updated_at": utc_now_iso(),
+                "metadata_json": dict(metadata or self.context.metadata or {})
+            })
+            self._append_monitor_event({
+                "stage": "run",
+                "event_kind": "run_start",
+                "status": status,
+            })
 
     def get_manifest(self) -> dict[str, Any]:
         with self._lock:
             manifest = dict(self._manifest)
-        manifest["metadata_json"] = _parse_json_field(manifest.get("metadata_json"), {})
         return manifest
 
     def update_manifest(self, **patch: Any) -> None:
-        now = utc_now_iso()
         with self._lock:
-            merged = dict(self._manifest)
             for key, value in patch.items():
                 if value is not None:
-                    merged[key] = value
-            merged["updated_at"] = now
-            if not isinstance(merged.get("metadata_json"), (dict, list)):
-                merged["metadata_json"] = _parse_json_field(merged.get("metadata_json"), {})
-            self._manifest = merged
-            self._snapshot_dirty = True
-            self._dirty_snapshot_updates += 1
-        self._write_manifest_files(best_effort=True)
-        self._write_summary_files(best_effort=True)
+                    self._manifest[key] = value
+            self._manifest["updated_at"] = utc_now_iso()
 
     def mark_completed(self) -> None:
-        self.update_manifest(
-            status="completed",
-            completed_at=utc_now_iso(),
-            fatal_stage="",
-            fatal_error_type="",
-            fatal_error_message="",
-        )
+        self.update_manifest(status="completed", completed_at=utc_now_iso())
+        with self._lock:
+            self._append_monitor_event({
+                "stage": "run",
+                "event_kind": "run_end",
+                "status": "completed",
+            })
 
     def mark_failed(self, *, stage: str, exc: BaseException | None = None) -> None:
         error = normalize_exception(exc)
         self.update_manifest(
-            status="failed",
-            completed_at=utc_now_iso(),
-            fatal_stage=stage,
-            fatal_error_type=error["error_type"],
-            fatal_error_message=error["error_message"],
+            status="failed", completed_at=utc_now_iso(), fatal_stage=stage,
+            fatal_error_type=error["error_type"], fatal_error_message=error["error_message"]
         )
-
-    def _build_manifest_row(self) -> dict[str, Any]:
-        manifest = self.get_manifest()
-        return {
-            "run_id": manifest.get("run_id", self.context.run_id),
-            "status": manifest.get("status", "running"),
-            "started_at": manifest.get("started_at", self.context.started_at),
-            "updated_at": manifest.get("updated_at", utc_now_iso()),
-            "completed_at": manifest.get("completed_at", ""),
-            "fatal_stage": manifest.get("fatal_stage", ""),
-            "fatal_error_type": manifest.get("fatal_error_type", ""),
-            "fatal_error_message": manifest.get("fatal_error_message", ""),
-            "metadata_json": json.dumps(manifest.get("metadata_json") or {}, ensure_ascii=True, sort_keys=True),
-            "checkpoint_dir": "",
-            "checkpoints_csv": manifest.get("checkpoints_csv", self.context.checkpoints_csv),
-            "url_result_events_csv": manifest.get("url_result_events_csv", self.context.checkpoints_csv),
-            "stage_events_csv": manifest.get("stage_events_csv", self.context.stage_events_csv),
-        }
-
-    def _build_summary_payload(self) -> dict[str, Any]:
-        manifest = self.get_manifest()
         with self._lock:
-            rows = list(self._url_results.values())
-            stage_event_count = int(self._stage_event_count_total)
-            heartbeat_count = len(self._worker_heartbeats)
-            stage_metric_count = int(self._stage_metric_count_total)
-            stall_event_count = int(self._stall_event_count_total)
-        final_decision_counts: dict[str, int] = {}
-        pipeline_status_counts: dict[str, int] = {}
-        for row in rows:
-            final_decision = str(row.get("final_decision", "") or "").strip()
-            final_status = str(row.get("final_pipeline_status", "") or "").strip()
-            submission_payload = str(row.get("submission_record_json", "") or "").strip()
-            if final_decision and submission_payload:
-                final_decision_counts[final_decision] = final_decision_counts.get(final_decision, 0) + 1
-            if final_status:
-                pipeline_status_counts[final_status] = pipeline_status_counts.get(final_status, 0) + 1
-        return {
-            "run_id": self.context.run_id,
-            "status": manifest.get("status", "running"),
-            "started_at": manifest.get("started_at", self.context.started_at),
-            "updated_at": manifest.get("updated_at", utc_now_iso()),
-            "completed_at": manifest.get("completed_at", ""),
-            "fatal_stage": manifest.get("fatal_stage", ""),
-            "fatal_error_type": manifest.get("fatal_error_type", ""),
-            "fatal_error_message": manifest.get("fatal_error_message", ""),
-            "run_output_dir": self.context.run_output_dir,
-            "latest_output_dir": self.context.latest_output_dir,
-            "telemetry_mode": self.context.telemetry_mode,
-            "totals": {
-                "tracked_records": len(rows),
-                "terminal_records": sum(
-                    1
-                    for row in rows
-                    if str(row.get("final_pipeline_status", "") or "") in TERMINAL_PIPELINE_STATUSES
-                ),
-                "stage_events": stage_event_count,
-                "worker_heartbeats": heartbeat_count,
-                "stage_metrics": stage_metric_count,
-                "stall_events": stall_event_count,
-            },
-            "final_decision_counts": final_decision_counts,
-            "pipeline_status_counts": pipeline_status_counts,
-            "metadata_json": manifest.get("metadata_json") or {},
-        }
-
-    def _write_manifest_files(self, *, best_effort: bool = False) -> None:
-        manifest = self.get_manifest()
-        manifest_row = self._build_manifest_row()
-        try:
-            write_run_artifact_csv(self.context, "run_manifest_csv", RUN_MANIFEST_COLUMNS, [manifest_row], best_effort=best_effort)
-            write_run_artifact_json(self.context, "run_manifest_json", manifest, best_effort=best_effort)
-        except Exception as exc:
-            if best_effort and _is_retryable_filesystem_error(exc):
-                self._log_deferred_export_warning("manifest", exc)
-                return
-            raise
-
-    def _write_summary_files(self, *, best_effort: bool = False) -> None:
-        summary_payload = self._build_summary_payload()
-        try:
-            write_run_artifact_json(self.context, "run_summary_json", summary_payload, best_effort=best_effort)
-        except Exception as exc:
-            if best_effort and _is_retryable_filesystem_error(exc):
-                self._log_deferred_export_warning("summary", exc)
-                return
-            raise
+            self._append_monitor_event({
+                "stage": "run",
+                "event_kind": "run_end",
+                "status": "failed",
+                "message": error["error_message"],
+            })
 
     def get_url_result(self, record_key: str) -> dict[str, Any] | None:
         with self._lock:
@@ -1061,8 +766,6 @@ class CheckpointStore:
 
     def upsert_url_result(self, patch: dict[str, Any]) -> dict[str, Any]:
         record_key = str(patch.get("record_key", "") or "")
-        if not record_key:
-            raise ValueError("record_key is required for url result upsert")
         with self._lock:
             existing = self._url_results.get(record_key)
             if existing is None:
@@ -1073,142 +776,79 @@ class CheckpointStore:
                     source_workbook=str(patch.get("source_workbook", "") or ""),
                 )
             merged = dict(existing)
-            merged.update({key: value for key, value in patch.items() if value is not None})
-            merged.setdefault("run_id", self.context.run_id)
-            merged.setdefault("record_key", record_key)
+            merged.update({k: v for k, v in patch.items() if v is not None})
             merged["last_updated_at"] = utc_now_iso()
-            merged = _coerce_int_fields(merged, RUN_RESULT_INT_FIELDS)
             self._url_results[record_key] = merged
-            self._pending_result_events.append(dict(merged))
-            self._pending_event_count += 1
-            self._append_dirty = True
-            self._snapshot_dirty = True
-            self._dirty_snapshot_updates += 1
         return dict(merged)
 
-    def ensure_url_result(
-        self,
-        *,
-        raw_url: str,
-        normalized_url: str,
-        source_workbook: str,
-    ) -> dict[str, Any]:
+    def ensure_url_result(self, *, raw_url: str, normalized_url: str, source_workbook: str) -> dict[str, Any]:
         record_key = make_record_key(normalized_url, source_workbook)
         with self._lock:
             existing = self._url_results.get(record_key)
             if existing is not None:
                 return dict(existing)
-            created = default_run_result(
-                run_id=self.context.run_id,
-                raw_url=raw_url,
-                normalized_url=normalized_url,
-                source_workbook=source_workbook,
-            )
+            created = default_run_result(run_id=self.context.run_id, raw_url=raw_url, normalized_url=normalized_url, source_workbook=source_workbook)
             self._url_results[record_key] = created
             return dict(created)
 
     def append_stage_event(self, event: dict[str, Any]) -> None:
-        normalized = _coerce_int_fields(dict(event), STAGE_EVENT_INT_FIELDS)
         with self._lock:
-            self._pending_stage_events.append(dict(normalized))
-            self._stage_event_count_total += 1
-            self._pending_event_count += 1
-            self._append_dirty = True
-            self._dirty_snapshot_updates += 1
-            self._snapshot_dirty = True
+            self._append_monitor_event({
+                "stage": event.get("stage_name", ""),
+                "event_kind": "stage_end" if event.get("status") in ("completed", "failed", "timeout") else "progress",
+                "status": event.get("status", ""),
+                "worker_id": event.get("worker_id", ""),
+                "record_key": event.get("record_key", ""),
+                "stage_elapsed_ms": event.get("duration_ms", ""),
+                "message": event.get("error_message", ""),
+            })
 
-    def update_worker_heartbeat(
-        self,
-        *,
-        stage_name: str,
-        worker_id: str,
-        record_key: str,
-        state: str,
-        task_kind: str = "",
-        item_age_s: float | int = 0.0,
-        details: dict[str, Any] | None = None,
-    ) -> None:
+    def update_worker_heartbeat(self, *, stage_name: str, worker_id: str, record_key: str, state: str, task_kind: str = "", item_age_s: float | int = 0.0, details: dict[str, Any] | None = None) -> None:
         with self._lock:
             self._worker_heartbeats[(stage_name, worker_id)] = {
-                "stage_name": stage_name,
-                "worker_id": worker_id,
-                "record_key": record_key,
-                "state": state,
-                "task_kind": str(task_kind or ""),
-                "item_age_s": f"{float(item_age_s or 0.0):.3f}",
-                "emitted_at": utc_now_iso(),
-                "last_seen_at": utc_now_iso(),
-                "details_json": dict(details or {}),
+                "stage_name": stage_name, "worker_id": worker_id, "record_key": record_key,
+                "state": state, "task_kind": str(task_kind or ""), "item_age_s": f"{float(item_age_s or 0.0):.3f}",
+                "emitted_at": utc_now_iso(), "last_seen_at": utc_now_iso(), "details_json": dict(details or {}),
             }
-            self._heartbeat_dirty = True
-            self._snapshot_dirty = True
-            self._dirty_snapshot_updates += 1
 
     def clear_worker_heartbeat(self, *, stage_name: str, worker_id: str) -> None:
         with self._lock:
             self._worker_heartbeats.pop((stage_name, worker_id), None)
-            self._heartbeat_dirty = True
-            self._snapshot_dirty = True
-            self._dirty_snapshot_updates += 1
 
     def append_stage_metric(self, snapshot: dict[str, Any]) -> None:
-        item = {
-            "run_id": self.context.run_id,
-            "emitted_at": str(snapshot.get("emitted_at", "") or utc_now_iso()),
-            "label": str(snapshot.get("label", "") or ""),
-            "stage_name": str(snapshot.get("stage_name", "") or ""),
-            "worker_id": str(snapshot.get("worker_id", "") or ""),
-            "metric_kind": str(snapshot.get("metric_kind", "snapshot") or "snapshot"),
-            "counters_json": json.dumps(snapshot.get("counters_json") or snapshot.get("counters") or {}, ensure_ascii=True, sort_keys=True),
-            "gauges_json": json.dumps(snapshot.get("gauges_json") or snapshot.get("gauges") or {}, ensure_ascii=True, sort_keys=True),
-            "latency_json": json.dumps(snapshot.get("latency_json") or snapshot.get("latency_ms") or {}, ensure_ascii=True, sort_keys=True),
-            "resource_snapshot_json": json.dumps(snapshot.get("resource_snapshot_json") or snapshot.get("resource_snapshot") or {}, ensure_ascii=True, sort_keys=True),
-            "details_json": json.dumps(snapshot.get("details_json") or snapshot.get("details") or {}, ensure_ascii=True, sort_keys=True),
-        }
+        res = snapshot.get("resource_snapshot_json", {})
+        if isinstance(res, str):
+            try:
+                res = json.loads(res)
+            except:
+                res = {}
         with self._lock:
-            self._stage_metrics.append(item)
-            self._stage_metric_count_total += 1
-            self._snapshot_dirty = True
-            self._dirty_snapshot_updates += 1
+            self._append_monitor_event({
+                "stage": snapshot.get("stage_name", ""),
+                "substage": snapshot.get("label", ""),
+                "event_kind": "progress",
+                "worker_id": snapshot.get("worker_id", ""),
+                "details_json": snapshot.get("details_json", {}),
+                "cpu_percent": res.get("cpu_percent", ""),
+                "process_cpu_percent": res.get("process_cpu_percent", ""),
+                "rss_mb": res.get("rss_mb", ""),
+            })
 
     def append_stall_event(self, event: dict[str, Any]) -> None:
-        item = {
-            "run_id": self.context.run_id,
-            "emitted_at": str(event.get("emitted_at", "") or utc_now_iso()),
-            "label": str(event.get("label", "") or ""),
-            "stage_name": str(event.get("stage_name", "") or ""),
-            "severity": str(event.get("severity", "warning") or "warning"),
-            "message": str(event.get("message", "") or ""),
-            "resource_snapshot_json": json.dumps(event.get("resource_snapshot_json") or event.get("resource_snapshot") or {}, ensure_ascii=True, sort_keys=True),
-            "details_json": json.dumps(event.get("details_json") or event.get("details") or {}, ensure_ascii=True, sort_keys=True),
-        }
         with self._lock:
-            self._stall_events.append(item)
-            self._stall_event_count_total += 1
-            self._snapshot_dirty = True
-            self._dirty_snapshot_updates += 1
+            self._append_monitor_event({
+                "stage": event.get("stage_name", ""),
+                "substage": event.get("label", ""),
+                "event_kind": "stall" if event.get("severity") == "error" else "warning",
+                "status": event.get("severity", ""),
+                "message": event.get("message", ""),
+                "details_json": event.get("details_json", {}),
+            })
 
     def snapshot_backlog(self) -> dict[str, Any]:
         with self._lock:
-            pending_result_events = len(self._pending_result_events)
-            pending_stage_events = len(self._pending_stage_events)
-            stage_event_rows = int(self._stage_event_count_total)
-            worker_heartbeats = len(self._worker_heartbeats)
-            stage_metric_rows = int(self._stage_metric_count_total)
-            stall_event_rows = int(self._stall_event_count_total)
-            snapshot_dirty_updates = int(self._dirty_snapshot_updates)
             return {
-                "append_dirty": bool(self._append_dirty),
-                "snapshot_dirty": bool(self._snapshot_dirty),
-                "heartbeat_dirty": bool(self._heartbeat_dirty),
-                "pending_result_events": pending_result_events,
-                "pending_stage_events": pending_stage_events,
-                "stage_event_rows": stage_event_rows,
-                "worker_heartbeats": worker_heartbeats,
-                "stage_metric_rows": stage_metric_rows,
-                "stall_event_rows": stall_event_rows,
-                "snapshot_dirty_updates": snapshot_dirty_updates,
-                "pending_rows_total": pending_result_events + pending_stage_events + snapshot_dirty_updates,
+                "pending_rows_total": len(self._monitor_rows),
             }
 
     def list_worker_heartbeats(self, *, stage_name: str | None = None) -> list[dict[str, Any]]:
@@ -1225,129 +865,45 @@ class CheckpointStore:
     def get_completed_record_keys(self) -> set[str]:
         with self._lock:
             return {
-                record_key
-                for record_key, row in self._url_results.items()
+                rk for rk, row in self._url_results.items()
                 if str(row.get("final_pipeline_status", "") or "") in TERMINAL_PIPELINE_STATUSES
             }
 
     def get_terminal_submission_records(self) -> list[dict[str, Any]]:
         output: list[dict[str, Any]] = []
         with self._lock:
-            rows = list(self._url_results.values())
-        for row in rows:
-            payload = str(row.get("submission_record_json", "") or "").strip()
-            if not payload:
-                continue
-            try:
-                output.append(json.loads(payload))
-            except Exception:
-                continue
-        output.sort(key=lambda item: (str(item.get("Identified Phishing/Suspected Domain Name", "")), str(item.get("Corresponding CSE Domain Name", ""))))
+            for row in self._url_results.values():
+                payload = str(row.get("submission_record_json", "") or "").strip()
+                if payload:
+                    try:
+                        output.append(json.loads(payload))
+                    except:
+                        pass
+        output.sort(key=lambda x: (str(x.get("Identified Phishing/Suspected Domain Name", "")), str(x.get("Corresponding CSE Domain Name", ""))))
         return output
 
     def flush_appends(self, *, force: bool = False, best_effort: bool = False) -> None:
         with self._lock:
-            now = time.monotonic()
-            if not force:
-                due_by_rows = self._pending_event_count >= self.context.append_flush_row_interval
-                due_by_time = (now - self._last_append_flush_monotonic) >= self.context.append_flush_interval_seconds
-                if not self._append_dirty:
-                    return
-                if not due_by_rows and not due_by_time:
-                    return
-
-            result_rows = list(self._pending_result_events)
-            stage_rows = list(self._pending_stage_events)
-            if not result_rows and not stage_rows:
-                self._append_dirty = False
-                self._pending_event_count = 0
-                self._last_append_flush_monotonic = now
-                return
-            try:
-                if result_rows:
-                    _append_csv_rows(self.context.checkpoints_csv, RUN_RESULT_COLUMNS, result_rows)
-                    sync_run_artifact(self.context, "checkpoints_csv", src_path=self.context.checkpoints_csv, best_effort=best_effort)
-                if stage_rows:
-                    _append_csv_rows(self.context.stage_events_csv, STAGE_EVENT_COLUMNS, stage_rows)
-                    sync_run_artifact(self.context, "stage_events_csv", src_path=self.context.stage_events_csv, best_effort=best_effort)
-            except Exception as exc:
-                if best_effort and _is_retryable_filesystem_error(exc):
-                    self._append_dirty = True
-                    self._pending_event_count = len(self._pending_result_events) + len(self._pending_stage_events)
-                    self._log_deferred_export_warning("append_checkpoints", exc)
-                    return
-                raise
-            del self._pending_result_events[: len(result_rows)]
-            del self._pending_stage_events[: len(stage_rows)]
-            self._pending_event_count = len(self._pending_result_events) + len(self._pending_stage_events)
-            self._append_dirty = bool(self._pending_result_events or self._pending_stage_events)
-            self._last_append_flush_monotonic = now
-
-    def maybe_export(self, *, force: bool = False) -> None:
-        self.flush_appends(force=force, best_effort=True)
-        now = time.monotonic()
-        if not force:
-            with self._lock:
-                due_by_rows = self._snapshot_dirty and self._dirty_snapshot_updates >= self.context.snapshot_flush_row_interval
-                due_by_time = self._snapshot_dirty and (
-                    (now - self._last_snapshot_flush_monotonic) >= self.context.snapshot_flush_interval_seconds
-                )
-                if not due_by_rows and not due_by_time:
-                    return
-        self.export_all(best_effort=True)
-
-    def export_all(self, *, best_effort: bool = False) -> None:
-        self.flush_appends(force=True, best_effort=best_effort)
-        with self._lock:
-            result_rows = [
-                dict(row)
-                for _, row in sorted(
-                    self._url_results.items(),
-                    key=lambda item: (
-                        str(item[1].get("normalized_url", "")),
-                        str(item[1].get("source_workbook", "")),
-                        item[0],
-                    ),
-                )
-            ]
-            worker_heartbeat_rows = []
-            for _, row in sorted(self._worker_heartbeats.items()):
-                item = dict(row)
-                item["details_json"] = json.dumps(item.get("details_json") or {}, ensure_ascii=True, sort_keys=True)
-                worker_heartbeat_rows.append(item)
-            stage_metric_rows = list(self._stage_metrics)
-            stall_event_rows = list(self._stall_events)
+            rows = list(self._monitor_rows)
+            self._monitor_rows.clear()
+        if not rows:
+            return
         try:
-            write_run_artifact_csv(self.context, "run_results_csv", RUN_RESULT_COLUMNS, result_rows, best_effort=best_effort)
-            write_run_artifact_csv(self.context, "worker_heartbeats_csv", WORKER_HEARTBEAT_COLUMNS, worker_heartbeat_rows, best_effort=best_effort)
-            if stage_metric_rows or not os.path.exists(self.context.stage_metrics_csv):
-                if stage_metric_rows:
-                    _append_csv_rows(self.context.stage_metrics_csv, STAGE_METRIC_COLUMNS, stage_metric_rows)
-                else:
-                    _write_csv_atomic(self.context.stage_metrics_csv, STAGE_METRIC_COLUMNS, [])
-                sync_run_artifact(self.context, "stage_metrics_csv", src_path=self.context.stage_metrics_csv, best_effort=best_effort)
-            if stall_event_rows or not os.path.exists(self.context.stall_events_csv):
-                if stall_event_rows:
-                    _append_csv_rows(self.context.stall_events_csv, STALL_EVENT_COLUMNS, stall_event_rows)
-                else:
-                    _write_csv_atomic(self.context.stall_events_csv, STALL_EVENT_COLUMNS, [])
-                sync_run_artifact(self.context, "stall_events_csv", src_path=self.context.stall_events_csv, best_effort=best_effort)
-            self._write_manifest_files(best_effort=best_effort)
-            self._write_summary_files(best_effort=best_effort)
+            _append_csv_rows(self.context.monitor_csv_path, PIPELINE_MONITOR_COLUMNS, rows)
+            sync_run_artifact(self.context, "pipeline_monitor_csv", src_path=self.context.monitor_csv_path, best_effort=best_effort)
         except Exception as exc:
             if best_effort and _is_retryable_filesystem_error(exc):
                 with self._lock:
-                    self._snapshot_dirty = True
-                self._log_deferred_export_warning("snapshot", exc)
-                return
-            raise
-        with self._lock:
-            self._snapshot_dirty = False
-            self._dirty_snapshot_updates = 0
-            self._heartbeat_dirty = False
-            self._stage_metrics.clear()
-            self._stall_events.clear()
-            self._last_snapshot_flush_monotonic = time.monotonic()
+                    self._monitor_rows = rows + self._monitor_rows
+                self._log_deferred_export_warning("append_monitor", exc)
+            else:
+                raise
+
+    def maybe_export(self, *, force: bool = False) -> None:
+        self.flush_appends(force=force, best_effort=True)
+
+    def export_all(self, *, best_effort: bool = False) -> None:
+        self.flush_appends(force=True, best_effort=best_effort)
 
     def close(self) -> None:
         self.export_all(best_effort=True)

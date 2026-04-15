@@ -34,7 +34,7 @@ DEFAULT_FOUND_FILE = os.path.join(ROOT_DIR, "output", "found.txt")
 DEFAULT_OUTPUT_FILE = os.path.join(ROOT_DIR, "output", "holdout.csv")
 
 GENERIC_DOMAIN_PARTS = {
-    'com', 'in', 'gov', 'org', 'co', 'net', 'www', 'io', 'xyz', 'app', 'site',
+    'com', 'in', 'gov', 'co', 'net', 'www', 'io', 'xyz', 'app', 'site',
     'online', 'shop', 'store', 'info', 'live', 'club', 'dev', 'io', 'ai'
 }
 GENERIC_PRIMARY_DOMAINS = {'mail', 'email', 'gov', 'nic'}
