@@ -96,10 +96,10 @@ def is_similar_advanced(cand_url_norm: str, legit_url_norm: str,
     return False
 
 def _discover_excel_files(folder_path: str) -> list[str]:
-    if os.path.isfile(folder_path) and folder_path.endswith((".xlsx", ".xls")):
+    if os.path.isfile(folder_path) and folder_path.endswith((".xlsx", ".xls", ".csv")):
         files = [folder_path]
     else:
-        files = glob.glob(os.path.join(folder_path, "*.xlsx")) + glob.glob(os.path.join(folder_path, "*.xls"))
+        files = glob.glob(os.path.join(folder_path, "*.xlsx")) + glob.glob(os.path.join(folder_path, "*.xls")) + glob.glob(os.path.join(folder_path, "*.csv"))
     return [f for f in files if not os.path.basename(f).startswith("~$")]
 
 
@@ -135,7 +135,7 @@ def load_url_records_from_excel_folder(folder_path, limit: int | None = None):
 
     files = _discover_excel_files(folder_path)
     if not files:
-        logger.warning(f"No .xlsx or .xls files found in {folder_path}.")
+        logger.warning(f"No .xlsx, .xls, or .csv files found in {folder_path}.")
         return []
     logger.info(f"Found {len(files)} files.")
     if max_urls == 0:
@@ -144,7 +144,10 @@ def load_url_records_from_excel_folder(folder_path, limit: int | None = None):
 
     for f in files:
         try:
-            header_df = pd.read_excel(f, nrows=0)
+            if f.endswith(".csv"):
+                header_df = pd.read_csv(f, nrows=0)
+            else:
+                header_df = pd.read_excel(f, nrows=0)
             possible_cols = ["Identified Phishing/Suspected Domain Name", "URL", "url", "Domain", "domain_name"]
             found_col = None
             fallback_to_first_col = False
@@ -167,11 +170,18 @@ def load_url_records_from_excel_folder(folder_path, limit: int | None = None):
                     logger.info("Reached target URL limit (%d total).", max_urls)
                     break
 
-            df = pd.read_excel(
-                f,
-                usecols=[found_col],
-                nrows=remaining_limit,
-            )
+            if f.endswith(".csv"):
+                df = pd.read_csv(
+                    f,
+                    usecols=[found_col],
+                    nrows=remaining_limit,
+                )
+            else:
+                df = pd.read_excel(
+                    f,
+                    usecols=[found_col],
+                    nrows=remaining_limit,
+                )
             urls = df[found_col].dropna().astype(str)
             if fallback_to_first_col:
                 sample_values = urls.head(5).tolist()
