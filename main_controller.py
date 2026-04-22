@@ -549,8 +549,8 @@ async def main():
         run_context.run_id,
         resuming_existing_run,
         args.force_reprocess,
-        run_context.run_manifest_csv,
-        run_context.checkpoints_csv,
+        get_run_artifact_path(run_context, "run_manifest_csv"),
+        get_run_artifact_path(run_context, "checkpoints_csv"),
         run_context.stage1_failure_policy,
         run_context.stall_threshold_seconds,
     )
