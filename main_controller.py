@@ -507,13 +507,26 @@ async def main():
             and str(existing_manifest.get("status", "")).strip().lower() != "completed"
             and _manifest_matches_inputs(existing_manifest, reliability_metadata)
         ):
-            checkpoint_events_csv = str(
-                existing_manifest.get("checkpoints_csv", "")
-                or existing_manifest.get("url_result_events_csv", "")
-                or ""
-            )
-            if checkpoint_events_csv and os.path.exists(checkpoint_events_csv):
-                existing_run_id = str(existing_manifest.get("run_id", "") or "").strip() or None
+            # Safety check: verify the previous run's output directory exists on
+            # this machine.  If it was created on a different host (e.g. local
+            # Windows vs Kaggle), the paths will be stale and resuming from them
+            # would silently skip classification.
+            _prev_run_output = str(existing_manifest.get("run_output_dir", "") or "").strip()
+            if _prev_run_output and not os.path.exists(_prev_run_output):
+                logger.warning(
+                    "Previous run output dir '%s' does not exist on this machine. "
+                    "Ignoring resume and starting a fresh run.",
+                    _prev_run_output,
+                )
+                existing_manifest = None
+            else:
+                checkpoint_events_csv = str(
+                    existing_manifest.get("checkpoints_csv", "")
+                    or existing_manifest.get("url_result_events_csv", "")
+                    or ""
+                )
+                if checkpoint_events_csv and os.path.exists(checkpoint_events_csv):
+                    existing_run_id = str(existing_manifest.get("run_id", "") or "").strip() or None
 
     resolved_run_id = args.run_id or existing_run_id
     resuming_existing_run = bool(existing_run_id and resolved_run_id == existing_run_id and args.resume and not args.force_reprocess)

@@ -1168,6 +1168,13 @@ async def run_hash_only_pipeline_with_ray_impl(
         classified_df = pd.DataFrame(pending_rows)
     if classified_df.empty:
         existing_records = await _ray_get(checkpoint_actor.get_terminal_submission_records.remote()) if checkpoint_actor is not None else []
+        logger.warning(
+            "Classify stage: all %d input rows already marked completed in checkpoint. "
+            "Reusing %d existing submission records from previous run. "
+            "Use --force-reprocess to re-classify all rows from scratch.",
+            len(df_filtered),
+            len(existing_records or []),
+        )
         empty_df = pd.DataFrame(existing_records, columns=pipeline_module._submission_record_columns()) if existing_records else pd.DataFrame(columns=pipeline_module._submission_record_columns())
         empty_df.to_csv(final_output_path, index=False, encoding="utf-8")
         empty_df.to_csv(filtered_output_path, index=False, encoding="utf-8")
