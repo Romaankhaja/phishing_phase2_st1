@@ -25,6 +25,7 @@ from .reliability import (
     utc_now_iso,
 )
 from .ray_runtime import (
+    HashBrowserPreflightError,
     HashRenderArtifact,
     _build_shortlist_patch,
     _build_shortlist_stage_event,
@@ -377,6 +378,7 @@ async def run_hashing_shortlist_with_ray_impl(
     hash_browser_actors: list[Any] = []
     prewarm_actors = bool(runtime_config.get("prewarm_actors", False))
     prewarm_mode = str(runtime_config.get("prewarm_mode", "full") or "full").strip().lower()
+    hash_browser_preflight_done = False
     logger.info("Ray shortlist control actors created | checkpoint=%s", bool(checkpoint_actor))
 
     input_urls = list(url_list)
@@ -685,6 +687,31 @@ async def run_hashing_shortlist_with_ray_impl(
         metrics["worker_nodes_alive"] = len(hash_browser_actors)
         logger.info("Ray shortlist browser actors created | count=%d", len(hash_browser_actors))
 
+    def _build_preflight_error_message(exc: BaseException) -> str:
+        parts: list[str] = []
+        seen: set[int] = set()
+        current: BaseException | None = exc
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            text = str(current).strip()
+            if text and text not in parts:
+                parts.append(text)
+            current = current.__cause__ or current.__context__
+        return " | ".join(parts) if parts else exc.__class__.__name__
+
+    async def _ensure_hash_browser_preflight() -> None:
+        nonlocal hash_browser_preflight_done
+        if hash_browser_preflight_done:
+            return
+        _ensure_hash_browser_actors()
+        try:
+            await _ray_get(hash_browser_actors[0].warm.remote(), _label="hash_browser_preflight")
+        except Exception as exc:
+            message = _build_preflight_error_message(exc)
+            logger.error("Hash browser preflight failed | error=%s", message)
+            raise HashBrowserPreflightError(message) from exc
+        hash_browser_preflight_done = True
+
     async def _replace_hash_browser_actor(actor_slot: int, *, reason: str) -> None:
         _ensure_hash_browser_actors()
         if actor_slot < 0 or actor_slot >= len(hash_browser_actors):
@@ -715,9 +742,7 @@ async def run_hashing_shortlist_with_ray_impl(
         warm_refs = [actor.warm.remote() for actor in stage1_fetch_actors]
         if prewarm_mode == "full":
             _ensure_stage1_enrich_actors()
-            _ensure_hash_browser_actors()
             warm_refs.extend(actor.warm.remote() for actor in stage1_enrich_actors)
-            warm_refs.extend(actor.warm.remote() for actor in hash_browser_actors)
         if not warm_refs:
             return
         logger.info(
@@ -725,7 +750,7 @@ async def run_hashing_shortlist_with_ray_impl(
             prewarm_mode,
             len(stage1_fetch_actors),
             len(stage1_enrich_actors),
-            len(hash_browser_actors),
+            0,
         )
         await _ray_get(warm_refs)
         logger.info("Ray shortlist actor prewarm complete")
@@ -838,6 +863,7 @@ async def run_hashing_shortlist_with_ray_impl(
 
     async def _schedule_hash_admission(raw_url: str, normalized_url: str, source_workbook: str, progress_key: str) -> None:
         nonlocal browser_actor_index
+        await _ensure_hash_browser_preflight()
         _ensure_hash_browser_actors()
         record_key = make_record_key(normalized_url, source_workbook)
         actor_slot = browser_actor_index % len(hash_browser_actors)

@@ -471,6 +471,7 @@ async def main():
     )
     from phishing_pipeline.reliability import (
         CheckpointStore,
+        archive_submission_artifacts,
         build_run_context,
         get_run_artifact_path,
         sync_run_artifact,
@@ -530,6 +531,7 @@ async def main():
 
     resolved_run_id = args.run_id or existing_run_id
     resuming_existing_run = bool(existing_run_id and resolved_run_id == existing_run_id and args.resume and not args.force_reprocess)
+    input_name = os.path.basename(os.path.normpath(args.shortlisting))
     run_context = build_run_context(
         output_dir=OUTPUT_DIR,
         run_id=resolved_run_id,
@@ -545,9 +547,11 @@ async def main():
         stage0_progress_log_interval_seconds=int(reliability_config.get("stage0_progress_log_interval_seconds", 10)),
         stage1_failure_policy=args.stage1_failure_policy,
         max_worker_restarts=int(reliability_config.get("max_worker_restarts", 2)),
+        submission_basename=f"Submission-{input_name}.zip",
         metadata=reliability_metadata,
     )
     checkpoint_store = CheckpointStore(run_context)
+    checkpoint_store.merge_exported_state()
     checkpoint_store.update_manifest(status="running", metadata_json=reliability_metadata)
     execution_backend = "ray" if args.pipeline_mode == "hash_only" else "legacy"
     from phishing_pipeline.progress_display import resolve_progress_mode
@@ -594,9 +598,11 @@ async def main():
     stage1_http_config = resolve_stage1_http_config(runtime_profile_settings=runtime_profile_settings)
     ray_runtime = None
     ray_runtime_config = {}
+    HashBrowserPreflightError = None
     if execution_backend == "ray":
         from phishing_pipeline import ray_runtime as ray_runtime
         from phishing_pipeline.config import resolve_ray_runtime_config
+        from phishing_pipeline.ray_runtime import HashBrowserPreflightError
         ray_runtime_config = resolve_ray_runtime_config()
     effective_runtime_snapshot = {
         "requested_progress_mode": requested_progress_mode,
@@ -767,6 +773,7 @@ async def main():
         logger.error("Shortlisting folder '%s' not found", args.shortlisting)
         raise FileNotFoundError(f"Shortlisting folder '{args.shortlisting}' not found")
 
+    fatal_stage = "controller_startup"
     try:
         # 🧹 Clear GPU memory at the start of every run
         if execution_backend == "ray" and ray_runtime is not None:
@@ -1005,6 +1012,7 @@ async def main():
                 os.makedirs(os.path.dirname(canonical_holdout_csv), exist_ok=True)
                 holdout_df.to_csv(canonical_holdout_csv, index=False)
                 sync_run_artifact(run_context, "holdout_csv", src_path=canonical_holdout_csv, best_effort=True)
+                checkpoint_store.merge_exported_state()
                 logger.info(f"--- Finished Step 1: Shortlisting Complete ({len(holdout_df)} matched) ---")
 
                 if args.stage_smoke_test in {"fetch", "lexical", "score"}:
@@ -1099,13 +1107,25 @@ async def main():
         # Package results if available
         zip_path = None
         if package_results is not None:
-            try:
-                fatal_stage = "package"
-                input_name = os.path.basename(os.path.normpath(args.shortlisting))
-                zip_path = package_results(zip_path=f"Submission-{input_name}.zip")
-                logger.info("Packaged results into: %s", zip_path)
-            except Exception as exc:
-                logger.warning("package_results() failed: %s", exc)
+            fatal_stage = "package"
+            checkpoint_store.export_all()
+            zip_path = package_results(zip_path=f"Submission-{input_name}.zip")
+            if not zip_path:
+                raise RuntimeError("package_results() did not return a submission zip path")
+            zip_path = os.path.abspath(str(zip_path))
+            if not os.path.exists(zip_path):
+                raise FileNotFoundError(zip_path)
+            archived_submission = archive_submission_artifacts(
+                run_context,
+                zip_path=zip_path,
+                submission_dir=os.path.join("output", "PS-02_ISS_NLP_Submission"),
+            )
+            checkpoint_store.update_manifest(
+                submission_zip=str(archived_submission.get("submission_zip", "") or ""),
+                submission_dir=str(archived_submission.get("submission_dir", "") or ""),
+            )
+            checkpoint_store.export_all()
+            logger.info("Packaged results into: %s", zip_path)
 
         if final_output:
             logger.info("Final output expected at: %s", final_output)
@@ -1123,6 +1143,8 @@ async def main():
             finalize_store.close()
 
     except Exception as exc:
+        if HashBrowserPreflightError is not None and isinstance(exc, HashBrowserPreflightError):
+            fatal_stage = "hash_browser_preflight"
         finalize_store, should_close_finalize_store = _load_checkpoint_store_for_finalize()
         finalize_store.mark_failed(stage=fatal_stage, exc=exc)
         finalize_store.export_all()

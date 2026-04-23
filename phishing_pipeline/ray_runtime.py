@@ -35,6 +35,10 @@ _RAY_PRIMITIVES: dict[str, Any] | None = None
 _DEBUG_MODE: bool = RAY_DEBUG_MODE
 
 
+class HashBrowserPreflightError(RuntimeError):
+    """Raised when the hash browser cannot launch in the current runtime."""
+
+
 def _is_debug_mode() -> bool:
     """Check if Ray debug mode is enabled (env or config)."""
     return _DEBUG_MODE or os.getenv("PHISHING_RAY_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}

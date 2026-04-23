@@ -390,6 +390,30 @@ class ReliabilityContractTests(unittest.TestCase):
             self.assertEqual(1, summary["pipeline_status_counts"]["review_only"])
             store.close()
 
+    def test_consistency_guard_flags_mixed_run_bundle(self):
+        with self._tempdir() as temp_dir:
+            ctx = build_run_context(
+                output_dir=temp_dir,
+                run_id="run_20260423T173127Z",
+                metadata={"shortlisting": "demo"},
+            )
+            os.makedirs(os.path.dirname(ctx.effective_args_json), exist_ok=True)
+            with open(ctx.effective_args_json, "w", encoding="utf-8") as fh:
+                json.dump({"run_id": "run_20260414T180434Z"}, fh)
+
+            store = CheckpointStore(ctx)
+            store.export_all()
+
+            with open(ctx.run_manifest_json, encoding="utf-8") as fh:
+                manifest_json = json.load(fh)
+            with open(ctx.run_summary_json, encoding="utf-8") as fh:
+                summary_json = json.load(fh)
+
+            self.assertTrue(manifest_json["mixed_run_bundle_detected"])
+            self.assertTrue(summary_json["mixed_run_bundle_detected"])
+            self.assertEqual("run_20260414T180434Z", manifest_json["consistency_guard"]["effective_args_run_id"])
+            store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

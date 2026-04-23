@@ -1826,26 +1826,46 @@ def _has_suspicious_fetch_network_state(
     fetch_error_detail: str = "",
 ) -> bool:
     status = str(fetch_status or "").strip().lower()
-    if status in {"failed", "timeout"}:
-        return True
 
     detail = " ".join(
         part.strip().lower()
         for part in (str(fetch_error_type or ""), str(fetch_error_detail or ""))
         if str(part or "").strip()
     )
-    if not detail:
+    browser_runtime_markers = (
+        "targetclosederror",
+        "browser_actor_failure_after_retry",
+        "playwright is closed",
+        "browser has been closed",
+        "context has been closed",
+        "page has been closed",
+        "browsercontext.new_page",
+        "browsertype.launch",
+        "chrome-headless-shell",
+        "error while loading shared libraries",
+        "host system is missing dependencies",
+        "libatk-1.0.so.0",
+    )
+    if any(marker in detail for marker in browser_runtime_markers):
         return False
+    if not detail:
+        return status == "timeout"
     suspicious_markers = (
         "err_name_not_resolved",
         "err_connection_refused",
         "no_records",
+        "no answer",
         "nxdomain",
         "not_registered",
         "not registered",
         "dns",
+        "connection refused",
+        "name or service not known",
+        "network is unreachable",
     )
-    return any(marker in detail for marker in suspicious_markers)
+    if any(marker in detail for marker in suspicious_markers):
+        return True
+    return status == "timeout"
 
 
 def _has_stage1_signal_seed(stage1_analysis: dict | None) -> bool:

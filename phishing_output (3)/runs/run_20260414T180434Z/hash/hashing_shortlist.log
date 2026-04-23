@@ -1,0 +1,11 @@
+2026-04-14 23:37:53,789 | INFO | Hashing shortlist completed | deep_attempted=62 | hash_finalized=0 | hashed_success=0 | fetch_failed=40 | fetch_timed_out=0 | final_matches_total=0 | gpu_batches=19 | gpu_items=22 | avg_gpu_batch=22.0 | urls_per_sec=0.00 | threshold=58.0 | elapsed=134.3s
+2026-04-14 23:37:53,798 | INFO | Anchor summary (shortlisted) | typo_anchor=62 | hash_anchor=8 | shortlisted=62
+2026-04-14 23:37:53,879 | INFO | Typo similarity summary (shortlisted) | min=1.0000 | avg=1.0000 | p95=1.0000 | max=1.0000 | typo_min_score=0.7500
+2026-04-14 23:37:54,016 | INFO | Stage2 hash exports written to c:\Users\SATWIK\Documents\Phishing\output\hash_folder (1 files)
+2026-04-14 23:37:54,107 | INFO | Stage1 methods summary | rows=64 | lexical_hits=64 | hard_triggers=0 | password_pages=0 | login_forms=0 | action_mismatches=0 | deep_candidates=62 | dns_accepted=62 | deep_attempted=62 | top_escalate_reasons=lexical_hit:62, dns_not_mapped_lexical_hit:2
+2026-04-14 23:37:54,107 | INFO | Stage1 methods CSV written to c:\Users\SATWIK\Documents\Phishing\output\runs\run_20260414T180434Z\stage1\stage1_methods_debug.csv
+2026-04-14 23:37:54,107 | INFO | Stage1 deep-analysis candidates CSV written to c:\Users\SATWIK\Documents\Phishing\output\runs\run_20260414T180434Z\stage1\stage1_deep_analysis_candidates.csv
+2026-04-14 23:37:54,524 | INFO | Stage1 review queue written to c:\Users\SATWIK\Documents\Phishing\output\runs\run_20260414T180434Z\stage1\review_queue.csv with 0 rows
+2026-04-14 23:37:54,569 | INFO | Stage1 debug CSV written to c:\Users\SATWIK\Documents\Phishing\output\runs\run_20260414T180434Z\stage0\stage0_lexical_decisions.csv with 64 rows
+2026-04-14 23:37:54,660 | INFO | Excluded URL audit written to c:\Users\SATWIK\Documents\Phishing\output\runs\run_20260414T180434Z\stage1\hashing_shortlist_excluded_urls.csv with 0 rows
+2026-04-14 23:37:54,661 | INFO | Stage1 routing summary | review_queue_rows=0
