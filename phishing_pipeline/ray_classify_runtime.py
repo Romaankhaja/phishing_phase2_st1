@@ -998,6 +998,14 @@ async def run_hash_only_pipeline_with_ray_impl(
     runtime_config = resolve_ray_runtime_config()
     progress_mode = resolve_progress_mode(progress_mode, execution_backend="ray")
     progress_enabled = progress_bars_enabled(progress_mode)
+    candidate_rows = df_filtered.to_dict("records")
+    ocr_required_actor_count = int(runtime_config["ocr_actors"])
+    if not any(
+        str(row.get("fetch_status", "fetched") or "fetched").strip().lower() in {"fetched", "fetched_visual_missing"}
+        and not pipeline_module._requires_registration_only_enrichment(row)
+        for row in candidate_rows
+    ):
+        ocr_required_actor_count = 0
     logger.info(
         "Ray classify startup | rows=%d | progress_mode=%s | local_mode=%s | low_memory=%s | server_mode=%s | prewarm=%s | classify_actors=%d | classify_inflight=%d | ocr_actors=%d | ocr_batch={size=%d,delay_ms=%d}",
         len(df_filtered),
@@ -1008,7 +1016,7 @@ async def run_hash_only_pipeline_with_ray_impl(
         bool(runtime_config.get("prewarm_actors")),
         int(runtime_config["classify_actors"]),
         int(runtime_config.get("classify_inflight", max(1, int(runtime_config["classify_actors"])))),
-        int(runtime_config["ocr_actors"]),
+        int(ocr_required_actor_count),
         int(runtime_config.get("ocr_batch_size", 1) or 1),
         int(runtime_config.get("ocr_batch_delay_ms", 1) or 1),
     )
@@ -1025,12 +1033,13 @@ async def run_hash_only_pipeline_with_ray_impl(
     stage3_debug_path = get_run_artifact_path(run_context, "stage3_classification_debug_csv", pipeline_module.STAGE3_CLASSIFICATION_DEBUG_PATH)
     whois_actor = primitives["WhoisCoordinatorActor"].options(num_cpus=0).remote(20)
     ocr_num_gpus = 0.0
-    try:
-        import torch  # type: ignore
-        if torch.cuda.is_available():
-            ocr_num_gpus = 1.0
-    except Exception:
-        pass
+    if ocr_required_actor_count > 0:
+        try:
+            import torch  # type: ignore
+            if torch.cuda.is_available():
+                ocr_num_gpus = 1.0
+        except Exception:
+            pass
     ocr_actors = [
         primitives["OcrWorkerActor"].options(
             num_cpus=1,
@@ -1039,7 +1048,7 @@ async def run_hash_only_pipeline_with_ray_impl(
             int(runtime_config.get("ocr_batch_size", 32) or 32),
             int(runtime_config.get("ocr_batch_delay_ms", 25) or 25),
         )
-        for index in range(int(runtime_config["ocr_actors"]))
+        for index in range(int(ocr_required_actor_count))
     ]
     classifier_actors = [primitives["HashOnlyClassifierActor"].options(num_cpus=1, max_concurrency=1).remote(failed_fetch_suspected_min, failed_fetch_review_min) for _ in range(int(runtime_config["classify_actors"]))]
     output_records: list[dict[str, Any]] = []
@@ -1223,7 +1232,7 @@ async def run_hash_only_pipeline_with_ray_impl(
 
     def _submit_classify_row(*, row: dict[str, Any], sequence_number: int, actor_slot: int, attempt_count: int) -> None:
         classifier = classifier_actors[actor_slot]
-        ocr_actor = ocr_actors[(max(1, sequence_number) - 1) % len(ocr_actors)]
+        ocr_actor = ocr_actors[(max(1, sequence_number) - 1) % len(ocr_actors)] if ocr_actors else None
         domain_url = str(row.get("Identified Phishing/Suspected Domain Name", "")).strip()
         normalized_url = domain_url.strip().lower()
         source_workbook = str(row.get("source_workbook", "") or "")

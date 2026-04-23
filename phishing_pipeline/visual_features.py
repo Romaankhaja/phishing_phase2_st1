@@ -1,4 +1,5 @@
 import os, re, base64, mimetypes, requests, asyncio, warnings, logging as _logging, socket, threading
+from typing import Any
 import aiohttp  # For HEAD request pre-check
 # Suppress harmless PyTorch RNN warning from EasyOCR's LSTM
 warnings.filterwarnings("ignore", message="RNN module weights are not part of single contiguous chunk")
@@ -17,8 +18,6 @@ from colormath.color_diff import delta_e_cie2000
 from playwright.sync_api import sync_playwright, Playwright, Browser, BrowserContext
 from playwright.async_api import async_playwright, Playwright as AsyncPlaywright, Browser as AsyncBrowser, BrowserContext as AsyncBrowserContext
 import tldextract
-import easyocr
-import torch
 import logging
 
 from .config import SCREENS_DIR
@@ -33,12 +32,32 @@ _browser: Browser | None = None
 _context: BrowserContext | None = None
 
 # _async_* variables are now handled by AsyncBrowserManager class
-_ocr_reader: easyocr.Reader | None = None
+_ocr_reader: Any | None = None
+_easyocr_module: Any | None = None
+_torch_module: Any | None = None
 _ocr_call_count: int = 0  # Counter for periodic GPU cache cleanup & reader reset
 _OCR_RESET_INTERVAL: int = 20  # Re-init OCR reader every N calls to prevent VRAM fragmentation
 _ocr_lock = threading.Lock()  # Global lock for thread-safe OCR access (MUST wrap ALL CUDA ops)
 
 logger = logging.getLogger(__name__)
+
+
+def _get_torch_module():
+    global _torch_module
+    if _torch_module is None:
+        import torch as torch_module
+
+        _torch_module = torch_module
+    return _torch_module
+
+
+def _get_easyocr_module():
+    global _easyocr_module
+    if _easyocr_module is None:
+        import easyocr as easyocr_module
+
+        _easyocr_module = easyocr_module
+    return _easyocr_module
 
 def _get_browser_context() -> BrowserContext:
     """
@@ -77,7 +96,7 @@ def _get_browser_context() -> BrowserContext:
 
 
 
-def _get_ocr_reader() -> easyocr.Reader:
+def _get_ocr_reader():
     """
     Initializes and returns a single, shared EasyOCR reader.
     
@@ -93,6 +112,8 @@ def _get_ocr_reader() -> easyocr.Reader:
     global _ocr_reader
     if _ocr_reader is None:
         try:
+            torch = _get_torch_module()
+            easyocr = _get_easyocr_module()
             # Check GPU availability
             gpu_available = torch.cuda.is_available()
             if gpu_available:
@@ -637,6 +658,7 @@ def run_ocr_inference(img_np) -> tuple:
         return "", []
 
     with _ocr_lock:
+        torch = _get_torch_module()
         # Periodic reader reset to clear VRAM fragmentation
         if _ocr_call_count > 0 and _ocr_call_count % _OCR_RESET_INTERVAL == 0:
             logger.debug("🔄 OCR reader reset (call #%d) to clear VRAM fragmentation", _ocr_call_count)

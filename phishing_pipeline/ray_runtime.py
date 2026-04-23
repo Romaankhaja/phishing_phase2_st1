@@ -825,8 +825,6 @@ class _HashOnlyClassifierActorImpl:
     def __init__(self, failed_fetch_suspected_min: float | None = None, failed_fetch_review_min: float | None = None) -> None:
         import httpx
 
-        from .model_utils import load_models_and_preproc
-
         self._failed_fetch_suspected_min = failed_fetch_suspected_min
         self._failed_fetch_review_min = failed_fetch_review_min
         self._client = httpx.AsyncClient(follow_redirects=True, timeout=10.0)
@@ -837,7 +835,22 @@ class _HashOnlyClassifierActorImpl:
             "dns_by_host": {},
             "geoip_by_ip": {},
         }
+        self._models_load_attempted = False
+        self._brand_model = None
+        self._domain_model = None
+        self._brand_classes: list[str] = []
+        self._source_classes: list[str] = []
+        self._feature_cols: list[str] = []
+        self._scaler = None
+        self._imputer = None
+
+    def _ensure_models_loaded(self) -> None:
+        if self._models_load_attempted:
+            return
+        self._models_load_attempted = True
         try:
+            from .model_utils import load_models_and_preproc
+
             (
                 self._brand_model,
                 self._domain_model,
@@ -865,6 +878,11 @@ class _HashOnlyClassifierActorImpl:
         }
 
     async def classify_row(self, row: dict[str, Any], sequence_number: int, ocr_worker: Any, whois_actor: Any) -> dict[str, Any]:
+        from . import pipeline as pipeline_module
+
+        fetch_status = str(row.get("fetch_status", "fetched") or "fetched").strip().lower()
+        if fetch_status in {"fetched", "fetched_visual_missing"} and not pipeline_module._requires_registration_only_enrichment(row):
+            self._ensure_models_loaded()
         return await _classify_hash_only_row_impl(
             row=row,
             sequence_number=sequence_number,

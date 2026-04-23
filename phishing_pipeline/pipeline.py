@@ -1069,8 +1069,16 @@ def _row_path_markers(row: dict) -> set[str]:
     return markers
 
 
-def _requires_registration_only_enrichment(row: dict) -> bool:
+def _is_dns_not_mapped_passthrough(row: dict) -> bool:
     return "dns_not_mapped_lexical_passthrough" in _row_path_markers(row)
+
+
+def _requires_registration_only_enrichment(row: dict) -> bool:
+    markers = _row_path_markers(row)
+    return bool(
+        "dns_not_mapped_lexical_passthrough" in markers
+        or "failed_fetch_strict_lexical_suspected" in markers
+    )
 
 
 def _build_output_remarks(
@@ -1081,7 +1089,7 @@ def _build_output_remarks(
     hosting_ip: str = "NA",
 ) -> str:
     hosting_ip_text = str(hosting_ip or "").strip().upper()
-    if _requires_registration_only_enrichment(row) and hosting_ip_text in {"", "NA", "N/A", "NONE"}:
+    if _is_dns_not_mapped_passthrough(row) and hosting_ip_text in {"", "NA", "N/A", "NONE"}:
         return "not_mapped_to_ip; webpage rendering skipped because the domain did not resolve to an active IP."
     redirect_flags = _resolve_redirect_target_flags(row)
     redirect_host = str(redirect_flags.get("redirect_host", "") or "")
