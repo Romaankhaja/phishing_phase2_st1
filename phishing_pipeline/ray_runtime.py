@@ -23,7 +23,6 @@ from .config import (
     CITY_DB_PATH,
     FINAL_OUTPUT,
     resolve_ray_runtime_config,
-    resolve_stage1_http_config,
 )
 from .geoip_utils import enrich_with_geoip
 from .reliability import CheckpointStore, RunContext, make_record_key, stage_result_patch, utc_now_iso
@@ -418,173 +417,6 @@ class _WhoisCoordinatorActorImpl:
             await asyncio.sleep(delay)
 
 
-class _Stage1FetchActorImpl:
-    def __init__(self, stage1_http_config: dict[str, Any]) -> None:
-        import httpx
-
-        self._config = resolve_stage1_http_config(stage1_http_config)
-        limits = httpx.Limits(
-            max_connections=max(
-                1,
-                int(
-                    self._config.get(
-                        "stage1_http_connection_limit",
-                        self._config.get("http_concurrency", self._config.get("concurrency", 24)),
-                    )
-                ),
-            ),
-            max_keepalive_connections=max(
-                1,
-                int(self._config.get("stage1_http_keepalive_limit", self._config.get("concurrency", 24))),
-            ),
-        )
-        timeout = httpx.Timeout(self._config["get_timeout"], connect=self._config["connect_timeout"])
-        self._client = httpx.AsyncClient(
-            timeout=timeout,
-            follow_redirects=False,
-            limits=limits,
-            verify=False,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; ray-stage1-fetch/1.0)"},
-        )
-
-    async def warm(self) -> dict[str, Any]:
-        return {
-            "ready": True,
-            "connection_limit": int(self._config.get("stage1_http_connection_limit", 0) or 0),
-            "keepalive_limit": int(self._config.get("stage1_http_keepalive_limit", 0) or 0),
-        }
-
-    async def fetch(self, record: dict[str, Any]) -> dict[str, Any]:
-        from .stage1_http_analyzer import fetch_stage1_http_artifacts
-
-        started = time.perf_counter()
-        payload = await fetch_stage1_http_artifacts(
-            str(record.get("raw_url", "") or ""),
-            self._client,
-            config=self._config,
-        )
-        return {
-            "record": dict(record),
-            "payload": payload,
-            "elapsed_ms": max(0.0, (time.perf_counter() - started) * 1000.0),
-        }
-
-    async def close(self) -> None:
-        await self._client.aclose()
-
-
-class _Stage1EnrichActorImpl:
-    def __init__(self, stage1_http_config: dict[str, Any], lookup_cache: Any | None = None) -> None:
-        import httpx
-
-        self._config = resolve_stage1_http_config(stage1_http_config)
-        self._lookup_cache = lookup_cache
-        self._client = httpx.AsyncClient(
-            timeout=self._config["rdap_timeout"],
-            follow_redirects=True,
-            verify=False,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; ray-stage1-enrich/1.0)"},
-        )
-
-    async def warm(self) -> dict[str, Any]:
-        return {
-            "ready": True,
-            "rdap_timeout": float(self._config.get("rdap_timeout", 0.0) or 0.0),
-        }
-
-    async def _cache_get(self, kind: str, key: str) -> dict[str, Any] | None:
-        if self._lookup_cache is None:
-            return None
-        ray = _import_ray()
-        method = self._lookup_cache.get_rdap if kind == "rdap" else self._lookup_cache.get_dns
-        return await asyncio.to_thread(ray.get, method.remote(key))
-
-    async def _cache_put(self, kind: str, key: str, payload: dict[str, Any]) -> None:
-        if self._lookup_cache is None:
-            return
-        method = self._lookup_cache.put_rdap if kind == "rdap" else self._lookup_cache.put_dns
-        method.remote(key, payload)
-
-    async def enrich(self, record: dict[str, Any], result: dict[str, Any], dns_prefetch: dict[str, Any] | None = None) -> dict[str, Any]:
-        from .rdap_utils import lookup_rdap
-        from .stage1_http_analyzer import (
-            _age_days_from_creation,
-            _fetch_tls_summary,
-            _normalize_host,
-            _resolve_dns_answers,
-            get_stage1_entity_context,
-            lookup_geoip_summary,
-            score_stage1_http_signals,
-        )
-
-        started = time.perf_counter()
-        enriched = dict(result or {})
-        final_domain = _normalize_host(
-            enriched.get("final_domain") or urlparse(str(enriched.get("final_landing_url") or "")).netloc
-        )
-        original_domain = _normalize_host(
-            enriched.get("original_domain") or urlparse(str(enriched.get("normalized_url") or "")).netloc
-        )
-        if final_domain:
-            same_domain_reuse = bool(dns_prefetch) and final_domain == original_domain
-            dns_info = None
-            if same_domain_reuse:
-                dns_info = dict(dns_prefetch or {})
-            else:
-                dns_info = await self._cache_get("dns", final_domain)
-                if dns_info is None:
-                    dns_info = await _resolve_dns_answers(final_domain, float(self._config["dns_timeout"]))
-                    await self._cache_put("dns", final_domain, dns_info)
-            if isinstance(dns_info, dict):
-                resolved_ips = dns_info.get("resolved_ips", [])
-                if isinstance(resolved_ips, str):
-                    resolved_ips = [item.strip() for item in resolved_ips.split(";") if item.strip()]
-                enriched["resolved_ips"] = list(resolved_ips or [])
-                enriched["dns_answer_count"] = int(dns_info.get("dns_answer_count", len(enriched["resolved_ips"])) or 0)
-                if enriched["resolved_ips"]:
-                    geoip = lookup_geoip_summary(enriched["resolved_ips"][0])
-                    enriched["asn"] = geoip.get("asn")
-                    enriched["asn_org"] = str(geoip.get("asn_org") or "")
-                    enriched["country"] = str(geoip.get("country") or "")
-
-            rdap_info = await self._cache_get("rdap", final_domain)
-            if rdap_info is None:
-                rdap_info = await lookup_rdap(
-                    final_domain,
-                    client=self._client,
-                    timeout=float(self._config["rdap_timeout"]),
-                )
-                await self._cache_put("rdap", final_domain, rdap_info)
-            if isinstance(rdap_info, dict):
-                creation_date = rdap_info.get("creation_date")
-                enriched["rdap_creation_date"] = creation_date
-                enriched["rdap_age_days"] = _age_days_from_creation(creation_date)
-
-            tls_info = await _fetch_tls_summary(final_domain, float(self._config["tls_timeout"]))
-            if isinstance(tls_info, dict):
-                enriched["cert_cn"] = str(tls_info.get("cert_cn") or "")
-                enriched["cert_san"] = list(tls_info.get("cert_san") or [])
-                enriched["cert_issuer"] = str(tls_info.get("cert_issuer") or "")
-
-        entity_context, ordered_entities = get_stage1_entity_context()
-        enriched.update(
-            score_stage1_http_signals(
-                enriched,
-                entity_context=entity_context,
-                ordered_entities=ordered_entities,
-                config=self._config,
-            )
-        )
-        return {
-            "record": dict(record),
-            "result": enriched,
-            "elapsed_ms": max(0.0, (time.perf_counter() - started) * 1000.0),
-        }
-
-    async def close(self) -> None:
-        await self._client.aclose()
-
-
 class _HashBrowserActorImpl:
     def __init__(self, tabs_per_actor: int, per_host_limit: int) -> None:
         self._tabs_per_actor = max(1, int(tabs_per_actor))
@@ -923,44 +755,6 @@ def _stage0_batch_task_impl(normalized_urls: list[str], lexical_eval_config: tup
     )
 
 
-def _stage1_parse_task_impl(record: dict[str, Any], payload: dict[str, Any], stage1_http_config: dict[str, Any]) -> dict[str, Any]:
-    from .stage1_http_analyzer import (
-        get_stage1_entity_context,
-        parse_stage1_html_payload,
-        score_stage1_http_signals,
-        should_enrich_stage1_result,
-    )
-
-    config = resolve_stage1_http_config(stage1_http_config)
-    result = dict(payload.get("result") or {})
-    html_bytes = payload.get("html_bytes") or b""
-    response_encoding = payload.get("response_encoding")
-    normalized_url = str(record.get("normalized_url", "") or result.get("normalized_url", ""))
-    if html_bytes:
-        result.update(
-            parse_stage1_html_payload(
-                html_bytes,
-                charset=response_encoding,
-                final_url=result.get("final_landing_url") or normalized_url,
-                max_html_bytes=int(config["max_html_bytes"]),
-            )
-        )
-    entity_context, ordered_entities = get_stage1_entity_context()
-    result.update(
-        score_stage1_http_signals(
-            result,
-            entity_context=entity_context,
-            ordered_entities=ordered_entities,
-            config=config,
-        )
-    )
-    return {
-        "record": dict(record),
-        "result": result,
-        "should_enrich": bool(should_enrich_stage1_result(result, config=config)),
-    }
-
-
 async def _hash_enrich_task_async_impl(render_payload: dict[str, Any], prefetch_metrics: dict[str, Any], stage1_analysis: dict[str, Any], scoring_config: dict[str, Any]) -> dict[str, Any]:
     import aiohttp
 
@@ -1061,13 +855,10 @@ def _get_ray_primitives() -> dict[str, Any]:
         "CheckpointWriterActor": ray.remote(num_cpus=0, max_concurrency=8)(_CheckpointWriterActorImpl),
         "LookupCacheActor": ray.remote(num_cpus=0, max_concurrency=32)(_LookupCacheActorImpl),
         "WhoisCoordinatorActor": ray.remote(num_cpus=0, max_concurrency=32)(_WhoisCoordinatorActorImpl),
-        "Stage1FetchActor": ray.remote(_Stage1FetchActorImpl),
-        "Stage1EnrichActor": ray.remote(_Stage1EnrichActorImpl),
         "HashBrowserActor": ray.remote(_HashBrowserActorImpl),
         "OcrWorkerActor": ray.remote(num_cpus=1, max_concurrency=64)(_OcrWorkerActorImpl),
         "HashOnlyClassifierActor": ray.remote(num_cpus=1)(_HashOnlyClassifierActorImpl),
         "stage0_batch_task": ray.remote(num_cpus=stage0_task_cpu)(_stage0_batch_task_impl),
-        "stage1_parse_task": ray.remote(num_cpus=light_task_cpu)(_stage1_parse_task_impl),
         "hash_enrich_task": ray.remote(num_cpus=light_task_cpu)(_hash_enrich_task_impl),
         "hash_finalize_batch_task": ray.remote(num_cpus=finalize_task_cpu)(_hash_finalize_batch_task_impl),
     }
@@ -1244,22 +1035,15 @@ async def run_hashing_shortlist_with_ray(
     weights: dict[str, float] | None = None,
     shortlist_debug_csv: str | None = None,
     url_sources: dict | None = None,
-    keep_stage1_suspected: bool = False,
-    keep_fetch_failed_strict_lexical: bool = False,
-    stage1_escalate_total_threshold=None,
-    stage1_brand_min=None,
-    stage1_credential_min=None,
-    stage1_low_band_min=None,
-    stage1_hard_trigger_brand_min=None,
     run_context: RunContext | None = None,
     checkpoint_store=None,
     resume: bool = False,
     force_reprocess: bool = False,
     progress_mode: str | None = None,
 ):
-    from .ray_shortlist_runtime import run_hashing_shortlist_with_ray_impl
+    from .comparison import run_hashing_shortlist_streaming
 
-    return await run_hashing_shortlist_with_ray_impl(
+    return await run_hashing_shortlist_streaming(
         url_list,
         threshold=threshold,
         domain_similarity_threshold=domain_similarity_threshold,
@@ -1271,18 +1055,10 @@ async def run_hashing_shortlist_with_ray(
         weights=weights,
         shortlist_debug_csv=shortlist_debug_csv,
         url_sources=url_sources,
-        keep_stage1_suspected=keep_stage1_suspected,
-        keep_fetch_failed_strict_lexical=keep_fetch_failed_strict_lexical,
-        stage1_escalate_total_threshold=stage1_escalate_total_threshold,
-        stage1_brand_min=stage1_brand_min,
-        stage1_credential_min=stage1_credential_min,
-        stage1_low_band_min=stage1_low_band_min,
-        stage1_hard_trigger_brand_min=stage1_hard_trigger_brand_min,
         run_context=run_context,
         checkpoint_store=checkpoint_store,
         resume=resume,
         force_reprocess=force_reprocess,
-        progress_mode=progress_mode,
     )
 
 

@@ -300,24 +300,6 @@ STAGE3_CLASSIFICATION_DEBUG_PATH = os.path.join(ROOT_DIR, "output", "stage3_clas
 # --- (End of Fix 1) ---
 
 _STAGE1_DEBUG_COMPAT_FIELDS = (
-    "lexical_hit",
-    "brand_score",
-    "credential_score",
-    "infra_score",
-    "evasion_score",
-    "total_stage1_score",
-    "hard_trigger_hit",
-    "stage1_reasons",
-    "page_has_password_field",
-    "page_has_login_form",
-    "form_action_mismatch",
-    "csc_mention_count",
-    "redirect_count",
-    "final_domain",
-    "favicon_domain",
-    "html_bytes_read",
-    "escalate_to_hashing",
-    "escalate_reason",
     "direct_brand_evidence_count",
     "deceptive_host_embedding",
     "content_spoof_strong",
@@ -326,24 +308,6 @@ _STAGE1_DEBUG_COMPAT_FIELDS = (
 
 def _stage1_debug_compat_payload(row: dict) -> dict:
     defaults = {
-        "lexical_hit": False,
-        "brand_score": 0,
-        "credential_score": 0,
-        "infra_score": 0,
-        "evasion_score": 0,
-        "total_stage1_score": 0,
-        "hard_trigger_hit": False,
-        "stage1_reasons": "",
-        "page_has_password_field": False,
-        "page_has_login_form": False,
-        "form_action_mismatch": False,
-        "csc_mention_count": 0,
-        "redirect_count": 0,
-        "final_domain": "",
-        "favicon_domain": "",
-        "html_bytes_read": 0,
-        "escalate_to_hashing": False,
-        "escalate_reason": "",
         "direct_brand_evidence_count": 0,
         "deceptive_host_embedding": False,
         "content_spoof_strong": False,
@@ -1075,10 +1039,7 @@ def _is_dns_not_mapped_passthrough(row: dict) -> bool:
 
 def _requires_registration_only_enrichment(row: dict) -> bool:
     markers = _row_path_markers(row)
-    return bool(
-        "dns_not_mapped_lexical_passthrough" in markers
-        or "failed_fetch_strict_lexical_suspected" in markers
-    )
+    return "dns_not_mapped_lexical_passthrough" in markers
 
 
 def _build_output_remarks(
@@ -1393,7 +1354,6 @@ def _hybrid_hash_decision(
     strict_lexical_hit = _as_bool_flag(row.get("strict_lexical_hit")) or lexical_rule_hit or brand_token_hit or old_fuzzy_hit or hybrid_lexical_hit
     lexical_score_pass = _as_bool_flag(row.get("lexical_score_pass"))
     fallback_rank_only = _as_bool_flag(row.get("fallback_rank_only"))
-    stage1_passthrough = _as_bool_flag(row.get("stage1_passthrough")) or "stage1_suspected_passthrough" in str(row.get("admission_path", "") or "")
     fetch_status = str(row.get("fetch_status", "fetched") or "fetched").strip().lower()
     fetched = fetch_status in {"fetched", "fetched_visual_missing"}
 
@@ -1405,11 +1365,11 @@ def _hybrid_hash_decision(
         "non_lexical_corroboration_count": 0,
     }
 
-    if fallback_rank_only and not strict_lexical_hit and not stage1_passthrough:
+    if fallback_rank_only and not strict_lexical_hit:
         decision["classification_gate_reason"] = "fallback_rank_only_without_strict_lexical"
         return decision
 
-    lexical_survivor = bool(strict_lexical_hit or lexical_score_pass or stage1_passthrough)
+    lexical_survivor = bool(strict_lexical_hit or lexical_score_pass)
     if not lexical_survivor:
         decision["classification_gate_reason"] = "no_lexical_gate"
         return decision
@@ -1951,7 +1911,6 @@ async def _run_hash_only_pipeline(
                         "hash_anchor": row.get("hash_anchor", False),
                         "generic_token_only_match": row.get("generic_token_only_match", False),
                         "direct_brand_evidence_count": row.get("direct_brand_evidence_count", 0),
-                        "stage1_passthrough": row.get("stage1_passthrough", False),
                         "tvc_brand_detected": False,
                         "tvc_detected_brand": "none",
                         "tvc_brand_spoofed": False,
@@ -2182,7 +2141,6 @@ async def _run_hash_only_pipeline(
                         "hash_anchor": row.get("hash_anchor", False),
                         "generic_token_only_match": row.get("generic_token_only_match", False),
                         "direct_brand_evidence_count": row.get("direct_brand_evidence_count", 0),
-                        "stage1_passthrough": row.get("stage1_passthrough", False),
                         "tvc_brand_detected": False,
                         "tvc_detected_brand": "none",
                         "tvc_brand_spoofed": False,
@@ -2466,7 +2424,6 @@ async def _run_hash_only_pipeline(
                     "hash_anchor": row.get("hash_anchor", False),
                     "generic_token_only_match": row.get("generic_token_only_match", False),
                     "direct_brand_evidence_count": row.get("direct_brand_evidence_count", 0),
-                    "stage1_passthrough": row.get("stage1_passthrough", False),
                     "tvc_brand_detected": ocr_tvc.get("tvc_brand_detected", False),
                     "tvc_detected_brand": ocr_tvc.get("tvc_detected_brand", "none"),
                     "tvc_brand_spoofed": ocr_tvc.get("tvc_brand_spoofed", False),
@@ -2736,13 +2693,6 @@ async def run_pipeline(
     typo_min_score=0.75,
     lexical_pass_min_score=0.85,
     shortlist_debug_csv=None,
-    stage1_escalate_total_threshold=None,
-    stage1_brand_min=None,
-    stage1_credential_min=None,
-    stage1_low_band_min=None,
-    stage1_hard_trigger_brand_min=None,
-    keep_stage1_suspected=False,
-    keep_fetch_failed_strict_lexical=False,
     failed_fetch_suspected_min=None,
     failed_fetch_review_min=None,
     classify_hash_floor: float = 25.0,
@@ -2771,10 +2721,7 @@ async def run_pipeline(
     logger.info(
         "Pipeline mode=%s | high_confidence_threshold=%.2f | medium_confidence_threshold=%.2f | "
         "hashing_threshold=%.2f | domain_similarity_threshold=%.3f | typo_top_k=%d | "
-        "typo_min_score=%.3f | lexical_pass_min_score=%.3f | "
-        "stage1_overrides={escalate_total=%s,brand_min=%s,credential_min=%s,low_band_min=%s,hard_trigger_brand_min=%s} | "
-        "review_policies={stage1_suspected_passthrough=%s,fetch_failed_strict_lexical_passthrough=%s} | "
-        "failed_fetch_rescue={suspected_min=%s,review_min=%s}",
+        "typo_min_score=%.3f | lexical_pass_min_score=%.3f | failed_fetch_rescue={suspected_min=%s,review_min=%s}",
         pipeline_mode,
         high_confidence_threshold,
         medium_confidence_threshold,
@@ -2783,13 +2730,6 @@ async def run_pipeline(
         int(typo_top_k),
         typo_min_score,
         lexical_pass_min_score,
-        stage1_escalate_total_threshold if stage1_escalate_total_threshold is not None else "default",
-        stage1_brand_min if stage1_brand_min is not None else "default",
-        stage1_credential_min if stage1_credential_min is not None else "default",
-        stage1_low_band_min if stage1_low_band_min is not None else "default",
-        stage1_hard_trigger_brand_min if stage1_hard_trigger_brand_min is not None else "default",
-        keep_stage1_suspected,
-        keep_fetch_failed_strict_lexical,
         failed_fetch_suspected_min if failed_fetch_suspected_min is not None else "off",
         failed_fetch_review_min if failed_fetch_review_min is not None else "off",
     )
@@ -2832,13 +2772,6 @@ async def run_pipeline(
                 lexical_pass_min_score=lexical_pass_min_score,
                 shortlist_debug_csv=shortlist_debug_csv,
                 url_sources=url_sources,
-                keep_stage1_suspected=keep_stage1_suspected,
-                keep_fetch_failed_strict_lexical=keep_fetch_failed_strict_lexical,
-                stage1_escalate_total_threshold=stage1_escalate_total_threshold,
-                stage1_brand_min=stage1_brand_min,
-                stage1_credential_min=stage1_credential_min,
-                stage1_low_band_min=stage1_low_band_min,
-                stage1_hard_trigger_brand_min=stage1_hard_trigger_brand_min,
                 run_context=run_context,
                 checkpoint_store=checkpoint_store,
                 resume=resume,
@@ -2912,13 +2845,7 @@ async def run_pipeline(
 
         def _bypass_floor(row) -> bool:
             """URLs with strong lexical evidence bypass the hash floor."""
-            return (
-                _as_bool_flag(row.get("strict_lexical_hit"))
-                or _as_bool_flag(row.get("hash_anchor"))
-                or _as_bool_flag(row.get("stage1_passthrough"))
-                or _as_bool_flag(row.get("typo_anchor"))
-                or _as_bool_flag(row.get("content_spoof_strong"))
-            )
+            return _as_bool_flag(row.get("strict_lexical_hit")) or _as_bool_flag(row.get("hash_anchor"))
 
         bypass_mask = df_filtered.apply(_bypass_floor, axis=1)
         score_mask = df_filtered["hash_score"] >= classify_hash_floor

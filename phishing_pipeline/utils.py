@@ -1,4 +1,4 @@
-﻿import os, re
+import os, re
 import psutil
 import tldextract
 import numpy as np
@@ -13,7 +13,7 @@ if sys.platform.startswith("win"):
 try:
     import torch
     TORCH_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
     TORCH_AVAILABLE = False
  
 

@@ -25,7 +25,7 @@
     "stage1_failure_policy": "route_to_dns",
     "stage1_hard_trigger_brand_min": null,
     "stage1_low_band_min": null,
-    "stage_smoke_test": "off",
+    "stage_smoke_test": "lexical",
     "stall_threshold_seconds": 180,
     "target_limit": null,
     "telemetry_mode": "sampled",
@@ -41,7 +41,7 @@
     "weight_ssl_hash": 12.0,
     "whitelist": "data\\whitelists\\Stage_2_Legitimate_Domains_80.xlsx"
   },
-  "latest_output_dir": "c:\\Users\\SATWIK\\Documents\\Phishing\\output\\latest",
-  "run_id": "run_20260414T180434Z",
-  "run_output_dir": "c:\\Users\\SATWIK\\Documents\\Phishing\\output\\runs\\run_20260414T180434Z"
+  "latest_output_dir": "C:\\Users\\sathwik.kusuri\\Documents\\phishing_ml\\output\\latest",
+  "run_id": "run_20260424T055056Z",
+  "run_output_dir": "C:\\Users\\sathwik.kusuri\\Documents\\phishing_ml\\output\\runs\\run_20260424T055056Z"
 }

@@ -585,7 +585,6 @@ def resolve_runtime_profile(
         "resolved_profile": resolved_profile,
         "resource_info": resource_info,
         "env": copy.deepcopy(selected.get("env") or {}),
-        "stage1_http": copy.deepcopy(selected.get("stage1_http") or {}),
         "reliability": copy.deepcopy(selected.get("reliability") or {}),
     }
 
@@ -667,12 +666,6 @@ def resolve_stage_config(
         "paths": copy.deepcopy(PATHS_CONFIG),
         "runtime_profile": copy.deepcopy(settings or {}),
         "stage0": stage0_config,
-        "stage1_http": resolve_stage1_http_config(
-            copy.deepcopy(overrides.get("stage1_http") or {}),
-            profile_name=profile_name,
-            resource_info=resource_info,
-            runtime_profile_settings=settings,
-        ),
         "hash": resolve_hash_stage_config(
             copy.deepcopy(overrides.get("hash") or {}),
             profile_name=profile_name,
@@ -692,36 +685,6 @@ def resolve_stage_config(
             runtime_profile_settings=settings,
         ),
     }
-
-
-def resolve_stage1_http_config(
-    overrides: dict | None = None,
-    *,
-    profile_name: str | None = None,
-    resource_info: dict[str, Any] | None = None,
-    runtime_profile_settings: dict[str, Any] | None = None,
-) -> dict:
-    config = copy.deepcopy(PIPELINE_STAGE_CONFIG["stage1_http"])
-    settings = runtime_profile_settings
-    if settings is None and profile_name:
-        settings = resolve_runtime_profile(profile_name, resource_info=resource_info)
-    config.update(copy.deepcopy((settings or {}).get("stage1_http") or {}))
-    for key, value in (overrides or {}).items():
-        if value is None:
-            continue
-        config[key] = value
-    if config.get("stage1_cpu_workers") is None:
-        config["stage1_cpu_workers"] = int(config.get("stage1_parse_workers", 4) or 4)
-    if config.get("stage1_parse_workers") is None:
-        config["stage1_parse_workers"] = int(config.get("stage1_cpu_workers", 4) or 4)
-    if config.get("stage1_cpu_queue_max") is None:
-        parse_queue_max = int(config.get("stage1_parse_queue_max", 0) or 0)
-        score_queue_max = int(config.get("stage1_score_queue_max", 0) or 0)
-        config["stage1_cpu_queue_max"] = max(1, parse_queue_max, score_queue_max)
-    if config.get("stage1_fetch_concurrency_floor") is None:
-        fetch_start = int(config.get("stage1_fetch_concurrency_start", config.get("concurrency", 1)) or 1)
-        config["stage1_fetch_concurrency_floor"] = max(1, min(fetch_start, 64))
-    return config
 
 
 def resolve_hash_stage_config(

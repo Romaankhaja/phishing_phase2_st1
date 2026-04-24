@@ -9,7 +9,6 @@ from phishing_pipeline.config import (
     resolve_ray_runtime_config,
     resolve_reliability_config,
     resolve_runtime_profile,
-    resolve_stage1_http_config,
     resolve_stage_config,
 )
 
@@ -45,19 +44,19 @@ class RuntimeProfileTests(unittest.TestCase):
 
         self.assertTrue(config["server_mode"])
         self.assertEqual(1024, config["stage0_batch_size"])
-        self.assertEqual(4, config["stage0_inflight"])
-        self.assertEqual(12, config["stage1_fetch_actors"])
-        self.assertEqual(6, config["stage1_enrich_actors"])
-        self.assertEqual(8, config["hash_browser_actors"])
-        self.assertEqual(2, config["hash_tabs_per_actor"])
-        self.assertEqual(32, config["hash_finalize_batch"])
-        self.assertEqual(8, config["classify_actors"])
-        self.assertEqual(8, config["classify_inflight"])
+        self.assertEqual(8, config["stage0_inflight"])
+        self.assertEqual(24, config["stage1_fetch_actors"])
+        self.assertEqual(12, config["stage1_enrich_actors"])
+        self.assertEqual(12, config["hash_browser_actors"])
+        self.assertEqual(3, config["hash_tabs_per_actor"])
+        self.assertEqual(64, config["hash_finalize_batch"])
+        self.assertEqual(16, config["classify_actors"])
+        self.assertEqual(48, config["classify_inflight"])
         self.assertEqual(4, config["ocr_actors"])
-        self.assertEqual(48, config["stage1_pending_cap"])
-        self.assertEqual(16, config["hash_pending_cap"])
-        self.assertEqual(192, config["stage1_http_connection_cap"])
-        self.assertEqual(96, config["stage1_http_keepalive_cap"])
+        self.assertEqual(192, config["stage1_pending_cap"])
+        self.assertEqual(96, config["hash_pending_cap"])
+        self.assertEqual(768, config["stage1_http_connection_cap"])
+        self.assertEqual(384, config["stage1_http_keepalive_cap"])
         self.assertEqual("staged", config["prewarm_mode"])
         self.assertTrue(config["enable_dynamic_control"])
 
@@ -124,7 +123,6 @@ class RuntimeProfileTests(unittest.TestCase):
         )
 
         self.assertEqual("server-balanced", stage_config["runtime_profile"]["resolved_profile"])
-        self.assertEqual(192, stage_config["stage1_http"]["http_concurrency"])
         self.assertEqual(10, stage_config["reliability"]["append_flush_interval_seconds"])
         self.assertEqual(16, stage_config["stage0"]["lexical_workers"])
 
@@ -140,16 +138,6 @@ class RuntimeProfileTests(unittest.TestCase):
 
         self.assertEqual(10, config["append_flush_interval_seconds"])
         self.assertEqual(10000, config["append_flush_row_interval"])
-
-    def test_resolve_stage1_http_config_applies_profile_overlay(self):
-        settings = resolve_runtime_profile(
-            "cpu-safe",
-            resource_info={"cpu_cores": 12, "ram_gb": 8.0, "vram_gb": 4.0, "platform": "win32"},
-        )
-        config = resolve_stage1_http_config(runtime_profile_settings=settings)
-
-        self.assertEqual(96, config["concurrency"])
-        self.assertEqual(16, config["tls_concurrency"])
 
 
 if __name__ == "__main__":

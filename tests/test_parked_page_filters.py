@@ -57,7 +57,7 @@ class Stage1PayloadTests(unittest.TestCase):
             "provider_branded_parking_template",
         )
 
-    def test_failed_strict_lexical_payload_is_rescued_into_holdout(self):
+    def test_failed_strict_lexical_payload_is_not_rescued_into_holdout(self):
         payload_outcome = comparison._handle_stage1_fetch_payload(
             payload={
                 "url": "https://brand-login-check.com",
@@ -73,11 +73,7 @@ class Stage1PayloadTests(unittest.TestCase):
         )
 
         self.assertIsNone(payload_outcome["queue_payload"])
-        self.assertIsNotNone(payload_outcome["admitted_prefetch_match"])
-        self.assertEqual(
-            payload_outcome["admitted_prefetch_match"]["admission_path"],
-            "failed_fetch_strict_lexical_suspected",
-        )
+        self.assertIsNone(payload_outcome["admitted_prefetch_match"])
 
 
 class HashOnlyClassificationTests(unittest.TestCase):

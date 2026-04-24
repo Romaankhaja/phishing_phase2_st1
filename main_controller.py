@@ -127,14 +127,6 @@ def _runtime_profile(value: str) -> str:
     return normalized
 
 
-def _stage1_failure_policy(value: str) -> str:
-    normalized = str(value or "").strip().lower()
-    allowed = {"route_to_dns", "stop"}
-    if normalized not in allowed:
-        raise argparse.ArgumentTypeError(f"stage1 failure policy must be one of {sorted(allowed)}")
-    return normalized
-
-
 def _telemetry_mode(value: str) -> str:
     normalized = str(value or "").strip().lower()
     allowed = {"sampled", "full", "debug"}
@@ -170,16 +162,6 @@ def _apply_runtime_profile_env(settings: dict[str, Any]) -> None:
     from phishing_pipeline.config import apply_runtime_profile_env
 
     apply_runtime_profile_env(settings)
-
-
-# UNUSED_IN_PROD_RAY_FLOW: dead wrapper after controller switched to direct config resolvers.
-# def _apply_stage1_http_runtime_profile(stage1_http_config: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
-#     from phishing_pipeline.config import resolve_stage1_http_config
-#
-#     resolved = resolve_stage1_http_config(stage1_http_config, runtime_profile_settings=settings)
-#     stage1_http_config.clear()
-#     stage1_http_config.update(resolved)
-#     return stage1_http_config
 
 
 # UNUSED_IN_PROD_RAY_FLOW: dead wrapper after controller switched to direct config resolvers.
@@ -297,7 +279,6 @@ def _build_resume_compatibility_snapshot(
             "pipeline_mode": args.pipeline_mode,
             "target_limit": args.target_limit,
             "limit_whitelisted": args.limit,
-            "stage1_failure_policy": args.stage1_failure_policy,
             "runtime_profile": runtime_profile_settings["resolved_profile"],
             "telemetry_mode": args.telemetry_mode,
             "trace_record_key": str(args.trace_record_key or ""),
@@ -311,13 +292,6 @@ def _build_resume_compatibility_snapshot(
             "typo_top_k": args.typo_top_k,
             "typo_min_score": args.typo_min_score,
             "lexical_pass_min_score": args.lexical_pass_min_score,
-            "stage1_escalate_total_threshold": args.stage1_escalate_total_threshold,
-            "stage1_brand_min": args.stage1_brand_min,
-            "stage1_credential_min": args.stage1_credential_min,
-            "stage1_low_band_min": args.stage1_low_band_min,
-            "stage1_hard_trigger_brand_min": args.stage1_hard_trigger_brand_min,
-            "keep_stage1_suspected": bool(args.keep_stage1_suspected),
-            "keep_fetch_failed_strict_lexical": bool(args.keep_fetch_failed_strict_lexical),
             "failed_fetch_suspected_min": args.failed_fetch_suspected_min,
             "failed_fetch_review_min": args.failed_fetch_review_min,
         },
@@ -330,7 +304,6 @@ def _build_resume_compatibility_snapshot(
             "keywords": args.weight_keywords,
         },
         "runtime_env": dict(runtime_profile_settings.get("env") or {}),
-        "stage1_http_profile": dict(runtime_profile_settings.get("stage1_http") or {}),
     }
 
 
@@ -393,21 +366,7 @@ async def main():
     parser.add_argument("--typo-min-score", type=_probability_float, default=0.75,
                         help="Minimum typosquat similarity to count as typo anchor (default=0.45)")
     parser.add_argument("--lexical-pass-min-score", type=_probability_float, default=0.85,
-                        help="Minimum lexical score allowed to pass Stage 1 admission even below hash threshold (default=0.85)")
-    parser.add_argument("--stage1-escalate-total-threshold", type=_non_negative_int, default=None,
-                        help="Override Stage1 HTTP escalate_total_threshold (default=config)")
-    parser.add_argument("--stage1-brand-min", type=_non_negative_int, default=None,
-                        help="Override Stage1 HTTP brand_min (default=config)")
-    parser.add_argument("--stage1-credential-min", type=_non_negative_int, default=None,
-                        help="Override Stage1 HTTP credential_min (default=config)")
-    parser.add_argument("--stage1-low-band-min", type=_non_negative_int, default=None,
-                        help="Override Stage1 HTTP low_band_min (default=config)")
-    parser.add_argument("--stage1-hard-trigger-brand-min", type=_non_negative_int, default=None,
-                        help="Override Stage1 HTTP hard_trigger_brand_min (default=config)")
-    parser.add_argument("--keep-stage1-suspected", action="store_true",
-                        help="Keep Stage1 suspected_non_escalated rows as weak holdout candidates")
-    parser.add_argument("--keep-fetch-failed-strict-lexical", action="store_true",
-                        help="Keep strict-lexical fetch failed/timeout rows as weak holdout candidates")
+                        help="Minimum lexical score allowed to pass the lexical gate even below hash threshold (default=0.85)")
     parser.add_argument("--failed-fetch-suspected-min", type=_probability_float, default=None,
                         help="Lexical score rescue threshold for Suspected on non-fetched strict-lexical rows")
     parser.add_argument("--failed-fetch-review-min", type=_probability_float, default=None,
@@ -424,12 +383,12 @@ async def main():
                         help="Weight for domain hash exact-match contribution (default=8)")
     parser.add_argument("--weight-keywords", type=_non_negative_float, default=10.0,
                         help="Weight for keyword overlap contribution (default=10)")
-    parser.add_argument("--shortlist-debug-csv", type=str, default=os.path.join("output", "stage1_lexical_debug.csv"),
-                        help="Path for Stage 1 lexical/debug CSV (default=output/stage1_lexical_debug.csv)")
+    parser.add_argument("--shortlist-debug-csv", type=str, default=os.path.join("output", "stage0_lexical_decisions.csv"),
+                        help="Path for Stage 0 lexical decisions CSV (default=output/stage0_lexical_decisions.csv)")
     parser.add_argument("--classify-hash-floor", type=_non_negative_float, default=40.0,
                         help="Minimum hash_score to send a holdout URL to Stage 2 classify (OCR/WHOIS). "
                              "URLs below this floor are auto-classified as Legitimate unless they have "
-                             "strict_lexical_hit, hash_anchor, or stage1_passthrough. Set to 0 to disable. (default=25)")
+                             "strict_lexical_hit or hash_anchor. Set to 0 to disable. (default=25)")
     parser.add_argument("--stage-smoke-test", type=_stage_smoke_mode, default="off",
                         help="Optional partial-run mode: off, fetch, lexical, score, classify, all (default=off)")
     parser.add_argument("--runtime-profile", type=_runtime_profile, default="auto",
@@ -440,8 +399,6 @@ async def main():
                         help="Resume from the latest compatible incomplete run when possible (default=true)")
     parser.add_argument("--force-reprocess", action="store_true",
                         help="Ignore resume state and process all URL records again")
-    parser.add_argument("--stage1-failure-policy", type=_stage1_failure_policy, default="route_to_dns",
-                        help="Routing policy when cheap Stage1 HTTP analysis fails for lexical misses")
     parser.add_argument("--stall-threshold-seconds", type=_positive_int, default=180,
                         help="Watchdog threshold for no-progress detection in long-running stages (default=180)")
     parser.add_argument("--telemetry-mode", type=_telemetry_mode, default="sampled",
@@ -467,7 +424,6 @@ async def main():
         OUTPUT_DIR,
         RUN_MANIFEST_CSV,
         resolve_reliability_config,
-        resolve_stage1_http_config,
     )
     from phishing_pipeline.reliability import (
         CheckpointStore,
@@ -545,7 +501,6 @@ async def main():
         snapshot_flush_interval_seconds=int(reliability_config.get("snapshot_flush_interval_seconds", 30)),
         snapshot_flush_row_interval=int(reliability_config.get("snapshot_flush_row_interval", 5000)),
         stage0_progress_log_interval_seconds=int(reliability_config.get("stage0_progress_log_interval_seconds", 10)),
-        stage1_failure_policy=args.stage1_failure_policy,
         max_worker_restarts=int(reliability_config.get("max_worker_restarts", 2)),
         submission_basename=f"Submission-{input_name}.zip",
         metadata=reliability_metadata,
@@ -562,13 +517,12 @@ async def main():
         execution_backend=execution_backend,
     )
     logger.info(
-        "Reliability run context | run_id=%s | resume=%s | force_reprocess=%s | manifest=%s | checkpoints=%s | stage1_failure_policy=%s | stall_threshold_seconds=%d",
+        "Reliability run context | run_id=%s | resume=%s | force_reprocess=%s | manifest=%s | checkpoints=%s | stall_threshold_seconds=%d",
         run_context.run_id,
         resuming_existing_run,
         args.force_reprocess,
         get_run_artifact_path(run_context, "run_manifest_csv"),
         get_run_artifact_path(run_context, "checkpoints_csv"),
-        run_context.stage1_failure_policy,
         run_context.stall_threshold_seconds,
     )
     logger.info(
@@ -595,7 +549,6 @@ async def main():
     package_results = components["package_results"]
     shortlisting = components["shortlisting"]
     run_hashing_shortlist_async = components["run_hashing_shortlist_async"]
-    stage1_http_config = resolve_stage1_http_config(runtime_profile_settings=runtime_profile_settings)
     ray_runtime = None
     ray_runtime_config = {}
     HashBrowserPreflightError = None
@@ -609,7 +562,6 @@ async def main():
         "effective_progress_mode": effective_progress_mode,
         "execution_backend": execution_backend,
         "runtime_profile": runtime_profile_settings,
-        "stage1_http_config": dict(stage1_http_config or {}),
         "telemetry_mode": args.telemetry_mode,
         "trace_record_key": str(args.trace_record_key or ""),
         "trace_url": str(args.trace_url or ""),
@@ -657,9 +609,7 @@ async def main():
         resource_info = _probe_runtime_resources()
         ray_cfg = dict(ray_runtime_config or {})
         actor_cpu_total = (
-            ray_cfg["stage1_fetch_actors"] * 0.25
-            + ray_cfg["stage1_enrich_actors"] * 0.25
-            + ray_cfg["hash_browser_actors"] * 0.5
+            ray_cfg["hash_browser_actors"] * 0.5
             + ray_cfg["classify_actors"] * 1.0
             + ray_cfg.get("ocr_actors", 1) * 1.0
         )
@@ -668,15 +618,13 @@ async def main():
         logger.info("  Physical CPUs:     %d", resource_info["cpu_cores"])
         logger.info("  System RAM:        %.1f GB", resource_info["ram_gb"])
         logger.info("  GPU VRAM:          %.1f GB", resource_info["vram_gb"])
-        logger.info("  Actor CPU demand:  %.1f  (fetch=%d*0.25 + enrich=%d*0.25 + browser=%d*0.5 + classify=%d*1.0 + ocr=%d*1.0)",
+        logger.info("  Actor CPU demand:  %.1f  (browser=%d*0.5 + classify=%d*1.0 + ocr=%d*1.0)",
             actor_cpu_total,
-            ray_cfg["stage1_fetch_actors"],
-            ray_cfg["stage1_enrich_actors"],
             ray_cfg["hash_browser_actors"],
             ray_cfg["classify_actors"],
             ray_cfg.get("ocr_actors", 1),
         )
-        logger.info("  Task CPU per call: 0.5  (stage0_batch, stage1_parse, hash_enrich, hash_finalize)")
+        logger.info("  Task CPU per call: 0.5  (stage0_batch, hash_enrich, hash_finalize)")
         logger.info("  Headroom:          %.1f CPUs  (%s)",
             resource_info["cpu_cores"] - actor_cpu_total,
             "✅ OK" if resource_info["cpu_cores"] > actor_cpu_total else "🛑 RISK OF DEADLOCK",
@@ -697,15 +645,13 @@ async def main():
     ):
         raise ValueError("failed-fetch-suspected-min must be >= failed-fetch-review-min")
     logger.info(
-        "Runtime profile requested=%s resolved=%s | host={cpu=%s,ram_gb=%.1f,vram_gb=%.1f,platform=%s} | ray={fetch_actors=%s,enrich_actors=%s,browser_actors=%s,classify_actors=%s,stage0_inflight=%s,prewarm=%s,dynamic_control=%s}",
+        "Runtime profile requested=%s resolved=%s | host={cpu=%s,ram_gb=%.1f,vram_gb=%.1f,platform=%s} | ray={browser_actors=%s,classify_actors=%s,stage0_inflight=%s,prewarm=%s,dynamic_control=%s}",
         runtime_profile_settings["requested_profile"],
         runtime_profile_settings["resolved_profile"],
         runtime_profile_settings["resource_info"].get("cpu_cores", "NA"),
         float(runtime_profile_settings["resource_info"].get("ram_gb", 0.0) or 0.0),
         float(runtime_profile_settings["resource_info"].get("vram_gb", 0.0) or 0.0),
         runtime_profile_settings["resource_info"].get("platform", "unknown"),
-        (ray_runtime_config or {}).get("stage1_fetch_actors", "NA"),
-        (ray_runtime_config or {}).get("stage1_enrich_actors", "NA"),
         (ray_runtime_config or {}).get("hash_browser_actors", "NA"),
         (ray_runtime_config or {}).get("classify_actors", "NA"),
         (ray_runtime_config or {}).get("stage0_inflight", "NA"),
@@ -713,17 +659,12 @@ async def main():
         (ray_runtime_config or {}).get("enable_dynamic_control", "NA"),
     )
     logger.info(
-        "Effective runtime concurrency | hash={pages=%s,page_concurrency=%s,http_limit=%s,aux_net_limit=%s,active_fetch_floor=%s} | stage1_http={url=%s,http=%s,dns=%s,rdap=%s,tls=%s}",
+        "Effective runtime concurrency | hash={pages=%s,page_concurrency=%s,http_limit=%s,aux_net_limit=%s,active_fetch_floor=%s}",
         runtime_profile_settings.get("env", {}).get("PHISHING_HASH_PAGES", "NA"),
         runtime_profile_settings.get("env", {}).get("PHISHING_HASH_PAGE_CONCURRENCY", "NA"),
         runtime_profile_settings.get("env", {}).get("PHISHING_HASH_HTTP_LIMIT", "NA"),
         runtime_profile_settings.get("env", {}).get("PHISHING_HASH_AUX_NET_LIMIT", "NA"),
         runtime_profile_settings.get("env", {}).get("PHISHING_HASH_ACTIVE_PAGES_FLOOR", "NA"),
-        stage1_http_config.get("concurrency", "NA"),
-        stage1_http_config.get("http_concurrency", "NA"),
-        stage1_http_config.get("dns_concurrency", "NA"),
-        stage1_http_config.get("rdap_concurrency", "NA"),
-        stage1_http_config.get("tls_concurrency", "NA"),
     )
     logger.info(
         "Hash stage topology | pages=%s | shard_workers=%s | shards=auto | http_limit=%s | aux_net_limit=%s | active_pages_floor=%s",
@@ -734,33 +675,7 @@ async def main():
         runtime_profile_settings.get("env", {}).get("PHISHING_HASH_ACTIVE_PAGES_FLOOR", "NA"),
     )
     logger.info(
-        "Stage1 lane topology | tiered_fast_path=%s | dns_reuse=%s | final_domain_dns_fallback=%s | fetch={start=%s,max=%s,floor=%s,conn=%s,keepalive=%s,per_host=%s} | cpu_workers=%s | enrich={dns=%s,rdap=%s,tls=%s} | queues={fetch=%s,cpu=%s,enrich=%s,result=%s}",
-        stage1_http_config.get("stage1_enable_tiered_fast_path", False),
-        True,
-        True,
-        stage1_http_config.get("stage1_fetch_concurrency_start", "NA"),
-        stage1_http_config.get("stage1_fetch_concurrency_max", "NA"),
-        stage1_http_config.get("stage1_fetch_concurrency_floor", "NA"),
-        stage1_http_config.get("stage1_http_connection_limit", "NA"),
-        stage1_http_config.get("stage1_http_keepalive_limit", "NA"),
-        stage1_http_config.get("stage1_per_host_limit", "NA"),
-        stage1_http_config.get("stage1_cpu_workers", stage1_http_config.get("stage1_parse_workers", "NA")),
-        stage1_http_config.get("stage1_enrich_dns_concurrency", "NA"),
-        stage1_http_config.get("stage1_enrich_rdap_concurrency", "NA"),
-        stage1_http_config.get("stage1_enrich_tls_concurrency", "NA"),
-        stage1_http_config.get("stage1_fetch_queue_max", "NA"),
-        stage1_http_config.get("stage1_cpu_queue_max", "NA"),
-        stage1_http_config.get("stage1_enrich_queue_max", "NA"),
-        stage1_http_config.get("stage1_result_queue_max", "NA"),
-    )
-    logger.info(
-        "Strict attempt policy | checkpoint_mode=csv | retries={stage1=0,rdap=0,tls=0,hash=0,classify=0} | timeouts={stage1_dns=%s,stage1_connect=%s,stage1_head=%s,stage1_get=%s,stage1_rdap=%s,stage1_tls=%s}",
-        stage1_http_config.get("dns_timeout", "NA"),
-        stage1_http_config.get("connect_timeout", "NA"),
-        stage1_http_config.get("head_timeout", "NA"),
-        stage1_http_config.get("get_timeout", "NA"),
-        stage1_http_config.get("rdap_timeout", "NA"),
-        stage1_http_config.get("tls_timeout", "NA"),
+        "Strict attempt policy | checkpoint_mode=csv | retries={rdap=0,tls=0,hash=0,classify=0}"
     )
 
     # ✅ Ensure whitelist file exists
@@ -807,9 +722,7 @@ async def main():
                 os.path.join("output", "dns_gate_audit.csv"),
                 os.path.join("output", "dns_rejected_lexical_hits.csv"),
                 os.path.join("output", "parked_page_exclusions.csv"),
-                os.path.join("output", "stage1_lexical_debug.csv"),
-                os.path.join("output", "stage1_methods_debug.csv"),
-                os.path.join("output", "stage1_deep_analysis_candidates.csv"),
+                os.path.join("output", "stage0_lexical_decisions.csv"),
                 os.path.join("output", "stage2_model_debug.csv"),
                 os.path.join("output", "stage3_classification_debug.csv"),
             ]
@@ -832,39 +745,10 @@ async def main():
             logger.info("Processing ALL whitelisted domains...")
         if args.target_limit is not None:
             logger.info("Limiting shortlist input to first %d target URLs...", args.target_limit)
-        effective_stage1_thresholds = {
-            "escalate_total_threshold": (
-                args.stage1_escalate_total_threshold
-                if args.stage1_escalate_total_threshold is not None
-                else stage1_http_config.get("escalate_total_threshold", "NA")
-            ),
-            "brand_min": (
-                args.stage1_brand_min
-                if args.stage1_brand_min is not None
-                else stage1_http_config.get("brand_min", "NA")
-            ),
-            "credential_min": (
-                args.stage1_credential_min
-                if args.stage1_credential_min is not None
-                else stage1_http_config.get("credential_min", "NA")
-            ),
-            "low_band_min": (
-                args.stage1_low_band_min
-                if args.stage1_low_band_min is not None
-                else stage1_http_config.get("low_band_min", "NA")
-            ),
-            "hard_trigger_brand_min": (
-                args.stage1_hard_trigger_brand_min
-                if args.stage1_hard_trigger_brand_min is not None
-                else stage1_http_config.get("hard_trigger_brand_min", "NA")
-            ),
-        }
         logger.info(
             "Runtime mode=%s | shortlist threshold=%.3f domain_sim_threshold=%.3f "
             "confidence_bands={high>=%.3f, medium>=%.3f} "
             "typo={top_k=%d,min_score=%.3f,lexical_pass_min_score=%.3f} "
-            "stage1_http={url_concurrency=%s,http=%s,dns=%s,rdap=%s,tls=%s,max_html_bytes=%s,max_redirects=%s,escalate_total=%s,brand_min=%s,credential_min=%s,low_band_min=%s,hard_trigger_brand_min=%s} "
-            "review_policies={stage1_suspected_passthrough=%s,fetch_failed_strict_lexical_passthrough=%s} "
             "failed_fetch_rescue={suspected_min=%s,review_min=%s} "
             "weights={domain=%.3f,favicon=%.3f,ssl_hash=%.3f,html_hash=%.3f,domain_hash=%.3f,keywords=%.3f} "
             "stage_smoke_test=%s shortlist_debug_csv=%s",
@@ -876,20 +760,6 @@ async def main():
             args.typo_top_k,
             args.typo_min_score,
             args.lexical_pass_min_score,
-            stage1_http_config.get("concurrency", "NA"),
-            stage1_http_config.get("http_concurrency", "NA"),
-            stage1_http_config.get("dns_concurrency", "NA"),
-            stage1_http_config.get("rdap_concurrency", "NA"),
-            stage1_http_config.get("tls_concurrency", "NA"),
-            stage1_http_config.get("max_html_bytes", "NA"),
-            stage1_http_config.get("max_redirects", "NA"),
-            effective_stage1_thresholds["escalate_total_threshold"],
-            effective_stage1_thresholds["brand_min"],
-            effective_stage1_thresholds["credential_min"],
-            effective_stage1_thresholds["low_band_min"],
-            effective_stage1_thresholds["hard_trigger_brand_min"],
-            args.keep_stage1_suspected,
-            args.keep_fetch_failed_strict_lexical,
             args.failed_fetch_suspected_min if args.failed_fetch_suspected_min is not None else "off",
             args.failed_fetch_review_min if args.failed_fetch_review_min is not None else "off",
             args.weight_domain,
@@ -927,13 +797,6 @@ async def main():
                     typo_min_score=args.typo_min_score,
                     lexical_pass_min_score=args.lexical_pass_min_score,
                     shortlist_debug_csv=effective_shortlist_debug_csv,
-                    stage1_escalate_total_threshold=args.stage1_escalate_total_threshold,
-                    stage1_brand_min=args.stage1_brand_min,
-                    stage1_credential_min=args.stage1_credential_min,
-                    stage1_low_band_min=args.stage1_low_band_min,
-                    stage1_hard_trigger_brand_min=args.stage1_hard_trigger_brand_min,
-                    keep_stage1_suspected=args.keep_stage1_suspected,
-                    keep_fetch_failed_strict_lexical=args.keep_fetch_failed_strict_lexical,
                     failed_fetch_suspected_min=args.failed_fetch_suspected_min,
                     failed_fetch_review_min=args.failed_fetch_review_min,
                     classify_hash_floor=args.classify_hash_floor,
@@ -993,13 +856,6 @@ async def main():
                     weights=shortlist_weights,
                     shortlist_debug_csv=effective_shortlist_debug_csv,
                     url_sources=url_sources,
-                    keep_stage1_suspected=args.keep_stage1_suspected,
-                    keep_fetch_failed_strict_lexical=args.keep_fetch_failed_strict_lexical,
-                    stage1_escalate_total_threshold=args.stage1_escalate_total_threshold,
-                    stage1_brand_min=args.stage1_brand_min,
-                    stage1_credential_min=args.stage1_credential_min,
-                    stage1_low_band_min=args.stage1_low_band_min,
-                    stage1_hard_trigger_brand_min=args.stage1_hard_trigger_brand_min,
                     run_context=run_context,
                     checkpoint_store=checkpoint_store,
                     resume=args.resume,
@@ -1044,13 +900,6 @@ async def main():
                     typo_min_score=args.typo_min_score,
                     lexical_pass_min_score=args.lexical_pass_min_score,
                     shortlist_debug_csv=effective_shortlist_debug_csv,
-                    stage1_escalate_total_threshold=args.stage1_escalate_total_threshold,
-                    stage1_brand_min=args.stage1_brand_min,
-                    stage1_credential_min=args.stage1_credential_min,
-                    stage1_low_band_min=args.stage1_low_band_min,
-                    stage1_hard_trigger_brand_min=args.stage1_hard_trigger_brand_min,
-                    keep_stage1_suspected=args.keep_stage1_suspected,
-                    keep_fetch_failed_strict_lexical=args.keep_fetch_failed_strict_lexical,
                     failed_fetch_suspected_min=args.failed_fetch_suspected_min,
                     failed_fetch_review_min=args.failed_fetch_review_min,
                     classify_hash_floor=args.classify_hash_floor,
@@ -1083,13 +932,6 @@ async def main():
                     typo_min_score=args.typo_min_score,
                     lexical_pass_min_score=args.lexical_pass_min_score,
                     shortlist_debug_csv=effective_shortlist_debug_csv,
-                    stage1_escalate_total_threshold=args.stage1_escalate_total_threshold,
-                    stage1_brand_min=args.stage1_brand_min,
-                    stage1_credential_min=args.stage1_credential_min,
-                    stage1_low_band_min=args.stage1_low_band_min,
-                    stage1_hard_trigger_brand_min=args.stage1_hard_trigger_brand_min,
-                    keep_stage1_suspected=args.keep_stage1_suspected,
-                    keep_fetch_failed_strict_lexical=args.keep_fetch_failed_strict_lexical,
                     failed_fetch_suspected_min=args.failed_fetch_suspected_min,
                     failed_fetch_review_min=args.failed_fetch_review_min,
                     run_context=run_context,

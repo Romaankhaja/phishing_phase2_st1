@@ -7,6 +7,7 @@ import ssl
 import subprocess
 import tldextract
 import httpx
+import dns.asyncresolver
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from collections import Counter
 from functools import partial
@@ -34,25 +35,13 @@ try:
     import resource as _resource
 except Exception:
     _resource = None
-from .config import HASH_EXPORT_DIR, OUTPUT_DIR, RAY_DEBUG_MODE, STAGE1_HTTP_CONFIG, resolve_stage1_http_config
+from .config import HASH_EXPORT_DIR, OUTPUT_DIR, RAY_DEBUG_MODE
 from .similarity_hashing import (
     SIMHASH_BITS,
     best_similarity_against_set,
     compute_domain_simhash,
     compute_image_phash,
     compute_ssl_simhash,
-)
-from .stage1_http_analyzer import (
-    _resolve_dns_answers,
-    _default_stage1_result,
-    analyze_stage1_url,
-    build_stage1_concurrency_controls,
-    enrich_stage1_result,
-    fetch_stage1_http_artifacts,
-    get_stage1_entity_context,
-    parse_stage1_html_payload,
-    score_stage1_http_signals,
-    should_enrich_stage1_result,
 )
 from .reliability import (
     CheckpointStore,
@@ -736,7 +725,7 @@ DEFAULT_TYPO_TOP_K = 10
 DEFAULT_TYPO_MIN_SCORE = 0.75
 DEFAULT_LEXICAL_PASS_MIN_SCORE = 0.85
 DEFAULT_CONTENT_SPOOF_STRONG_DIRECT_BRAND_MIN = 3
-DEFAULT_STAGE1_DEBUG_CSV = os.path.join(ROOT_DIR, "output", "stage1_lexical_debug.csv")
+DEFAULT_STAGE1_DEBUG_CSV = os.path.join(ROOT_DIR, "output", "stage0_lexical_decisions.csv")
 STAGE1_METHODS_DEBUG_PATH = os.path.join(ROOT_DIR, "output", "stage1_methods_debug.csv")
 STAGE1_DEEP_ANALYSIS_CANDIDATES_PATH = os.path.join(ROOT_DIR, "output", "stage1_deep_analysis_candidates.csv")
 FETCH_FAILED_LEXICAL_HITS_PATH = os.path.join(ROOT_DIR, "output", "fetch_failed_lexical_hits.csv")
@@ -995,39 +984,6 @@ def _coerce_optional_stage1_threshold(
     return coerced
 
 
-def _resolve_stage1_runtime_config(
-    *,
-    stage1_escalate_total_threshold=None,
-    stage1_brand_min=None,
-    stage1_credential_min=None,
-    stage1_low_band_min=None,
-    stage1_hard_trigger_brand_min=None,
-) -> dict:
-    overrides = {
-        "escalate_total_threshold": _coerce_optional_stage1_threshold(
-            "stage1_escalate_total_threshold",
-            stage1_escalate_total_threshold,
-        ),
-        "brand_min": _coerce_optional_stage1_threshold(
-            "stage1_brand_min",
-            stage1_brand_min,
-        ),
-        "credential_min": _coerce_optional_stage1_threshold(
-            "stage1_credential_min",
-            stage1_credential_min,
-        ),
-        "low_band_min": _coerce_optional_stage1_threshold(
-            "stage1_low_band_min",
-            stage1_low_band_min,
-        ),
-        "hard_trigger_brand_min": _coerce_optional_stage1_threshold(
-            "stage1_hard_trigger_brand_min",
-            stage1_hard_trigger_brand_min,
-        ),
-    }
-    return resolve_stage1_http_config(overrides)
-
-
 def _resolve_scoring_config(
     weights: dict | None = None,
     domain_similarity_threshold: float = DEFAULT_DOMAIN_SIMILARITY_THRESHOLD,
@@ -1036,13 +992,6 @@ def _resolve_scoring_config(
     typo_top_k: int = DEFAULT_TYPO_TOP_K,
     typo_min_score: float = DEFAULT_TYPO_MIN_SCORE,
     lexical_pass_min_score: float = DEFAULT_LEXICAL_PASS_MIN_SCORE,
-    keep_stage1_suspected: bool = False,
-    keep_fetch_failed_strict_lexical: bool = False,
-    stage1_escalate_total_threshold=None,
-    stage1_brand_min=None,
-    stage1_credential_min=None,
-    stage1_low_band_min=None,
-    stage1_hard_trigger_brand_min=None,
 ) -> dict:
     if not isinstance(domain_similarity_threshold, numbers.Real):
         raise ValueError("domain_similarity_threshold must be a numeric value in [0, 1]")
@@ -1076,8 +1025,6 @@ def _resolve_scoring_config(
     lexical_pass_min_score = float(lexical_pass_min_score)
     if lexical_pass_min_score < 0 or lexical_pass_min_score > 1:
         raise ValueError("lexical_pass_min_score must be in [0, 1]")
-    keep_stage1_suspected = bool(keep_stage1_suspected)
-    keep_fetch_failed_strict_lexical = bool(keep_fetch_failed_strict_lexical)
 
     resolved_weights = dict(DEFAULT_SCORING_WEIGHTS)
     if weights is not None:
@@ -1109,14 +1056,6 @@ def _resolve_scoring_config(
     if total_weight <= 0:
         raise ValueError("Total scoring weight must be greater than zero")
 
-    stage1_http_config = _resolve_stage1_runtime_config(
-        stage1_escalate_total_threshold=stage1_escalate_total_threshold,
-        stage1_brand_min=stage1_brand_min,
-        stage1_credential_min=stage1_credential_min,
-        stage1_low_band_min=stage1_low_band_min,
-        stage1_hard_trigger_brand_min=stage1_hard_trigger_brand_min,
-    )
-
     return {
         "weights": resolved_weights,
         "total_weight": total_weight,
@@ -1126,9 +1065,6 @@ def _resolve_scoring_config(
         "typo_top_k": typo_top_k,
         "typo_min_score": typo_min_score,
         "lexical_pass_min_score": lexical_pass_min_score,
-        "keep_stage1_suspected": keep_stage1_suspected,
-        "keep_fetch_failed_strict_lexical": keep_fetch_failed_strict_lexical,
-        "stage1_http_config": stage1_http_config,
     }
 
 
@@ -2031,7 +1967,6 @@ def _build_prefetch_decision_row(
         "direct_brand_evidence_count": 0,
         "deceptive_host_embedding": False,
         "content_spoof_strong": False,
-        "stage1_passthrough": False,
         "survival_path": "",
         "drop_path": "",
         "domain_component": round(lexical_contribution, 4),
@@ -2055,25 +1990,7 @@ def _build_prefetch_admitted_failure_match(
     *,
     scoring_config: dict,
 ) -> dict | None:
-    if not isinstance(decision_row, dict):
-        return None
-    lexical_survivor = bool(
-        decision_row.get("strict_lexical_hit", False)
-        or decision_row.get("lexical_score_pass", False)
-    )
-    if not lexical_survivor or bool(decision_row.get("fallback_rank_only", False)):
-        return None
-    if not _has_suspicious_fetch_network_state(
-        str(decision_row.get("fetch_status", "") or ""),
-        fetch_error_type=str(decision_row.get("fetch_error_type", "") or ""),
-        fetch_error_detail=str(decision_row.get("fetch_error_detail", "") or ""),
-    ):
-        return None
-    return _build_stage1_passthrough_holdout_row(
-        decision_row,
-        scoring_config,
-        passthrough_path_override="failed_fetch_strict_lexical_suspected",
-    )
+    return None
 
 
 def _handle_stage1_fetch_payload(
@@ -2145,7 +2062,6 @@ def _empty_shortlist_df():
             "brand_token_hit",
             "candidate_generation_reason",
             "dominant_signal_family",
-            "stage1_passthrough",
             "survival_path",
             "drop_path",
             "old_fuzzy_hit",
@@ -2157,23 +2073,7 @@ def _empty_shortlist_df():
             "admission_reason",
             "admission_path",
             "lexical_hit",
-            "brand_score",
-            "credential_score",
-            "infra_score",
-            "evasion_score",
-            "total_stage1_score",
-            "hard_trigger_hit",
-            "stage1_reasons",
-            "page_has_password_field",
-            "page_has_login_form",
-            "form_action_mismatch",
-            "csc_mention_count",
-            "redirect_count",
             "final_domain",
-            "favicon_domain",
-            "html_bytes_read",
-            "escalate_to_hashing",
-            "escalate_reason",
             "fetch_status",
             "visual_status",
             "fetch_error_type",
@@ -2672,8 +2572,7 @@ def _build_dns_failed_lexical_stage1_state(
     return state
 
 
-def _stage1_passthrough_path(row: dict, scoring_config: dict | None = None) -> str:
-    scoring_config = scoring_config or _DEFAULT_SCORING_CONFIG
+def _dns_passthrough_path_legacy(row: dict, scoring_config: dict | None = None) -> str:
     reason = str(row.get("reason", "") or "").strip()
     lexical_survivor = bool(
         row.get("strict_lexical_hit", False)
@@ -2684,36 +2583,15 @@ def _stage1_passthrough_path(row: dict, scoring_config: dict | None = None) -> s
         and lexical_survivor
     ):
         return DNS_NOT_MAPPED_LEXICAL_PASSTHROUGH_PATH
-    if (
-        reason == "stage1_suspected_non_escalated"
-        and (
-            lexical_survivor
-            or bool(scoring_config.get("keep_stage1_suspected", False))
-        )
-    ):
-        return "stage1_suspected_passthrough"
-    if (
-        reason == "fetch_timeout_or_fetch_failed"
-        and lexical_survivor
-        and (
-            _has_suspicious_fetch_network_state(
-                str(row.get("fetch_status", "") or ""),
-                fetch_error_type=str(row.get("fetch_error_type", "") or ""),
-                fetch_error_detail=str(row.get("fetch_error_detail", "") or ""),
-            )
-            or bool(scoring_config.get("keep_fetch_failed_strict_lexical", False))
-        )
-    ):
-        return "failed_fetch_strict_lexical_suspected"
     return ""
 
 
-def _build_stage1_passthrough_holdout_row(
+def _build_dns_passthrough_holdout_row_legacy(
     stage1_row: dict,
     scoring_config: dict,
     passthrough_path_override: str | None = None,
 ) -> dict:
-    passthrough_path = str(passthrough_path_override or "") or _stage1_passthrough_path(stage1_row, scoring_config)
+    passthrough_path = str(passthrough_path_override or "") or _dns_passthrough_path_legacy(stage1_row, scoring_config)
     if not passthrough_path:
         return {}
 
@@ -2745,8 +2623,7 @@ def _build_stage1_passthrough_holdout_row(
         "lexical_rule_hit": bool(stage1_row.get("strict_lexical_hit", False)),
         "brand_token_hit": bool(stage1_row.get("hybrid_lexical_hit", False)),
         "candidate_generation_reason": stage1_row.get("candidate_generation_reason", ""),
-        "dominant_signal_family": "stage1_passthrough",
-        "stage1_passthrough": True,
+        "dominant_signal_family": "dns_not_mapped_lexical_passthrough",
         "survival_path": passthrough_path,
         "drop_path": "",
         "old_fuzzy_hit": bool(stage1_row.get("old_fuzzy_hit", False)),
@@ -2894,7 +2771,6 @@ _STAGE1_DEBUG_FIELDNAMES = [
     "direct_brand_evidence_count",
     "deceptive_host_embedding",
     "content_spoof_strong",
-    "stage1_passthrough",
     "domain_component",
     "hash_component",
     "hash_anchor",
@@ -3018,7 +2894,6 @@ _EXCLUDED_AUDIT_FIELDNAMES = [
     "html_bytes_read",
     "escalate_to_hashing",
     "escalate_reason",
-    "stage1_passthrough",
 ]
 
 
@@ -3104,7 +2979,6 @@ def _build_stage1_debug_rows(
             "direct_brand_evidence_count": 0,
             "deceptive_host_embedding": False,
             "content_spoof_strong": False,
-            "stage1_passthrough": False,
             "domain_component": 0.0,
             "hash_component": 0.0,
         }
@@ -3151,9 +3025,8 @@ def _build_stage1_debug_rows(
                 stage_row["dns_decision"] = "skipped"
             stage_row["exclusion_stage"] = "stage1_http"
             stage_row["reason"] = stage_row.get("escalate_reason", "") or "stage1_low_suspicion"
-            passthrough_path = _stage1_passthrough_path(stage_row, scoring_config)
+            passthrough_path = _dns_passthrough_path_legacy(stage_row, scoring_config)
             if passthrough_path:
-                stage_row["stage1_passthrough"] = True
                 stage_row["survival_path"] = passthrough_path
             else:
                 stage_row["drop_path"] = stage_row["reason"]
@@ -3185,9 +3058,8 @@ def _build_stage1_debug_rows(
                     stage_row["reason"] = "fetch_timeout_or_fetch_failed"
                 else:
                     stage_row["reason"] = "not_admitted_after_lexical_and_hash_checks"
-            passthrough_path = _stage1_passthrough_path(stage_row, scoring_config)
+            passthrough_path = _dns_passthrough_path_legacy(stage_row, scoring_config)
             if passthrough_path:
-                stage_row["stage1_passthrough"] = True
                 stage_row["survival_path"] = passthrough_path
                 stage_row["drop_path"] = ""
             elif stage_row.get("kept_for_review_only"):
@@ -3258,7 +3130,6 @@ def _build_excluded_url_rows(stage1_debug_rows):
                 "html_bytes_read": row.get("html_bytes_read", 0),
                 "escalate_to_hashing": row.get("escalate_to_hashing", False),
                 "escalate_reason": row.get("escalate_reason", ""),
-                "stage1_passthrough": row.get("stage1_passthrough", False),
             }
         )
     return excluded_rows
@@ -3267,7 +3138,7 @@ def _build_excluded_url_rows(stage1_debug_rows):
 def _resolve_stage1_terminal_checkpoint_outcome(stage1_row: dict) -> tuple[str | None, str, str]:
     reason = str(stage1_row.get("reason", "") or "").strip()
     fetch_status = str(stage1_row.get("fetch_status", "") or "").strip().lower()
-    if bool(stage1_row.get("admitted")) or bool(stage1_row.get("stage1_passthrough")):
+    if bool(stage1_row.get("admitted")):
         return "holdout_ready", "admitted", ""
     if bool(stage1_row.get("kept_for_review_only")):
         return (
@@ -3670,25 +3541,6 @@ def _write_stage1_method_rows_csv(method_rows, output_path: str) -> str:
     return output_path
 
 
-# UNUSED_IN_CURRENT_WORKFLOW: unused debug wrappers; active artifact writing uses
-# _write_stage1_method_rows_csv() and _write_stage1_method_artifacts() directly.
-# def _write_stage1_methods_csv(stage1_rows, output_path: str = STAGE1_METHODS_DEBUG_PATH) -> str:
-#     method_rows = _build_stage1_method_rows(stage1_rows)
-#     return _write_stage1_method_rows_csv(method_rows, output_path)
-#
-#
-# def _write_stage1_deep_analysis_candidates_csv(
-#     stage1_rows,
-#     output_path: str = STAGE1_DEEP_ANALYSIS_CANDIDATES_PATH,
-# ) -> str:
-#     method_rows = [
-#         row
-#         for row in _build_stage1_method_rows(stage1_rows)
-#         if bool(row.get("deep_analysis_candidate", False))
-#     ]
-#     return _write_stage1_method_rows_csv(method_rows, output_path)
-#
-#
 # def _log_stage1_method_summary(stage1_rows) -> None:
 #     method_rows = _build_stage1_method_rows(stage1_rows)
 #     if not method_rows:
@@ -5688,7 +5540,6 @@ def _build_shortlist_output_row(match: dict, scoring_config: dict) -> dict:
         "brand_token_hit": bool(match.get("brand_token_hit", False)),
         "candidate_generation_reason": match.get("candidate_generation_reason", ""),
         "dominant_signal_family": match.get("dominant_signal_family", "lexical"),
-        "stage1_passthrough": bool(match.get("stage1_passthrough", False)),
         "survival_path": match.get("survival_path", ""),
         "drop_path": match.get("drop_path", ""),
         "old_fuzzy_hit": bool(match.get("old_fuzzy_hit", False)),
@@ -5711,23 +5562,7 @@ def _build_shortlist_output_row(match: dict, scoring_config: dict) -> dict:
         "domain_component": round(float(match.get("domain_component", 0.0)), 4),
         "hash_component": round(float(match.get("hash_component", 0.0)), 4),
         "lexical_hit": bool(match.get("lexical_hit", False)),
-        "brand_score": int(match.get("brand_score", 0) or 0),
-        "credential_score": int(match.get("credential_score", 0) or 0),
-        "infra_score": int(match.get("infra_score", 0) or 0),
-        "evasion_score": int(match.get("evasion_score", 0) or 0),
-        "total_stage1_score": int(match.get("total_stage1_score", 0) or 0),
-        "hard_trigger_hit": bool(match.get("hard_trigger_hit", False)),
-        "stage1_reasons": match.get("stage1_reasons", ""),
-        "page_has_password_field": bool(match.get("page_has_password_field", False)),
-        "page_has_login_form": bool(match.get("page_has_login_form", False)),
-        "form_action_mismatch": bool(match.get("form_action_mismatch", False)),
-        "csc_mention_count": int(match.get("csc_mention_count", 0) or 0),
-        "redirect_count": int(match.get("redirect_count", 0) or 0),
         "final_domain": match.get("final_domain", ""),
-        "favicon_domain": match.get("favicon_domain", ""),
-        "html_bytes_read": int(match.get("html_bytes_read", 0) or 0),
-        "escalate_to_hashing": bool(match.get("escalate_to_hashing", False)),
-        "escalate_reason": match.get("escalate_reason", ""),
         "typo_similarity": round(float(match.get("typo_similarity", 0.0)), 4),
         "typo_min_score_used": round(float(scoring_config["typo_min_score"]), 4),
         "typo_decision_reason": (
@@ -6016,7 +5851,6 @@ def _finalize_scored_hash_payload(
             "html_hash_raw": _coerce_hash_export_text(payload.get("html_hash_raw", "")),
             "page_hash_raw": _coerce_hash_export_text(payload.get("page_hash_raw", "")),
             "domain_hash_raw": _coerce_hash_export_text(payload.get("domain_hash_raw", "")),
-            "stage1_passthrough": False,
             "survival_path": "|".join(dict.fromkeys(admission_paths)) if admitted_to_holdout else (review_only_reason if kept_for_review_only else ""),
             "drop_path": "" if (admitted_to_holdout or kept_for_review_only) else "not_admitted_after_lexical_and_hash_checks",
             "domain_component": round(lexical_contribution, 4),
@@ -6041,7 +5875,6 @@ def _finalize_scored_hash_payload(
         "brand_token_hit": bool(brand_token_hit),
         "candidate_generation_reason": candidate_generation_reason,
         "dominant_signal_family": dominant_signal_family,
-        "stage1_passthrough": False,
         "survival_path": "|".join(dict.fromkeys(admission_paths)) if admitted_to_holdout else (review_only_reason if kept_for_review_only else ""),
         "drop_path": "" if admitted_to_holdout else ("not_admitted_after_lexical_and_hash_checks" if not kept_for_review_only else ""),
         "old_fuzzy_hit": old_fuzzy_hit,
@@ -7044,6 +6877,40 @@ def _get_dns_gate_prefilter_semaphore(limit: int) -> asyncio.Semaphore:
     return _dns_gate_prefilter_semaphore
 
 
+async def _resolve_dns_answers(host: str, timeout: float) -> dict[str, Any]:
+    if not host:
+        return {"resolved_ips": [], "dns_answer_count": 0}
+
+    resolver = dns.asyncresolver.Resolver(configure=True)
+    resolver.timeout = timeout
+    resolver.lifetime = timeout
+    answers = await asyncio.gather(
+        resolver.resolve(host, "A", lifetime=timeout),
+        resolver.resolve(host, "AAAA", lifetime=timeout),
+        return_exceptions=True,
+    )
+    ips: list[str] = []
+    for answer in answers:
+        if isinstance(answer, Exception):
+            continue
+        for item in answer:
+            value = getattr(item, "address", None) or item.to_text()
+            if value:
+                ips.append(str(value))
+    ordered_ips = []
+    seen = set()
+    for ip in ips:
+        normalized = str(ip).strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered_ips.append(normalized)
+    return {
+        "resolved_ips": ordered_ips,
+        "dns_answer_count": len(ordered_ips),
+    }
+
+
 def _classify_dns_gate_exception(exc: Exception) -> str:
     text = f"{type(exc).__name__}: {exc}".strip().lower()
     if any(marker in text for marker in ("nxdomain", "name does not exist", "err_name_not_resolved")):
@@ -7096,7 +6963,8 @@ def _build_dns_gate_filtered_analysis(
 async def _dns_gate_lexical_miss_records(
     records: list[dict[str, Any]],
     *,
-    stage1_http_config: dict | None = None,
+    dns_timeout: float = 3.0,
+    dns_concurrency: int = 64,
 ) -> dict[str, Any]:
     if not records:
         return {
@@ -7107,21 +6975,8 @@ async def _dns_gate_lexical_miss_records(
             "stats": {"checked": 0, "accepted": 0, "rejected": 0, "status_counts": {}},
         }
 
-    stage1_http_config = dict(stage1_http_config or STAGE1_HTTP_CONFIG)
-    dns_timeout = max(0.5, float(stage1_http_config.get("dns_timeout", 3.0) or 3.0))
-    dns_concurrency = max(
-        1,
-        min(
-            256,
-            int(
-                stage1_http_config.get(
-                    "dns_concurrency",
-                    stage1_http_config.get("stage1_enrich_dns_concurrency", 64),
-                )
-                or 64
-            ),
-        ),
-    )
+    dns_timeout = max(0.5, float(dns_timeout or 3.0))
+    dns_concurrency = max(1, min(256, int(dns_concurrency or 64)))
     semaphore = _get_dns_gate_prefilter_semaphore(dns_concurrency)
     host_cache: dict[str, dict[str, Any]] = {}
 
@@ -8893,7 +8748,7 @@ async def _run_stage1_http_pipeline(
     checkpoint_store: CheckpointStore | None = None,
     queue_depth_sink: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    stage1_http_config = resolve_stage1_http_config(stage1_http_config or STAGE1_HTTP_CONFIG)
+    stage1_http_config = dict(stage1_http_config or {})
     scoring_config = dict(scoring_config or _DEFAULT_SCORING_CONFIG)
     source_workbook_map = dict(source_workbook_map or {})
     dns_prefetch_map = dns_prefetch_map if dns_prefetch_map is not None else {}
@@ -9869,7 +9724,7 @@ async def _run_hashing_shortlist_streaming_concurrent(
             passthrough_rows = [
                 row
                 for row in (
-                    _build_stage1_passthrough_holdout_row(stage1_row, scoring_config)
+                    _build_dns_passthrough_holdout_row_legacy(stage1_row, scoring_config)
                     for stage1_row in stage1_rows
                 )
                 if row
@@ -9948,6 +9803,937 @@ async def _run_hashing_shortlist_streaming_concurrent(
 ###############################################
 # STREAMING ENGINE
 ###############################################
+def _build_dns_passthrough_holdout_row(stage1_analysis: dict, prefetch_metrics: dict, scoring_config: dict) -> dict:
+    lexical_score = round(float(prefetch_metrics.get("best_lexical_score", 0.0) or 0.0), 4)
+    typo_similarity = round(float(prefetch_metrics.get("best_typo_similarity", 0.0) or 0.0), 4)
+    strict_lexical_hit = bool(prefetch_metrics.get("strict_lexical_hit", False))
+    lexical_score_pass = bool(prefetch_metrics.get("lexical_score_pass", False))
+    fallback_rank_only = bool(prefetch_metrics.get("fallback_rank_only", False))
+    candidate_generation_reason = str(prefetch_metrics.get("candidate_generation_reason", "") or "")
+    domain_component = round(lexical_score * float(scoring_config["weights"]["domain"]), 4)
+    return {
+        "Cooresponding CSE": prefetch_metrics.get("best_entity", ""),
+        "Legitimate Domains": prefetch_metrics.get("best_matching_domain", ""),
+        "Identified Phishing/Suspected Domain Name": stage1_analysis.get("normalized_url", stage1_analysis.get("url", "")),
+        "source_workbook": stage1_analysis.get("source_workbook", ""),
+        "hash_score": 0.0,
+        "confidence_band": "Low",
+        "score_margin": 0.0,
+        "evidence_tier": "weak_evidence",
+        "lexical_score": lexical_score,
+        "jw_primary": 0.0,
+        "token_set_primary": 0.0,
+        "skeleton_similarity": typo_similarity,
+        "lexical_rule_hit": strict_lexical_hit,
+        "brand_token_hit": bool(prefetch_metrics.get("hybrid_lexical_hit", False)),
+        "candidate_generation_reason": candidate_generation_reason,
+        "dominant_signal_family": "lexical",
+        "survival_path": DNS_NOT_MAPPED_LEXICAL_PASSTHROUGH_PATH,
+        "drop_path": "",
+        "old_fuzzy_hit": bool(prefetch_metrics.get("old_fuzzy_hit", False)),
+        "old_fuzzy_cse": prefetch_metrics.get("old_fuzzy_cse", ""),
+        "hybrid_lexical_hit": bool(prefetch_metrics.get("hybrid_lexical_hit", False)),
+        "strict_lexical_hit": strict_lexical_hit,
+        "lexical_score_pass": lexical_score_pass,
+        "fallback_rank_only": fallback_rank_only,
+        "admission_reason": DNS_NOT_MAPPED_LEXICAL_PASSTHROUGH_PATH,
+        "admission_path": DNS_NOT_MAPPED_LEXICAL_PASSTHROUGH_PATH,
+        "fetch_status": stage1_analysis.get("fetch_status", "failed"),
+        "visual_status": stage1_analysis.get("visual_status", "not_attempted"),
+        "fetch_error_type": stage1_analysis.get("fetch_error_type", ""),
+        "fetch_error_detail": stage1_analysis.get("fetch_error_detail", ""),
+        "final_landing_url": stage1_analysis.get("final_landing_url", ""),
+        "parking_provider": stage1_analysis.get("parking_provider", ""),
+        "parking_reason": stage1_analysis.get("parking_reason", ""),
+        "placeholder_or_parking_reason": stage1_analysis.get("placeholder_or_parking_reason", ""),
+        "best_score": 0.0,
+        "domain_component": domain_component,
+        "hash_component": 0.0,
+        "lexical_hit": True,
+        "final_domain": stage1_analysis.get("final_domain", ""),
+        "typo_similarity": typo_similarity,
+        "typo_min_score_used": round(float(scoring_config["typo_min_score"]), 4),
+        "typo_decision_reason": (
+            "anchor_typo"
+            if strict_lexical_hit and typo_similarity >= float(scoring_config["typo_min_score"])
+            else "below_min_score"
+        ),
+        "favicon_hash_similarity": 0.0,
+        "favicon_hash_distance": -1,
+        "page_hash_similarity": 0.0,
+        "page_hash_distance": -1,
+        "domain_hash_similarity": 0.0,
+        "domain_hash_distance": -1,
+        "ssl_hash_similarity": 0.0,
+        "ssl_hash_distance": -1,
+        "typo_anchor": bool(strict_lexical_hit and typo_similarity >= float(scoring_config["typo_min_score"])),
+        "hash_anchor": False,
+        "signal_hit_domain": strict_lexical_hit,
+        "signal_hit_favicon": False,
+        "signal_hit_ssl_hash": False,
+        "signal_hit_html_hash": False,
+        "signal_hit_domain_hash": False,
+        "signal_hit_keywords": False,
+        "signal_hit_typo": bool(strict_lexical_hit and typo_similarity >= float(scoring_config["typo_min_score"])),
+        "generic_token_only_match": bool(prefetch_metrics.get("generic_token_only_match", False)),
+        "direct_brand_evidence_count": 0,
+        "deceptive_host_embedding": False,
+        "content_spoof_strong": False,
+        "screenshot_path": "",
+        "html_title_text": "",
+        "visible_text_excerpt": "",
+    }
+
+
+def _build_stage0_debug_rows(
+    *,
+    input_urls: list[str],
+    prefetch_metrics_map: dict[str, dict],
+    source_workbook_map: dict[str, str],
+    decision_rows: list[dict],
+    lexical_reject_urls: set[str],
+    dns_passthrough_urls: set[str],
+) -> list[dict[str, Any]]:
+    decision_index = {
+        str(row.get("normalized_url", "") or ""): dict(row)
+        for row in decision_rows
+        if str(row.get("normalized_url", "") or "").strip()
+    }
+    rows: list[dict[str, Any]] = []
+    for idx, raw_url in enumerate(input_urls, start=1):
+        normalized_url = normalize_url(str(raw_url or "").strip()) if str(raw_url or "").strip() else ""
+        prefetch = dict(prefetch_metrics_map.get(normalized_url, {}) or {})
+        decision_row = decision_index.get(normalized_url, {})
+        lexical_hit = normalized_url not in lexical_reject_urls and bool(prefetch)
+        reason = ""
+        final_status = ""
+        dns_status = ""
+        dns_decision = ""
+        fetch_status = ""
+        fetch_error_type = ""
+        fetch_error_detail = ""
+        if normalized_url in lexical_reject_urls:
+            reason = (
+                "generic_token_only_lexical_rejected"
+                if bool(prefetch.get("generic_token_only_match", False))
+                else "lexical_prefilter_rejected"
+            )
+            final_status = "filtered_lexical_miss"
+        elif normalized_url in dns_passthrough_urls:
+            reason = DNS_NOT_MAPPED_LEXICAL_PASSTHROUGH_PATH
+            final_status = "dns_not_mapped_lexical_passthrough"
+            dns_status = "no_answer"
+            dns_decision = "filtered"
+            fetch_status = "failed"
+            fetch_error_type = "dns_gate_no_answer"
+            fetch_error_detail = "domain not mapped to an active IP"
+        elif decision_row:
+            reason = str(decision_row.get("admission_path", "") or decision_row.get("review_only_reason", "") or "")
+            final_status = (
+                "shortlisted"
+                if bool(decision_row.get("admitted_to_holdout", False))
+                else "review_only"
+                if bool(decision_row.get("kept_for_review_only", False))
+                else "filtered_after_hash"
+            )
+            fetch_status = str(decision_row.get("fetch_status", "") or "")
+            fetch_error_type = str(decision_row.get("fetch_error_type", "") or "")
+            fetch_error_detail = str(decision_row.get("fetch_error_detail", "") or "")
+            dns_status = "resolved"
+            dns_decision = "accepted"
+        else:
+            reason = "lexical_hit"
+            final_status = "queued_for_hash"
+            dns_status = "resolved"
+            dns_decision = "accepted"
+        rows.append(
+            {
+                "input_position": idx,
+                "input_url": str(raw_url or ""),
+                "normalized_url": normalized_url,
+                "source_workbook": str(prefetch.get("source_workbook", "") or source_workbook_map.get(normalized_url, "")),
+                "lexical_hit": lexical_hit,
+                "strict_lexical_hit": bool(prefetch.get("strict_lexical_hit", False)),
+                "lexical_score_pass": bool(prefetch.get("lexical_score_pass", False)),
+                "fallback_rank_only": bool(prefetch.get("fallback_rank_only", False)),
+                "candidate_generation_reason": str(prefetch.get("candidate_generation_reason", "") or ""),
+                "best_entity": str(prefetch.get("best_entity", "") or ""),
+                "best_matching_domain": str(prefetch.get("best_matching_domain", "") or ""),
+                "lexical_score": round(float(prefetch.get("best_lexical_score", 0.0) or 0.0), 4),
+                "typo_similarity": round(float(prefetch.get("best_typo_similarity", 0.0) or 0.0), 4),
+                "generic_token_only_match": bool(prefetch.get("generic_token_only_match", False)),
+                "dns_status": dns_status,
+                "dns_decision": dns_decision,
+                "fetch_status": fetch_status,
+                "fetch_error_type": fetch_error_type,
+                "fetch_error_detail": fetch_error_detail,
+                "hash_shortlisted": bool(decision_row.get("admitted_to_holdout", False)),
+                "review_only": bool(decision_row.get("kept_for_review_only", False)),
+                "reason": reason,
+                "final_status": final_status,
+            }
+        )
+    return rows
+
+
+def _write_stage0_debug_csv(rows: list[dict[str, Any]], output_path: str = DEFAULT_STAGE1_DEBUG_CSV) -> str:
+    fieldnames = [
+        "input_position",
+        "input_url",
+        "normalized_url",
+        "source_workbook",
+        "lexical_hit",
+        "strict_lexical_hit",
+        "lexical_score_pass",
+        "fallback_rank_only",
+        "candidate_generation_reason",
+        "best_entity",
+        "best_matching_domain",
+        "lexical_score",
+        "typo_similarity",
+        "generic_token_only_match",
+        "dns_status",
+        "dns_decision",
+        "fetch_status",
+        "fetch_error_type",
+        "fetch_error_detail",
+        "hash_shortlisted",
+        "review_only",
+        "reason",
+        "final_status",
+    ]
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    return output_path
+
+
+def _finish_hashing_shortlist_output_lexical_only(
+    *,
+    t0: float,
+    metrics: dict[str, Any],
+    threshold: float,
+    results: list[dict[str, Any]],
+    review_results: list[dict[str, Any]],
+    input_urls: list[str],
+    decision_rows: list[dict[str, Any]],
+    prefetch_metrics_map: dict[str, dict[str, Any]],
+    lexical_reject_urls: set[str],
+    dns_passthrough_urls: set[str],
+    stage1_analysis_map: dict[str, dict[str, Any]],
+    scoring_config: dict[str, Any],
+    source_workbook_map: dict[str, str],
+    shortlist_debug_csv: str | None,
+    run_context: RunContext | None,
+    checkpoint_store: CheckpointStore | None,
+):
+    import pandas as pd
+
+    elapsed = time.perf_counter() - t0
+    counters = _resolve_hash_metric_counters(metrics)
+    metrics["stage_elapsed_s"] = elapsed
+    metrics["gpu_queue_depth"] = 0
+    metrics["render_queue_depth"] = 0
+    metrics["aux_queue_depth"] = 0
+    print(
+        f"\nHashing shortlist completed in {elapsed:.1f}s "
+        f"(deep_attempted={counters['deep_attempted']} "
+        f"hash_finalized={counters['hash_finalized']} "
+        f"final_matches_total={counters['final_matches_total']})"
+    )
+    _log_hashing_metrics_summary(
+        metrics,
+        elapsed,
+        threshold,
+        shortlisted_results=results,
+        typo_min_score=scoring_config["typo_min_score"],
+    )
+    hash_export_paths = _write_stage2_hash_exports(decision_rows, run_context=run_context)
+    if hash_export_paths:
+        _hash_logger.info(
+            "Stage2 hash exports written to %s (%d files)",
+            os.path.join(getattr(run_context, "output_dir", "") or os.path.dirname(HASH_EXPORT_DIR), "hash_folder"),
+            len(hash_export_paths),
+        )
+
+    rows = [
+        (
+            dict(match)
+            if "Cooresponding CSE" in match and "Identified Phishing/Suspected Domain Name" in match
+            else _build_shortlist_output_row(match, scoring_config)
+        )
+        for match in results
+    ]
+    for normalized_url in sorted(dns_passthrough_urls):
+        rows.append(
+            _build_dns_passthrough_holdout_row(
+                stage1_analysis_map.get(normalized_url, {}),
+                prefetch_metrics_map.get(normalized_url, {}),
+                scoring_config,
+            )
+        )
+    if rows:
+        deduped_rows = []
+        seen_row_keys = set()
+        for row in rows:
+            row_key = (
+                str(row.get("Identified Phishing/Suspected Domain Name", "") or ""),
+                str(row.get("Cooresponding CSE", "") or ""),
+                str(row.get("Legitimate Domains", "") or ""),
+            )
+            if row_key in seen_row_keys:
+                continue
+            seen_row_keys.add(row_key)
+            deduped_rows.append(row)
+        rows = deduped_rows
+
+    if shortlist_debug_csv:
+        debug_rows = _build_stage0_debug_rows(
+            input_urls=input_urls,
+            prefetch_metrics_map=prefetch_metrics_map,
+            source_workbook_map=source_workbook_map,
+            decision_rows=decision_rows,
+            lexical_reject_urls=lexical_reject_urls,
+            dns_passthrough_urls=dns_passthrough_urls,
+        )
+        debug_path = _write_stage0_debug_csv(
+            debug_rows,
+            output_path=get_run_artifact_path(
+                run_context,
+                "stage0_lexical_decisions_csv",
+                shortlist_debug_csv or DEFAULT_STAGE1_DEBUG_CSV,
+            ),
+        )
+        sync_run_artifact(run_context, "stage0_lexical_decisions_csv", src_path=debug_path, best_effort=True)
+        _hash_logger.info("Stage0 lexical decisions CSV written to %s with %d rows", debug_path, len(debug_rows))
+
+    if checkpoint_store is not None and run_context is not None:
+        for normalized_url in dns_passthrough_urls:
+            analysis = dict(stage1_analysis_map.get(normalized_url, {}) or {})
+            _upsert_shortlist_checkpoint(
+                run_context=run_context,
+                checkpoint_store=checkpoint_store,
+                raw_url=str(analysis.get("url", normalized_url) or normalized_url),
+                normalized_url=normalized_url,
+                source_workbook=str(analysis.get("source_workbook", "") or source_workbook_map.get(normalized_url, "")),
+                stage_name="hash",
+                stage_status="admitted",
+                current_stage="hash",
+                final_pipeline_status="holdout_ready",
+            )
+
+    if not rows:
+        return _empty_shortlist_df()
+    return pd.DataFrame(rows)
+
+
+async def _run_hashing_shortlist_lexical_only(
+    url_list,
+    *,
+    threshold=DEFAULT_HASHING_THRESHOLD,
+    domain_similarity_threshold=DEFAULT_DOMAIN_SIMILARITY_THRESHOLD,
+    high_confidence_threshold=DEFAULT_HIGH_CONFIDENCE_THRESHOLD,
+    medium_confidence_threshold=DEFAULT_MEDIUM_CONFIDENCE_THRESHOLD,
+    typo_top_k=DEFAULT_TYPO_TOP_K,
+    typo_min_score=DEFAULT_TYPO_MIN_SCORE,
+    lexical_pass_min_score=DEFAULT_LEXICAL_PASS_MIN_SCORE,
+    weights=None,
+    shortlist_debug_csv: str | None = DEFAULT_STAGE1_DEBUG_CSV,
+    url_sources: dict | None = None,
+    run_context: RunContext | None = None,
+    checkpoint_store: CheckpointStore | None = None,
+    resume: bool = False,
+    force_reprocess: bool = False,
+):
+    if not isinstance(threshold, numbers.Real):
+        raise ValueError("threshold must be a numeric value")
+    threshold = float(threshold)
+    if threshold < 0:
+        raise ValueError("threshold must be non-negative")
+
+    scoring_config = _resolve_scoring_config(
+        weights=weights,
+        domain_similarity_threshold=domain_similarity_threshold,
+        high_confidence_threshold=high_confidence_threshold,
+        medium_confidence_threshold=medium_confidence_threshold,
+        typo_top_k=typo_top_k,
+        typo_min_score=typo_min_score,
+        lexical_pass_min_score=lexical_pass_min_score,
+    )
+    source_workbook_map = _resolve_source_workbook_map(url_sources)
+    from .rdap_utils import get_rdap_metrics_snapshot, reset_rdap_state
+
+    input_urls = list(url_list)
+    completed_record_keys = (
+        checkpoint_store.get_completed_record_keys()
+        if checkpoint_store is not None and resume and not force_reprocess
+        else set()
+    )
+    log_path = _configure_hashing_log(
+        get_run_artifact_path(run_context, "hashing_log", HASHING_LOG_PATH)
+    )
+    reset_rdap_state()
+
+    metrics = {
+        "processed": 0,
+        "render_completed": 0,
+        "aux_completed": 0,
+        "finalized": 0,
+        "hashed_success": 0,
+        "fetch_failed": 0,
+        "fetch_timed_out": 0,
+        "final_matches_above_threshold": 0,
+        "gpu_batches_flushed": 0,
+        "gpu_items_scored": 0,
+        "avg_gpu_batch_size": 0.0,
+        "gpu_queue_depth": 0,
+        "render_queue_depth": 0,
+        "aux_queue_depth": 0,
+        "stage_elapsed_s": 0.0,
+        "active_fetch_limit": ACTIVE_FETCH_LIMIT_INITIAL,
+        "worker_nodes_alive": 0,
+        "node_restarts": 0,
+        "live_page_workers": 0,
+        "shutdown_sentinels_expected": 0,
+        "shutdown_sentinels_drained": 0,
+        "stuck_reset_recoveries": 0,
+        "phase": "running",
+        "fd_count": 0,
+        "fd_limit": 0,
+        "fd_usage_ratio": 0.0,
+        "ram_usage_ratio": 0.0,
+        "limiting_lane": "render",
+    }
+    decision_rows: list[dict[str, Any]] = []
+    stage1_analysis_map: dict[str, dict[str, Any]] = {}
+    prefetch_metrics_map: dict[str, dict[str, Any]] = {}
+    lexical_reject_urls: set[str] = set()
+    dns_passthrough_urls: set[str] = set()
+    lexical_candidate_urls: list[str] = []
+
+    _hash_logger.info(
+        "Hashing shortlist (lexical-only) started | urls=%d | threshold=%s | domain_similarity_threshold=%.3f | high_confidence_threshold=%.2f | medium_confidence_threshold=%.2f | typo_top_k=%d | typo_min_score=%.3f | lexical_pass_min_score=%.3f",
+        len(input_urls),
+        threshold,
+        scoring_config["domain_similarity_threshold"],
+        scoring_config["high_confidence_threshold"],
+        scoring_config["medium_confidence_threshold"],
+        scoring_config["typo_top_k"],
+        scoring_config["typo_min_score"],
+        scoring_config["lexical_pass_min_score"],
+    )
+    _hash_logger.info("Scoring weights | %s", _format_weights_for_logging(scoring_config["weights"]))
+    _hash_logger.info("Hashing log file: %s", log_path)
+    print(f"Hashing log: {log_path}")
+
+    try:
+        from tqdm import tqdm as tqdm_sync
+
+        stage0_progress_bar = tqdm_sync(
+            total=len(input_urls),
+            desc="Stage0 lexical gate",
+            unit="url",
+            leave=True,
+            dynamic_ncols=True,
+        )
+    except Exception:
+        stage0_progress_bar = None
+
+    stage0_records = []
+    pending_metric_urls = []
+    pending_metric_seen = set()
+    pending_metric_input_counts: dict[str, int] = {}
+    stage0_skipped = 0
+    for raw_url in input_urls:
+        normalized_url = normalize_url(raw_url)
+        source_workbook = source_workbook_map.get(normalized_url, "")
+        is_completed = bool(
+            checkpoint_store is not None
+            and run_context is not None
+            and normalized_url
+            and make_record_key(normalized_url, source_workbook) in completed_record_keys
+        )
+        stage0_records.append((raw_url, normalized_url, source_workbook, is_completed))
+        if is_completed:
+            stage0_skipped += 1
+            _append_shortlist_stage_event_now(
+                run_context=run_context,
+                checkpoint_store=checkpoint_store,
+                raw_url=raw_url,
+                normalized_url=normalized_url,
+                source_workbook=source_workbook,
+                stage_name="stage0",
+                worker_id="stage0-lexical",
+                status="skipped",
+            )
+            if stage0_progress_bar is not None:
+                stage0_progress_bar.update(1)
+            continue
+        pending_metric_input_counts[normalized_url] = pending_metric_input_counts.get(normalized_url, 0) + 1
+        if normalized_url and normalized_url not in pending_metric_seen:
+            pending_metric_seen.add(normalized_url)
+            pending_metric_urls.append(normalized_url)
+
+    stage0_batch_stats = {
+        "metric_urls_total": 0,
+        "metric_urls_completed": 0,
+        "input_urls_completed": stage0_skipped,
+        "batches_total": 0,
+        "batches_completed": 0,
+        "avg_batch_latency_ms": 0.0,
+    }
+    if pending_metric_urls:
+        computed_prefetch_metrics, stage0_batch_stats = _compute_stage0_prefetch_metrics_parallel(
+            pending_metric_urls,
+            scoring_config,
+            original_count=len(input_urls),
+            metric_input_counts=pending_metric_input_counts,
+            progress_bar=stage0_progress_bar,
+            skipped_count=stage0_skipped,
+        )
+        for normalized_url, prefetch_metrics in computed_prefetch_metrics.items():
+            prefetch_metrics_map[normalized_url] = dict(prefetch_metrics)
+            prefetch_metrics_map[normalized_url]["source_workbook"] = source_workbook_map.get(
+                normalized_url,
+                prefetch_metrics_map[normalized_url].get("source_workbook", ""),
+            )
+
+    stage0_hits = 0
+    stage0_misses = 0
+    lexical_hit_records: list[dict[str, Any]] = []
+    stage0_started_monotonic = time.perf_counter()
+    stage0_processed = stage0_skipped
+    for raw_url, normalized_url, source_workbook, is_completed in stage0_records:
+        if is_completed:
+            continue
+        prefetch_metrics = prefetch_metrics_map.get(normalized_url, {})
+        prefetch_metrics["source_workbook"] = source_workbook_map.get(normalized_url, prefetch_metrics.get("source_workbook", ""))
+        if _passes_lexical_gate(prefetch_metrics):
+            stage0_hits += 1
+            lexical_hit_records.append(
+                {
+                    "raw_url": raw_url,
+                    "normalized_url": normalized_url,
+                    "source_workbook": source_workbook,
+                }
+            )
+            _upsert_shortlist_checkpoint(
+                run_context=run_context,
+                checkpoint_store=checkpoint_store,
+                raw_url=raw_url,
+                normalized_url=normalized_url,
+                source_workbook=source_workbook,
+                stage_name="stage0",
+                stage_status="lexical_hit",
+                current_stage="stage0",
+            )
+            _append_shortlist_stage_event_now(
+                run_context=run_context,
+                checkpoint_store=checkpoint_store,
+                raw_url=raw_url,
+                normalized_url=normalized_url,
+                source_workbook=source_workbook,
+                stage_name="stage0",
+                worker_id="stage0-lexical",
+                status="lexical_hit",
+            )
+        else:
+            stage0_misses += 1
+            lexical_reject_urls.add(normalized_url)
+            _upsert_shortlist_checkpoint(
+                run_context=run_context,
+                checkpoint_store=checkpoint_store,
+                raw_url=raw_url,
+                normalized_url=normalized_url,
+                source_workbook=source_workbook,
+                stage_name="stage0",
+                stage_status="filtered_lexical_miss",
+                current_stage="stage0",
+            )
+            _append_shortlist_stage_event_now(
+                run_context=run_context,
+                checkpoint_store=checkpoint_store,
+                raw_url=raw_url,
+                normalized_url=normalized_url,
+                source_workbook=source_workbook,
+                stage_name="stage0",
+                worker_id="stage0-lexical",
+                status="filtered_lexical_miss",
+            )
+        stage0_processed += 1
+
+    if lexical_hit_records:
+        lexical_hit_dns_gate_result = await _dns_gate_lexical_miss_records(lexical_hit_records)
+        hit_dns_prefetch_map = dict(lexical_hit_dns_gate_result.get("dns_prefetch_map") or {})
+        for record in lexical_hit_dns_gate_result["accepted_records"]:
+            raw_url = str(record.get("raw_url", "") or "")
+            normalized_url = str(record.get("normalized_url", "") or normalize_url(raw_url))
+            source_workbook = str(record.get("source_workbook", "") or source_workbook_map.get(normalized_url, ""))
+            stage1_state = _build_lexical_stage1_state(prefetch_metrics_map.get(normalized_url, {}))
+            stage1_state.update(dict(hit_dns_prefetch_map.get(normalized_url, {}) or {}))
+            stage1_analysis_map[normalized_url] = stage1_state
+            lexical_candidate_urls.append(raw_url)
+            _upsert_shortlist_checkpoint(
+                run_context=run_context,
+                checkpoint_store=checkpoint_store,
+                raw_url=raw_url,
+                normalized_url=normalized_url,
+                source_workbook=source_workbook,
+                stage_name="dns_gate",
+                stage_status="accepted",
+                current_stage="dns_gate",
+                worker_id="dns-gate",
+            )
+            _append_shortlist_stage_event_now(
+                run_context=run_context,
+                checkpoint_store=checkpoint_store,
+                raw_url=raw_url,
+                normalized_url=normalized_url,
+                source_workbook=source_workbook,
+                stage_name="dns_gate",
+                worker_id="dns-gate",
+                status="accepted",
+            )
+        for record in lexical_hit_dns_gate_result["rejected_records"]:
+            raw_url = str(record.get("raw_url", "") or "")
+            normalized_url = str(record.get("normalized_url", "") or normalize_url(raw_url))
+            source_workbook = str(record.get("source_workbook", "") or source_workbook_map.get(normalized_url, ""))
+            analysis = _build_dns_failed_lexical_stage1_state(
+                prefetch_metrics_map.get(normalized_url, {}),
+                raw_url=raw_url,
+                normalized_url=normalized_url,
+                source_workbook=source_workbook,
+                dns_status=str(record.get("dns_status", "") or ""),
+                dns_decision=str(record.get("dns_decision", "") or "filtered"),
+                dns_answer_count=0,
+                error_message=str(record.get("error_message", "") or ""),
+            )
+            stage1_analysis_map[normalized_url] = analysis
+            dns_passthrough_urls.add(normalized_url)
+            _upsert_shortlist_checkpoint(
+                run_context=run_context,
+                checkpoint_store=checkpoint_store,
+                raw_url=raw_url,
+                normalized_url=normalized_url,
+                source_workbook=source_workbook,
+                stage_name="dns_gate",
+                stage_status="registration_passthrough",
+                current_stage="dns_gate",
+                worker_id="dns-gate",
+                error_type=str(analysis.get("stage1_error_type", "") or analysis.get("fetch_error_type", "")),
+                error_message=str(analysis.get("stage1_error_message", "") or analysis.get("fetch_error_detail", "")),
+                failure_reason=str(analysis.get("stage1_reasons", "") or "dns_not_mapped_to_ip"),
+            )
+            _append_shortlist_stage_event_now(
+                run_context=run_context,
+                checkpoint_store=checkpoint_store,
+                raw_url=raw_url,
+                normalized_url=normalized_url,
+                source_workbook=source_workbook,
+                stage_name="dns_gate",
+                worker_id="dns-gate",
+                status="registration_passthrough",
+                error_type=str(analysis.get("stage1_error_type", "") or analysis.get("fetch_error_type", "")),
+                error_message=str(analysis.get("stage1_error_message", "") or analysis.get("fetch_error_detail", "")),
+            )
+
+    if stage0_progress_bar is not None:
+        if stage0_processed > stage0_progress_bar.n:
+            stage0_progress_bar.update(stage0_processed - stage0_progress_bar.n)
+        stage0_progress_bar.set_postfix(
+            {
+                "hits": stage0_hits,
+                "miss": stage0_misses,
+                "skip": stage0_skipped,
+                "w": LEXICAL_WORKERS,
+                "b": stage0_batch_stats["batches_completed"],
+            },
+            refresh=False,
+        )
+        stage0_progress_bar.close()
+    stage0_elapsed_s = max(0.001, time.perf_counter() - stage0_started_monotonic)
+    _hash_logger.info(
+        "Stage0 lexical gate completed | processed=%d/%d | rate=%.1f url/s | elapsed=%.1fs | hits=%d | misses=%d | skipped=%d | workers=%d | metric_urls=%d | batches=%d/%d | avg_batch_latency_ms=%.1f",
+        stage0_processed,
+        len(input_urls),
+        stage0_processed / stage0_elapsed_s,
+        stage0_elapsed_s,
+        stage0_hits,
+        stage0_misses,
+        stage0_skipped,
+        LEXICAL_WORKERS,
+        stage0_batch_stats["metric_urls_total"],
+        stage0_batch_stats["batches_completed"],
+        stage0_batch_stats["batches_total"],
+        stage0_batch_stats["avg_batch_latency_ms"],
+    )
+    _hash_logger.info(
+        "Lexical-only shortlist routing | lexical_hits=%d | lexical_misses=%d | hash_candidates=%d | dns_passthrough=%d",
+        stage0_hits,
+        stage0_misses,
+        len(lexical_candidate_urls),
+        len(dns_passthrough_urls),
+    )
+
+    if not lexical_candidate_urls:
+        try:
+            return _finish_hashing_shortlist_output_lexical_only(
+                t0=time.perf_counter(),
+                metrics=metrics,
+                threshold=threshold,
+                results=[],
+                review_results=[],
+                input_urls=input_urls,
+                decision_rows=[],
+                prefetch_metrics_map=prefetch_metrics_map,
+                lexical_reject_urls=lexical_reject_urls,
+                dns_passthrough_urls=dns_passthrough_urls,
+                stage1_analysis_map=stage1_analysis_map,
+                scoring_config=scoring_config,
+                source_workbook_map=source_workbook_map,
+                shortlist_debug_csv=shortlist_debug_csv,
+                run_context=run_context,
+                checkpoint_store=checkpoint_store,
+            )
+        finally:
+            _close_hashing_log()
+
+    shortlisted_urls = list(lexical_candidate_urls)
+    results: list[dict[str, Any]] = []
+    review_results: list[dict[str, Any]] = []
+    prefetch_admitted_failures: list[dict[str, Any]] = []
+    t0 = time.perf_counter()
+    url_queue = asyncio.Queue()
+    gpu_queue = asyncio.Queue(maxsize=GPU_QUEUE_MAXSIZE)
+    active_fetch_limiter = _AdaptiveFetchLimiter(ACTIVE_FETCH_LIMIT_INITIAL)
+    hash_progress = ProgressTracker(total=len(shortlisted_urls))
+    last_progress_log = t0
+    last_processed = 0
+    last_window_processed = 0
+    last_window_failed = 0
+    last_window_timed_out = 0
+    consecutive_pressure_windows = 0
+    metrics["hash_execution_mode"] = "legacy_shards"
+
+    for raw_url in shortlisted_urls:
+        normalized_url = normalize_url(raw_url)
+        source_workbook = str(source_workbook_map.get(normalized_url, "") or "")
+        _append_hash_stage_event(
+            run_context=run_context,
+            checkpoint_store=checkpoint_store,
+            raw_url=raw_url,
+            normalized_url=normalized_url,
+            source_workbook=source_workbook,
+            worker_id="hash-admit",
+            status="admitted",
+        )
+        await url_queue.put(raw_url)
+    for _ in range(BROWSER_SHARDS * SCRAPER_PAGE_CONCURRENCY):
+        await url_queue.put(None)
+
+    connector = aiohttp.TCPConnector(limit=_AIOHTTP_CONNECTOR_LIMIT, ttl_dns_cache=300) if _has_aiohttp else None
+    aio_session = aiohttp.ClientSession(connector=connector) if _has_aiohttp else None
+    progress_bar = None
+    hash_watchdog = None
+
+    try:
+        from tqdm import tqdm
+
+        progress_bar = tqdm(
+            total=len(shortlisted_urls),
+            desc="Hashing shortlist",
+            unit="url",
+            leave=True,
+        )
+    except Exception:
+        pass
+
+    try:
+        loop = asyncio.get_running_loop()
+        _install_asyncio_exception_logging(loop)
+        shard_tasks = [
+            asyncio.create_task(
+                _run_browser_shard(
+                    i,
+                    url_queue,
+                    gpu_queue,
+                    metrics,
+                    decision_rows,
+                    prefetch_metrics_map,
+                    stage1_analysis_map,
+                    prefetch_admitted_failures,
+                    active_fetch_limiter,
+                    aio_session,
+                    scoring_config,
+                    None,
+                    run_context,
+                    checkpoint_store,
+                )
+            )
+            for i in range(BROWSER_SHARDS)
+        ]
+        scorer_task = asyncio.create_task(
+            _gpu_microbatch_scorer(
+                gpu_queue,
+                results,
+                review_results,
+                decision_rows,
+                metrics,
+                threshold,
+                scoring_config,
+                None,
+                run_context,
+                checkpoint_store,
+            )
+        )
+        hash_watchdog = StageWatchdog(
+            stage_name="hash",
+            progress_tracker=hash_progress,
+            checkpoint_store=checkpoint_store,
+            warn_after_seconds=run_context.watchdog_warning_seconds if run_context is not None else 60,
+            stall_after_seconds=run_context.stall_threshold_seconds if run_context is not None else 180,
+            queue_size_getter=url_queue.qsize,
+            active_summary_getter=lambda: {
+                "processed": metrics.get("processed", 0),
+                "gpu_queue_depth": gpu_queue.qsize(),
+                "active_fetch_limit": active_fetch_limiter.limit,
+                "shards_done": sum(1 for task in shard_tasks if task.done()),
+                "shards_total": len(shard_tasks),
+            },
+            logger_instance=_hash_logger,
+        )
+        hash_watchdog.start()
+
+        while not all(task.done() for task in shard_tasks):
+            await asyncio.sleep(0.5)
+            now = time.perf_counter()
+            metrics["gpu_queue_depth"] = gpu_queue.qsize()
+            metrics["active_fetch_limit"] = active_fetch_limiter.limit
+            metrics["stage_elapsed_s"] = now - t0
+            current = metrics["processed"]
+            if progress_bar is not None and current > last_processed:
+                progress_bar.update(current - last_processed)
+                progress_bar.set_postfix(_build_progress_postfix(metrics), refresh=False)
+                last_processed = current
+                for _ in range(current - hash_progress.completed):
+                    hash_progress.mark_completed(final_status="hash_processed")
+            if (
+                run_context is not None
+                and hash_progress.seconds_since_progress() >= run_context.stall_threshold_seconds
+            ):
+                for task in shard_tasks:
+                    task.cancel()
+                scorer_task.cancel()
+                await asyncio.gather(*shard_tasks, return_exceptions=True)
+                await asyncio.gather(scorer_task, return_exceptions=True)
+                raise RuntimeError(
+                    f"Hashing browser shard pool stalled for >= {run_context.stall_threshold_seconds}s without progress"
+                )
+            if now - last_progress_log >= HASH_RAMP_INTERVAL_SECONDS:
+                window_processed = current - last_window_processed
+                window_failed = metrics["fetch_failed"] - last_window_failed
+                window_timed_out = metrics["fetch_timed_out"] - last_window_timed_out
+                if ADAPTIVE_FETCH_DOWNSHIFT_ENABLED:
+                    downshift = _compute_stage1_downshift(
+                        current_limit=active_fetch_limiter.limit,
+                        floor_limit=ACTIVE_FETCH_LIMIT_FLOOR,
+                        step=ACTIVE_FETCH_DOWNSHIFT_STEP,
+                        processed_total=current,
+                        window_processed=window_processed,
+                        window_failed=window_failed,
+                        window_timed_out=window_timed_out,
+                        gpu_queue_depth=metrics["gpu_queue_depth"],
+                        gpu_backlog_threshold=GPU_QUEUE_BACKLOG_THRESHOLD,
+                        consecutive_pressure_windows=consecutive_pressure_windows,
+                    )
+                    consecutive_pressure_windows = downshift["next_consecutive_pressure_windows"]
+                    if downshift["should_downshift"] and downshift["next_limit"] < active_fetch_limiter.limit:
+                        previous_limit = active_fetch_limiter.limit
+                        await active_fetch_limiter.set_limit(downshift["next_limit"])
+                        metrics["active_fetch_limit"] = active_fetch_limiter.limit
+                        _hash_logger.info(
+                            "Hash adaptive downshift | active_fetch_limit %d -> %d | timeout_ratio=%.3f | success_ratio=%.3f",
+                            previous_limit,
+                            active_fetch_limiter.limit,
+                            downshift["timeout_ratio"],
+                            metrics["hashed_success"] / max(1, current),
+                        )
+                _log_hashing_periodic_status(metrics, len(shortlisted_urls))
+                last_window_processed = current
+                last_window_failed = metrics["fetch_failed"]
+                last_window_timed_out = metrics["fetch_timed_out"]
+                last_progress_log = now
+
+        await asyncio.gather(*shard_tasks)
+        current = metrics["processed"]
+        metrics["stage_elapsed_s"] = time.perf_counter() - t0
+        metrics["gpu_queue_depth"] = gpu_queue.qsize()
+        metrics["active_fetch_limit"] = active_fetch_limiter.limit
+        if progress_bar is not None and current > last_processed:
+            progress_bar.update(current - last_processed)
+            progress_bar.set_postfix(_build_progress_postfix(metrics), refresh=False)
+            last_processed = current
+            for _ in range(current - hash_progress.completed):
+                hash_progress.mark_completed(final_status="hash_processed")
+        await gpu_queue.put(None)
+        await scorer_task
+        current = metrics["processed"]
+        metrics["stage_elapsed_s"] = time.perf_counter() - t0
+        metrics["gpu_queue_depth"] = 0
+        metrics["active_fetch_limit"] = active_fetch_limiter.limit
+        if progress_bar is not None and current > last_processed:
+            progress_bar.update(current - last_processed)
+            progress_bar.set_postfix(_build_progress_postfix(metrics), refresh=False)
+            last_processed = current
+            for _ in range(current - hash_progress.completed):
+                hash_progress.mark_completed(final_status="hash_processed")
+        if prefetch_admitted_failures:
+            results.extend(prefetch_admitted_failures)
+    finally:
+        if hash_watchdog is not None:
+            with suppress(Exception):
+                await hash_watchdog.stop()
+        if progress_bar is not None:
+            progress_bar.close()
+        if aio_session is not None:
+            await aio_session.close()
+
+    try:
+        rdap_metrics = get_rdap_metrics_snapshot()
+        _hash_logger.info(
+            "RDAP metrics | requests=%d success=%d fallback=%d exception=%d cache_hit=%d inflight_wait=%d cooldown_hit=%d",
+            int(rdap_metrics.get("request", 0) or 0),
+            int(rdap_metrics.get("success", 0) or 0),
+            int(rdap_metrics.get("fallback_request", 0) or 0),
+            int(rdap_metrics.get("exception", 0) or 0),
+            int(rdap_metrics.get("cache_hit", 0) or 0),
+            int(rdap_metrics.get("inflight_wait", 0) or 0),
+            int(rdap_metrics.get("cooldown_hit", 0) or 0),
+        )
+        return _finish_hashing_shortlist_output_lexical_only(
+            t0=t0,
+            metrics=metrics,
+            threshold=threshold,
+            results=results,
+            review_results=review_results,
+            input_urls=input_urls,
+            decision_rows=decision_rows,
+            prefetch_metrics_map=prefetch_metrics_map,
+            lexical_reject_urls=lexical_reject_urls,
+            dns_passthrough_urls=dns_passthrough_urls,
+            stage1_analysis_map=stage1_analysis_map,
+            scoring_config=scoring_config,
+            source_workbook_map=source_workbook_map,
+            shortlist_debug_csv=shortlist_debug_csv,
+            run_context=run_context,
+            checkpoint_store=checkpoint_store,
+        )
+    finally:
+        _close_hashing_log()
+
 
 async def run_hashing_shortlist_streaming(
     url_list,
@@ -9961,13 +10747,6 @@ async def run_hashing_shortlist_streaming(
     weights=None,
     shortlist_debug_csv: str | None = DEFAULT_STAGE1_DEBUG_CSV,
     url_sources: dict | None = None,
-    keep_stage1_suspected: bool = False,
-    keep_fetch_failed_strict_lexical: bool = False,
-    stage1_escalate_total_threshold=None,
-    stage1_brand_min=None,
-    stage1_credential_min=None,
-    stage1_low_band_min=None,
-    stage1_hard_trigger_brand_min=None,
     run_context: RunContext | None = None,
     checkpoint_store: CheckpointStore | None = None,
     resume: bool = False,
@@ -9977,7 +10756,23 @@ async def run_hashing_shortlist_streaming(
     Streaming hashing shortlist engine. Uses long-lived browser shards
     feeding a bounded GPU queue. No Ray dependency.
     """
-    import pandas as pd
+    return await _run_hashing_shortlist_lexical_only(
+        url_list,
+        threshold=threshold,
+        domain_similarity_threshold=domain_similarity_threshold,
+        high_confidence_threshold=high_confidence_threshold,
+        medium_confidence_threshold=medium_confidence_threshold,
+        typo_top_k=typo_top_k,
+        typo_min_score=typo_min_score,
+        lexical_pass_min_score=lexical_pass_min_score,
+        weights=weights,
+        shortlist_debug_csv=shortlist_debug_csv,
+        url_sources=url_sources,
+        run_context=run_context,
+        checkpoint_store=checkpoint_store,
+        resume=resume,
+        force_reprocess=force_reprocess,
+    )
 
     if not isinstance(threshold, numbers.Real):
         raise ValueError("threshold must be a numeric value")
@@ -10519,7 +11314,7 @@ async def run_hashing_shortlist_streaming(
         passthrough_rows = [
             row
             for row in (
-                _build_stage1_passthrough_holdout_row(stage1_row, scoring_config)
+                _build_dns_passthrough_holdout_row_legacy(stage1_row, scoring_config)
                 for stage1_row in stage1_rows
             )
             if row
@@ -10811,208 +11606,38 @@ def _finish_hashing_shortlist_output(
     run_context,
     checkpoint_store,
 ):
-    import pandas as pd
-
-    elapsed = time.perf_counter() - t0
-    counters = _resolve_hash_metric_counters(metrics)
-    resolved_shortlist_debug_csv = get_run_artifact_path(
-        run_context,
-        "stage0_lexical_decisions_csv",
-        shortlist_debug_csv or DEFAULT_STAGE1_DEBUG_CSV,
-    ) if shortlist_debug_csv else ""
-    stage1_http_routing_csv = get_run_artifact_path(
-        run_context,
-        "stage1_http_routing_csv",
-        os.path.join(getattr(run_context, "output_dir", "") or OUTPUT_DIR, "stage1_http_routing.csv"),
-    )
-    stage1_methods_csv = get_run_artifact_path(run_context, "stage1_methods_csv", STAGE1_METHODS_DEBUG_PATH)
-    stage1_deep_analysis_csv = get_run_artifact_path(
-        run_context,
-        "stage1_deep_analysis_candidates_csv",
-        STAGE1_DEEP_ANALYSIS_CANDIDATES_PATH,
-    )
-    stage1_review_queue_csv = get_run_artifact_path(run_context, "stage1_review_queue_csv", STAGE1_REVIEW_QUEUE_PATH)
-    fetch_failed_hits_csv = get_run_artifact_path(run_context, "fetch_failed_lexical_hits_csv", FETCH_FAILED_LEXICAL_HITS_PATH)
-    excluded_urls_csv = get_run_artifact_path(run_context, "hashing_excluded_urls_csv", HASHING_EXCLUDED_URLS_PATH)
-    metrics["stage_elapsed_s"] = elapsed
-    metrics["gpu_queue_depth"] = 0
-    metrics["render_queue_depth"] = 0
-    metrics["aux_queue_depth"] = 0
-    print(
-        f"\nHashing shortlist completed in {elapsed:.1f}s "
-        f"(deep_attempted={counters['deep_attempted']} "
-        f"hash_finalized={counters['hash_finalized']} "
-        f"final_matches_total={counters['final_matches_total']})"
-    )
-    print(
-        "Hashing metrics: "
-        f"deep_attempted={counters['deep_attempted']} "
-        + (
-            ""
-            if str(metrics.get("hash_execution_mode", "")).strip().lower() == "legacy_shards"
-            else f"render={metrics.get('render_completed', 0)} aux={metrics.get('aux_completed', 0)} "
+    del audit_rows
+    dns_passthrough_urls = {
+        str(normalized_url or "")
+        for normalized_url, analysis in (stage1_analysis_map or {}).items()
+        if (
+            DNS_NOT_MAPPED_LEXICAL_PASSTHROUGH_PATH
+            in {
+                str(analysis.get("admission_path", "") or "").strip(),
+                str(analysis.get("survival_path", "") or "").strip(),
+                str(analysis.get("reason", "") or "").strip(),
+            }
+            or str(analysis.get("reason", "") or "").strip() == "dns_not_mapped_lexical_hit"
         )
-        + f"hash_finalized={counters['hash_finalized']} "
-        + f"hashed_success={metrics['hashed_success']} "
-        f"fetch_failed={metrics['fetch_failed']} "
-        f"fetch_timed_out={metrics['fetch_timed_out']} "
-        f"gpu_batches_flushed={metrics['gpu_batches_flushed']} "
-        f"gpu_items_scored={metrics['gpu_items_scored']} "
-        f"avg_gpu_batch_size={metrics['avg_gpu_batch_size']:.1f} "
-        f"urls_per_sec={counters['hash_finalized'] / max(elapsed, 1e-6):.2f} "
-        f"final_matches_total={counters['final_matches_total']}"
-    )
-    _log_hashing_metrics_summary(
-        metrics,
-        elapsed,
-        threshold,
-        shortlisted_results=results,
-        typo_min_score=scoring_config["typo_min_score"],
-    )
-    hash_export_paths = _write_stage2_hash_exports(decision_rows, run_context=run_context)
-    if hash_export_paths:
-        _hash_logger.info(
-            "Stage2 hash exports written to %s (%d files)",
-            os.path.join(getattr(run_context, "output_dir", "") or os.path.dirname(HASH_EXPORT_DIR), "hash_folder"),
-            len(hash_export_paths),
-        )
-
-    rows = [
-        (
-            dict(match)
-            if "Cooresponding CSE" in match and "Identified Phishing/Suspected Domain Name" in match
-            else _build_shortlist_output_row(match, scoring_config)
-        )
-        for match in results
-    ]
-    review_rows = []
-    for match in review_results:
-        review_row = _build_shortlist_output_row(match, scoring_config)
-        review_row["review_reason"] = match.get("review_reason", "stage1_review_only")
-        review_rows.append(review_row)
-
-    stage1_rows = _build_stage1_debug_rows(
-        input_urls,
-        audit_rows,
+    }
+    return _finish_hashing_shortlist_output_lexical_only(
+        t0=t0,
+        metrics=metrics,
+        threshold=threshold,
+        results=results,
+        review_results=review_results,
+        input_urls=input_urls,
         decision_rows=decision_rows,
         prefetch_metrics_map=prefetch_metrics_map,
         lexical_reject_urls=lexical_reject_urls,
+        dns_passthrough_urls=dns_passthrough_urls,
         stage1_analysis_map=stage1_analysis_map,
         scoring_config=scoring_config,
         source_workbook_map=source_workbook_map,
+        shortlist_debug_csv=shortlist_debug_csv,
+        run_context=run_context,
+        checkpoint_store=checkpoint_store,
     )
-    methods_path, deep_analysis_path = _write_stage1_method_artifacts(
-        stage1_rows,
-        methods_path=stage1_methods_csv,
-        deep_analysis_path=stage1_deep_analysis_csv,
-    )
-    sync_run_artifact(run_context, "stage1_methods_csv", src_path=methods_path, best_effort=True)
-    sync_run_artifact(run_context, "stage1_deep_analysis_candidates_csv", src_path=deep_analysis_path, best_effort=True)
-    passthrough_rows = [
-        row
-        for row in (
-            _build_stage1_passthrough_holdout_row(stage1_row, scoring_config)
-            for stage1_row in stage1_rows
-        )
-        if row
-    ]
-    rows.extend(passthrough_rows)
-    if rows:
-        deduped_rows = []
-        seen_row_keys = set()
-        for row in rows:
-            row_key = (
-                str(row.get("Identified Phishing/Suspected Domain Name", "") or ""),
-                str(row.get("Cooresponding CSE", "") or ""),
-                str(row.get("Legitimate Domains", "") or ""),
-            )
-            if row_key in seen_row_keys:
-                continue
-            seen_row_keys.add(row_key)
-            deduped_rows.append(row)
-        rows = deduped_rows
-    review_rows.extend(_build_stage1_review_queue_rows(stage1_rows, scoring_config=scoring_config))
-    review_df = pd.DataFrame(review_rows)
-    if not review_df.empty:
-        dedupe_columns = [
-            column
-            for column in [
-                "Identified Phishing/Suspected Domain Name",
-                "Cooresponding CSE",
-                "Legitimate Domains",
-                "review_reason",
-            ]
-            if column in review_df.columns
-        ]
-        if dedupe_columns:
-            review_df = review_df.drop_duplicates(subset=dedupe_columns, keep="last")
-    os.makedirs(os.path.dirname(stage1_review_queue_csv), exist_ok=True)
-    review_df.to_csv(stage1_review_queue_csv, index=False, encoding="utf-8")
-    sync_run_artifact(run_context, "stage1_review_queue_csv", src_path=stage1_review_queue_csv, best_effort=True)
-    _hash_logger.info(
-        "Stage1 review queue written to %s with %d rows",
-        stage1_review_queue_csv,
-        len(review_df),
-    )
-    if resolved_shortlist_debug_csv:
-        debug_path = _write_stage1_debug_csv(stage1_rows, output_path=resolved_shortlist_debug_csv)
-        sync_run_artifact(run_context, "stage0_lexical_decisions_csv", src_path=debug_path, best_effort=True)
-        _hash_logger.info("Stage1 debug CSV written to %s with %d rows", debug_path, len(stage1_rows))
-        print(f"Stage1 debug: {debug_path} ({len(stage1_rows)} rows)")
-        routing_path = _write_stage1_debug_csv(stage1_rows, output_path=stage1_http_routing_csv)
-        sync_run_artifact(run_context, "stage1_http_routing_csv", src_path=routing_path, best_effort=True)
-    _write_stage1_subset_csv(
-        stage1_rows,
-        fetch_failed_hits_csv,
-        lambda row: str(row.get("fetch_status", "")).strip().lower() in {"failed", "timeout"} and bool(row.get("strict_lexical_hit")),
-    )
-    sync_run_artifact(run_context, "fetch_failed_lexical_hits_csv", src_path=fetch_failed_hits_csv, best_effort=True)
-    excluded_rows = _build_excluded_url_rows(stage1_rows)
-    excluded_path = _write_excluded_urls_audit(excluded_rows, output_path=excluded_urls_csv)
-    sync_run_artifact(run_context, "hashing_excluded_urls_csv", src_path=excluded_path, best_effort=True)
-    _hash_logger.info(
-        "Excluded URL audit written to %s with %d rows",
-        excluded_path,
-        len(excluded_rows),
-    )
-    _hash_logger.info("Stage1 routing summary | review_queue_rows=%d", len(review_df))
-    if checkpoint_store is not None and run_context is not None:
-        for stage1_row in stage1_rows:
-            raw_url = str(stage1_row.get("input_url", "") or "")
-            normalized_url = str(stage1_row.get("normalized_url", "") or "")
-            source_workbook = str(stage1_row.get("source_workbook", "") or "")
-            final_status, hash_status, failure_reason = _resolve_stage1_terminal_checkpoint_outcome(stage1_row)
-            _upsert_shortlist_checkpoint(
-                run_context=run_context,
-                checkpoint_store=checkpoint_store,
-                raw_url=raw_url,
-                normalized_url=normalized_url,
-                source_workbook=source_workbook,
-                stage_name="hash",
-                stage_status=hash_status,
-                current_stage="hash",
-                final_pipeline_status=final_status,
-                failure_reason=failure_reason,
-            )
-    print(f"Excluded URLs: {excluded_path} ({len(excluded_rows)} rows)")
-    print(f"Stage1 methods: {methods_path}")
-    print(f"Stage1 deep-analysis candidates: {deep_analysis_path}")
-
-    if not rows:
-        return _empty_shortlist_df()
-    output_df = pd.DataFrame(rows)
-    dedupe_columns = [
-        column
-        for column in [
-            "Identified Phishing/Suspected Domain Name",
-            "Cooresponding CSE",
-            "Legitimate Domains",
-        ]
-        if column in output_df.columns
-    ]
-    if dedupe_columns:
-        output_df = output_df.drop_duplicates(subset=dedupe_columns, keep="first")
-    return output_df
 
 
 ###############################################
@@ -11031,13 +11656,6 @@ def run_hashing_shortlist(
     weights=None,
     shortlist_debug_csv: str | None = DEFAULT_STAGE1_DEBUG_CSV,
     url_sources: dict | None = None,
-    keep_stage1_suspected: bool = False,
-    keep_fetch_failed_strict_lexical: bool = False,
-    stage1_escalate_total_threshold=None,
-    stage1_brand_min=None,
-    stage1_credential_min=None,
-    stage1_low_band_min=None,
-    stage1_hard_trigger_brand_min=None,
 ):
     """Synchronous entry point for hashing shortlist."""
     return asyncio.run(
@@ -11053,13 +11671,6 @@ def run_hashing_shortlist(
             weights=weights,
             shortlist_debug_csv=shortlist_debug_csv,
             url_sources=url_sources,
-            keep_stage1_suspected=keep_stage1_suspected,
-            keep_fetch_failed_strict_lexical=keep_fetch_failed_strict_lexical,
-            stage1_escalate_total_threshold=stage1_escalate_total_threshold,
-            stage1_brand_min=stage1_brand_min,
-            stage1_credential_min=stage1_credential_min,
-            stage1_low_band_min=stage1_low_band_min,
-            stage1_hard_trigger_brand_min=stage1_hard_trigger_brand_min,
         )
     )
 
@@ -11076,13 +11687,6 @@ async def run_hashing_shortlist_async(
     weights=None,
     shortlist_debug_csv: str | None = DEFAULT_STAGE1_DEBUG_CSV,
     url_sources: dict | None = None,
-    keep_stage1_suspected: bool = False,
-    keep_fetch_failed_strict_lexical: bool = False,
-    stage1_escalate_total_threshold=None,
-    stage1_brand_min=None,
-    stage1_credential_min=None,
-    stage1_low_band_min=None,
-    stage1_hard_trigger_brand_min=None,
     run_context: RunContext | None = None,
     checkpoint_store: CheckpointStore | None = None,
     resume: bool = False,
@@ -11109,13 +11713,6 @@ async def run_hashing_shortlist_async(
             weights=weights,
             shortlist_debug_csv=shortlist_debug_csv,
             url_sources=url_sources,
-            keep_stage1_suspected=keep_stage1_suspected,
-            keep_fetch_failed_strict_lexical=keep_fetch_failed_strict_lexical,
-            stage1_escalate_total_threshold=stage1_escalate_total_threshold,
-            stage1_brand_min=stage1_brand_min,
-            stage1_credential_min=stage1_credential_min,
-            stage1_low_band_min=stage1_low_band_min,
-            stage1_hard_trigger_brand_min=stage1_hard_trigger_brand_min,
             run_context=run_context,
             checkpoint_store=checkpoint_store,
             resume=resume,
@@ -11134,13 +11731,6 @@ async def run_hashing_shortlist_async(
         weights=weights,
         shortlist_debug_csv=shortlist_debug_csv,
         url_sources=url_sources,
-        keep_stage1_suspected=keep_stage1_suspected,
-        keep_fetch_failed_strict_lexical=keep_fetch_failed_strict_lexical,
-        stage1_escalate_total_threshold=stage1_escalate_total_threshold,
-        stage1_brand_min=stage1_brand_min,
-        stage1_credential_min=stage1_credential_min,
-        stage1_low_band_min=stage1_low_band_min,
-        stage1_hard_trigger_brand_min=stage1_hard_trigger_brand_min,
         run_context=run_context,
         checkpoint_store=checkpoint_store,
         resume=resume,
