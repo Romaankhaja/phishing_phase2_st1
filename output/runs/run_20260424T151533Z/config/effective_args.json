@@ -33,7 +33,7 @@
     "weight_ssl_hash": 12.0,
     "whitelist": "data\\whitelists\\Stage_2_Legitimate_Domains_80.xlsx"
   },
-  "latest_output_dir": "c:\\Users\\sathwik.kusuri\\Documents\\phishing_ml\\output\\latest",
+  "latest_output_dir": "C:\\Users\\sathwik.kusuri\\Documents\\phishing_ml\\output\\latest",
   "run_id": "run_20260424T151533Z",
-  "run_output_dir": "c:\\Users\\sathwik.kusuri\\Documents\\phishing_ml\\output\\runs\\run_20260424T151533Z"
+  "run_output_dir": "C:\\Users\\sathwik.kusuri\\Documents\\phishing_ml\\output\\runs\\run_20260424T151533Z"
 }

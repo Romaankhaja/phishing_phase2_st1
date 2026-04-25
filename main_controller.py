@@ -521,7 +521,7 @@ async def main():
         requested_progress_mode,
         execution_backend=execution_backend,
     )
-    logger.info(
+    logger.debug(
         "Reliability run context | run_id=%s | resume=%s | force_reprocess=%s | manifest=%s | checkpoints=%s | stall_threshold_seconds=%d",
         run_context.run_id,
         resuming_existing_run,
@@ -530,7 +530,7 @@ async def main():
         get_run_artifact_path(run_context, "checkpoints_csv"),
         run_context.stall_threshold_seconds,
     )
-    logger.info(
+    logger.debug(
         "Progress mode requested=%s resolved=%s | backend=%s | stderr_tty=%s",
         requested_progress_mode,
         effective_progress_mode,
@@ -603,16 +603,44 @@ async def main():
         "holdout_csv",
         os.path.join("output", "holdout.csv"),
     )
+    # --- Compact startup banner ---
+    _res = runtime_profile_settings["resource_info"]
+    _ray_cfg = ray_runtime_config or {}
+    _env = runtime_profile_settings.get("env", {})
+    _limit_desc = f"first {args.limit}" if args.limit else "ALL"
+    _target_desc = f"first {args.target_limit}" if args.target_limit is not None else "ALL"
     logger.info(
-        "Run artifact roots | run_id=%s | run_output_dir=%s | latest_output_dir=%s",
+        "\n" + "=" * 70 + "\n"
+        "  🚀 Phishing Pipeline | run_id=%s\n"
+        "  📂 output=%s\n"
+        "  📋 whitelist=%s | shortlisting=%s\n"
+        "  🔧 mode=%s | backend=%s | profile=%s | progress=%s\n"
+        "  💻 host: cpu=%s ram=%.1fGB vram=%.1fGB platform=%s\n"
+        "  🎯 domains=%s | targets=%s | smoke_test=%s\n"
+        "  ⚙️  thresholds: shortlist=%.0f domain_sim=%.2f confidence=[H≥%.0f M≥%.0f]\n"
+        "  🔗 ray: browser_actors=%s classify_actors=%s stage0_inflight=%s\n"
+        + "=" * 70,
         run_context.run_id,
         run_context.run_output_dir,
-        run_context.latest_output_dir,
+        args.whitelist, args.shortlisting,
+        args.pipeline_mode, execution_backend,
+        runtime_profile_settings["resolved_profile"], effective_progress_mode,
+        _res.get("cpu_cores", "NA"),
+        float(_res.get("ram_gb", 0.0) or 0.0),
+        float(_res.get("vram_gb", 0.0) or 0.0),
+        _res.get("platform", "unknown"),
+        _limit_desc, _target_desc, args.stage_smoke_test,
+        args.hashing_threshold, args.domain_sim_threshold,
+        args.high_confidence_threshold, args.medium_confidence_threshold,
+        _ray_cfg.get("hash_browser_actors", "NA"),
+        _ray_cfg.get("classify_actors", "NA"),
+        _ray_cfg.get("stage0_inflight", "NA"),
     )
-    # --- Ray debug startup diagnostic ---
+
+    # --- Ray debug startup diagnostic (only with --ray-debug) ---
     if getattr(args, "ray_debug", False) and execution_backend == "ray":
         resource_info = _probe_runtime_resources()
-        ray_cfg = dict(ray_runtime_config or {})
+        ray_cfg = dict(_ray_cfg)
         actor_cpu_total = (
             ray_cfg["hash_browser_actors"] * 0.5
             + ray_cfg["classify_actors"] * 1.0
@@ -629,15 +657,9 @@ async def main():
             ray_cfg["classify_actors"],
             ray_cfg.get("ocr_actors", 1),
         )
-        logger.info("  Task CPU per call: 0.5  (stage0_batch, hash_enrich, hash_finalize)")
         logger.info("  Headroom:          %.1f CPUs  (%s)",
             resource_info["cpu_cores"] - actor_cpu_total,
             "✅ OK" if resource_info["cpu_cores"] > actor_cpu_total else "🛑 RISK OF DEADLOCK",
-        )
-        logger.info("  Memory mode:       %s",
-            "very_low" if ray_cfg.get("very_low_memory_mode") else
-            "low" if ray_cfg.get("low_memory_mode") else
-            "critical" if ray_cfg.get("critical_memory_mode") else "normal",
         )
         logger.info("-" * 70 + "\n")
 
@@ -649,39 +671,6 @@ async def main():
         and args.failed_fetch_suspected_min < args.failed_fetch_review_min
     ):
         raise ValueError("failed-fetch-suspected-min must be >= failed-fetch-review-min")
-    logger.info(
-        "Runtime profile requested=%s resolved=%s | host={cpu=%s,ram_gb=%.1f,vram_gb=%.1f,platform=%s} | ray={browser_actors=%s,classify_actors=%s,stage0_inflight=%s,prewarm=%s,dynamic_control=%s}",
-        runtime_profile_settings["requested_profile"],
-        runtime_profile_settings["resolved_profile"],
-        runtime_profile_settings["resource_info"].get("cpu_cores", "NA"),
-        float(runtime_profile_settings["resource_info"].get("ram_gb", 0.0) or 0.0),
-        float(runtime_profile_settings["resource_info"].get("vram_gb", 0.0) or 0.0),
-        runtime_profile_settings["resource_info"].get("platform", "unknown"),
-        (ray_runtime_config or {}).get("hash_browser_actors", "NA"),
-        (ray_runtime_config or {}).get("classify_actors", "NA"),
-        (ray_runtime_config or {}).get("stage0_inflight", "NA"),
-        (ray_runtime_config or {}).get("prewarm_mode", "NA"),
-        (ray_runtime_config or {}).get("enable_dynamic_control", "NA"),
-    )
-    logger.info(
-        "Effective runtime concurrency | hash={pages=%s,page_concurrency=%s,http_limit=%s,aux_net_limit=%s,active_fetch_floor=%s}",
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_PAGES", "NA"),
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_PAGE_CONCURRENCY", "NA"),
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_HTTP_LIMIT", "NA"),
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_AUX_NET_LIMIT", "NA"),
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_ACTIVE_PAGES_FLOOR", "NA"),
-    )
-    logger.info(
-        "Hash stage topology | pages=%s | shard_workers=%s | shards=auto | http_limit=%s | aux_net_limit=%s | active_pages_floor=%s",
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_PAGES", "NA"),
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_PAGE_CONCURRENCY", "NA"),
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_HTTP_LIMIT", "NA"),
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_AUX_NET_LIMIT", "NA"),
-        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_ACTIVE_PAGES_FLOOR", "NA"),
-    )
-    logger.info(
-        "Strict attempt policy | checkpoint_mode=csv | retries={rdap=0,tls=0,hash=0,classify=0}"
-    )
 
     # ✅ Ensure whitelist file exists
     if not os.path.exists(args.whitelist):
@@ -725,40 +714,7 @@ async def main():
             except Exception as e:
                 logger.warning("Failed to run external cleanup_fresh_run_outputs: %s", e)
 
-        logger.info("Using whitelist file: %s", args.whitelist)
-        logger.info("Using shortlisting folder: %s", args.shortlisting)
-        if args.limit:
-            logger.info("Processing first %d whitelisted domains...", args.limit)
-        else:
-            logger.info("Processing ALL whitelisted domains...")
-        if args.target_limit is not None:
-            logger.info("Limiting shortlist input to first %d target URLs...", args.target_limit)
-        logger.info(
-            "Runtime mode=%s | shortlist threshold=%.3f domain_sim_threshold=%.3f "
-            "confidence_bands={high>=%.3f, medium>=%.3f} "
-            "typo={top_k=%d,min_score=%.3f,lexical_pass_min_score=%.3f} "
-            "failed_fetch_rescue={suspected_min=%s,review_min=%s} "
-            "weights={domain=%.3f,favicon=%.3f,ssl_hash=%.3f,html_hash=%.3f,domain_hash=%.3f,keywords=%.3f} "
-            "stage_smoke_test=%s shortlist_debug_csv=%s",
-            args.pipeline_mode,
-            args.hashing_threshold,
-            args.domain_sim_threshold,
-            args.high_confidence_threshold,
-            args.medium_confidence_threshold,
-            args.typo_top_k,
-            args.typo_min_score,
-            args.lexical_pass_min_score,
-            args.failed_fetch_suspected_min if args.failed_fetch_suspected_min is not None else "off",
-            args.failed_fetch_review_min if args.failed_fetch_review_min is not None else "off",
-            args.weight_domain,
-            args.weight_favicon,
-            args.weight_ssl_hash,
-            args.weight_html_hash,
-            args.weight_domain_hash,
-            args.weight_keywords,
-            args.stage_smoke_test,
-            effective_shortlist_debug_csv,
-        )
+    
 
         df_out = None
 

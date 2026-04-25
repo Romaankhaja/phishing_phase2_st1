@@ -2477,3 +2477,5 @@ The above exception was the direct cause of the following exception:
   File ""C:\Users\sathwik.kusuri\Documents\phishing_ml\phishing_pipeline\visual_features.py"", line 133, in _get_ocr_reader
     raise RuntimeError(f""EasyOCR initialization failed: {e}"") from e
 RuntimeError: EasyOCR initialization failed: [WinError 1114] A dynamic link library (DLL) initialization routine failed. Error loading ""C:\Users\sathwik.kusuri\Documents\phishing_ml\venv\Lib\site-packages\torch\lib\c10.dll"" or one of its dependencies.",{}
+run_20260424T151533Z,2026-04-25T08:59:40+00:00,run,,run_start,running,,,,,,,,,,,,,,,,,,,,,,,{}
+run_20260424T151533Z,2026-04-25T10:03:55+00:00,run,,run_end,failed,,,,,,,,,,,,,,,,,,,,,,[WinError 233] No process is on the other end of the pipe,{}

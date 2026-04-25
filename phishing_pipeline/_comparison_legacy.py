@@ -2288,6 +2288,9 @@ def _evaluate_prefetch_lexical_bundle(
 
         best_jw = 0.0
         best_token = 0.0
+
+        best_jw = 0.0
+        best_token = 0.0
         best_skeleton = 0.0
         best_host = 0.0
         best_lexical = 0.0
@@ -2296,15 +2299,26 @@ def _evaluate_prefetch_lexical_bundle(
         best_domain_primary_generic = False
 
         for domain_features in entity_features.domains:
-            legacy_score = _legacy_fuzzy_similarity_score(
-                target_features.legacy_primary,
-                domain_features.legacy_primary,
-            )
-            is_legacy_hit = _legacy_is_similar_from_features(
-                target_features,
-                domain_features,
-                entity_features,
-            )
+            # Inline legacy score calculations
+            legacy_jw = 0.0
+            legacy_token = 0.0
+            if target_features.legacy_primary and domain_features.legacy_primary:
+                try:
+                    legacy_jw = float(jellyfish.jaro_winkler_similarity(target_features.legacy_primary, domain_features.legacy_primary)) if jellyfish is not None else 0.0
+                except Exception:
+                    pass
+                try:
+                    legacy_token = float(fuzz.token_set_ratio(target_features.legacy_primary, domain_features.legacy_primary)) / 100.0
+                except Exception:
+                    pass
+
+            legacy_score = max(legacy_jw, legacy_token)
+            
+            is_legacy_hit = False
+            if target_features.legacy_primary and domain_features.legacy_primary and target_features.legacy_normalized != domain_features.legacy_normalized:
+                if _has_substantive_lexical_anchor(target_features, domain_features, entity_features):
+                    is_legacy_hit = (legacy_jw >= 0.85) or (legacy_token >= 0.90)
+
             if is_legacy_hit and (not legacy_best_hit or legacy_score > legacy_best_score):
                 legacy_best_entity = entity_features.name
                 legacy_best_domain = domain_features.domain
@@ -2331,18 +2345,46 @@ def _evaluate_prefetch_lexical_bundle(
                 and substantive_anchor
             )
 
-            jw_score = _jaro_winkler_similarity(target_features.primary, entity_primary)
-            token_score = (
-                fuzz.token_set_ratio(target_features.primary, entity_primary) / 100.0
-                if target_features.primary and entity_primary
-                else 0.0
-            )
-            skeleton_score = _typosquat_similarity_from_features(target_features, domain_features)
-            host_score = (
-                ratio(target_features.host, entity_host) / 100.0
-                if target_features.host and entity_host
-                else 0.0
-            )
+            # Deduplicate string similarity using exact-match short-circuits and legacy caching
+            if target_features.primary and entity_primary:
+                if target_features.primary == entity_primary:
+                    jw_score = 1.0
+                    token_score = 1.0
+                elif target_features.primary == target_features.legacy_primary and entity_primary == domain_features.legacy_primary:
+                    jw_score = legacy_jw
+                    token_score = legacy_token
+                else:
+                    try:
+                        jw_score = float(jellyfish.jaro_winkler_similarity(target_features.primary, entity_primary)) if jellyfish is not None else 0.0
+                    except Exception:
+                        jw_score = 0.0
+                    try:
+                        token_score = float(fuzz.token_set_ratio(target_features.primary, entity_primary)) / 100.0
+                    except Exception:
+                        token_score = 0.0
+            else:
+                jw_score = 0.0
+                token_score = 0.0
+
+            # Deduplicate Levenshtein ratios
+            host_score = 0.0
+            if target_features.host and entity_host:
+                if target_features.host == entity_host:
+                    host_score = 1.0
+                else:
+                    host_score = float(ratio(target_features.host, entity_host)) / 100.0
+
+            sim_primary = 0.0
+            if target_features.primary and domain_features.normalized_primary:
+                if target_features.primary == domain_features.normalized_primary:
+                    sim_primary = 1.0
+                else:
+                    sim_primary = float(ratio(target_features.primary, domain_features.normalized_primary)) / 100.0
+
+            skeleton_score = max(sim_primary, host_score)
+            if target_features.suffix and target_features.suffix == domain_features.suffix:
+                skeleton_score = min(1.0, skeleton_score + 0.03)
+
             lexical_score = max(jw_score, token_score, skeleton_score, host_score)
 
             if lexical_score > best_lexical:
@@ -3943,8 +3985,10 @@ def _normalized_primary_for_similarity(value: str) -> str:
     return _domain_label_skeleton(ext.domain)
 
 
+_COMPACT_LEXICAL_RE = re.compile(r"[^a-z0-9]+")
+
 def _compact_lexical_label(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+    return _COMPACT_LEXICAL_RE.sub("", str(value or "").strip().lower())
 
 
 def _first_host_label_for_similarity(value: str) -> str:
@@ -4196,9 +4240,9 @@ def _has_substantive_lexical_anchor(
     if domain_features.primary_generic:
         return False
 
-    target_primary = _compact_lexical_label(target_features.compact_primary)
-    target_raw_primary = _compact_lexical_label(target_features.raw_primary)
-    entity_primary = _compact_lexical_label(domain_features.compact_primary or domain_features.normalized_primary)
+    target_primary = target_features.compact_primary or ""
+    target_raw_primary = target_features.raw_primary or ""
+    entity_primary = domain_features.compact_primary or _compact_lexical_label(domain_features.normalized_primary)
     if not target_primary or not entity_primary:
         return False
 
@@ -4220,14 +4264,13 @@ def _has_substantive_lexical_anchor(
     ):
         return True
 
-    longest, target_offset, entity_offset = _longest_common_substring(target_primary, entity_primary)
-    if (
-        shortest >= 8
-        and target_raw_primary[:1] == entity_primary[:1]
-        and longest >= max(6, int(shortest * 0.75))
-        and (target_offset == 0 or entity_offset == 0)
-    ):
-        return True
+    if shortest >= 8 and target_raw_primary[:1] == entity_primary[:1]:
+        longest, target_offset, entity_offset = _longest_common_substring(target_primary, entity_primary)
+        if (
+            longest >= max(6, int(shortest * 0.75))
+            and (target_offset == 0 or entity_offset == 0)
+        ):
+            return True
 
     return False
 
