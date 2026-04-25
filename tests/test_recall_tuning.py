@@ -4,7 +4,8 @@ from pathlib import Path
 import pandas as pd
 from tests._workspace_temp import workspace_tempdir
 
-from phishing_pipeline import recall_tuning, shortlisting
+from phishing_pipeline import _shortlisting_legacy as shortlisting
+from phishing_pipeline import recall_tuning
 
 
 class SourceWorkbookTaggingTests(unittest.TestCase):

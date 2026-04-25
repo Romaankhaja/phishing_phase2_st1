@@ -1,6 +1,6 @@
 import unittest
 
-from phishing_pipeline import comparison
+from phishing_pipeline import _comparison_legacy as comparison
 
 
 class Stage1AdaptiveDownshiftTests(unittest.TestCase):

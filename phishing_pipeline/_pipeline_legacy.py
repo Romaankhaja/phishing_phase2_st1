@@ -458,7 +458,6 @@ async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=Non
     """
     import csv
     import gc
-    import torch
     from .utils import (
         _safe_extract_ocr, _safe_extract_branding, _safe_extract_laplacian,
     )
@@ -611,8 +610,9 @@ async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=Non
             finally:
                 queue.task_done()
                 try:
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    torch_module = sys.modules.get("torch")
+                    if torch_module is not None and torch_module.cuda.is_available():
+                        torch_module.cuda.empty_cache()
                     gc.collect()
                 except Exception:
                     pass
@@ -642,8 +642,9 @@ async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=Non
 
     # Final GPU cleanup after all OCR is done
     try:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        torch_module = sys.modules.get("torch")
+        if torch_module is not None and torch_module.cuda.is_available():
+            torch_module.cuda.empty_cache()
         gc.collect()
         logger.debug("🧹 Final GPU cleanup complete")
     except Exception:
@@ -3646,7 +3647,7 @@ def package_results(output_file=FINAL_OUTPUT, zip_path="PS-02_ISS_NLP_Submission
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Run the phishing pipeline (pipeline.py).")
+    parser = argparse.ArgumentParser(description="Run the phishing pipeline.")
     parser.add_argument("holdout_folder",
                         help="Folder where CSVs will be read/written (pass '.' for current dir)")
     parser.add_argument("ps02_whitelist_file",

@@ -6,7 +6,7 @@ from unittest import mock
 
 import pandas as pd
 
-from phishing_pipeline import pipeline
+from phishing_pipeline import _pipeline_legacy as pipeline
 from phishing_pipeline import watcher
 from phishing_pipeline.reliability import archive_submission_artifacts, build_run_context
 from tests._workspace_temp import workspace_tempdir

@@ -1,7 +1,9 @@
 import unittest
 from unittest import mock
 
-from phishing_pipeline import comparison, pipeline, utils
+from phishing_pipeline import _comparison_legacy as comparison
+from phishing_pipeline import _pipeline_legacy as pipeline
+from phishing_pipeline import utils
 
 
 class Stage1AdmissionRetuneTests(unittest.TestCase):

@@ -13,6 +13,8 @@ import logging
 import warnings
 from typing import Any
 
+os.environ.setdefault("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
+
 # Event loop policy on Windows
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
@@ -206,24 +208,24 @@ def _load_runtime_components() -> dict[str, Any]:
         from phishing_pipeline import _pipeline_legacy as pipeline
         components["run_pipeline"] = pipeline.run_pipeline
         components["package_results"] = pipeline.package_results
-        logger.info("Imported run_pipeline and package_results from pipeline.py")
+        logger.info("Imported run_pipeline and package_results from _pipeline_legacy.py")
     except ImportError as exc:
-        logger.error("Failed to import from pipeline.py: %s", exc)
+        logger.error("Failed to import from _pipeline_legacy.py: %s", exc)
         raise
 
     try:
         from phishing_pipeline import _shortlisting_legacy as shortlisting
         components["shortlisting"] = shortlisting
-        logger.info("Imported shortlisting module for utils (shortlisting.py)")
+        logger.info("Imported shortlisting module for utils (_shortlisting_legacy.py)")
     except ImportError as exc:
-        logger.warning("Could not import shortlisting.py: %s", exc)
+        logger.warning("Could not import _shortlisting_legacy.py: %s", exc)
 
     try:
         from phishing_pipeline._comparison_legacy import run_hashing_shortlist_async
         components["run_hashing_shortlist_async"] = run_hashing_shortlist_async
-        logger.info("Imported run_hashing_shortlist_async from phishing_pipeline.comparison")
+        logger.info("Imported run_hashing_shortlist_async from phishing_pipeline._comparison_legacy")
     except ImportError as exc:
-        logger.warning("Could not import phishing_pipeline.comparison: %s", exc)
+        logger.warning("Could not import phishing_pipeline._comparison_legacy: %s", exc)
 
     return components
 
@@ -325,6 +327,9 @@ def _manifest_matches_inputs(manifest: dict[str, Any] | None, metadata: dict[str
 
 def clear_gpu_memory():
     """Clear GPU memory before pipeline run for better performance."""
+    if "torch" not in sys.modules and os.getenv("PHISHING_FORCE_GPU_CLEANUP", "").lower() not in {"1", "true", "yes"}:
+        logger.info("Skipping GPU cleanup because PyTorch is not loaded")
+        return
     try:
         import torch
         import gc
@@ -809,7 +814,7 @@ async def main():
                 )
                 logger.info("--- Finished Stage Smoke Test classify ---")
             else:
-            # 1. Run Shortlisting using phishing_pipeline.comparison
+                # 1. Run shortlisting with the legacy hashing module.
                 fatal_stage = "shortlist"
                 logger.info("--- Starting Step 1: Running Hashing-based Shortlisting ---")
                 url_records = shortlisting.load_url_records_from_excel_folder(

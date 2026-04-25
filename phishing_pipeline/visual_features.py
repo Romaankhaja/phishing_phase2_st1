@@ -602,7 +602,7 @@ async def get_favicon_features_async(url):
 #  Phase B: run_ocr_inference()         ← GPU, holds _ocr_lock for minimum time
 #           Only reader.readtext() is inside the lock
 #
-# pipeline.py Stage 2 calls A in parallel (executor), then B serially (executor).
+# Legacy pipeline Stage 2 calls A in parallel (executor), then B serially (executor).
 # While GPU is busy for worker A, workers B and C are already running Phase A.
 # ─────────────────────────────────────────────────────────────────────────────
 

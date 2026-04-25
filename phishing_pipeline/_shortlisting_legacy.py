@@ -1,4 +1,4 @@
-# phishing_pipeline/shortlisting.py
+# Legacy shortlisting implementation.
 import os
 import pandas as pd
 import logging
@@ -357,12 +357,12 @@ def run_shortlisting_process(holdout_folder: str | None = None,
     return out_df
 
 # ----------------------------------------------------------------------
-# BACKWARD COMPATIBILITY WRAPPER FOR pipeline.py
+# Backward compatibility wrapper for legacy pipeline callers.
 # ----------------------------------------------------------------------
 def generate_shortlisted_csv(holdout_folder, ps02_whitelist_file,
                              limit_whitelisted=None, write_outputs=True):
     """
-    Wrapper to keep pipeline.py working.
+    Wrapper to keep legacy pipeline callers working.
     Calls run_shortlisting_process() and returns the output CSV path.
     """
     out_df = run_shortlisting_process(

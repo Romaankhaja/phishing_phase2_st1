@@ -1,14 +1,20 @@
 import asyncio
 import logging
+import os
 import psutil
 
-try:
-    import torch
-    TORCH_AVAILABLE = bool(torch.cuda.is_available() and torch.cuda.device_count() > 0)
-except ImportError:
-    TORCH_AVAILABLE = False
-except Exception:
-    TORCH_AVAILABLE = False
+torch = None
+TORCH_AVAILABLE = False
+
+
+def _load_torch_for_resource_probe():
+    if os.getenv("PHISHING_ENABLE_TORCH_PROBES", "").lower() not in {"1", "true", "yes"}:
+        return None
+    try:
+        import torch as torch_module
+        return torch_module
+    except Exception:
+        return None
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +24,9 @@ class ResourceMonitor:
         self.ram_threshold = ram_threshold
         self.gpu_threshold = gpu_threshold
         self.check_interval = check_interval
+        global torch, TORCH_AVAILABLE
+        torch = _load_torch_for_resource_probe()
+        TORCH_AVAILABLE = bool(torch and torch.cuda.is_available() and torch.cuda.device_count() > 0)
         self.gpu_available = TORCH_AVAILABLE
         if self.gpu_available:
             try:

@@ -10,11 +10,21 @@ if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 # Resource management
-try:
-    import torch
-    TORCH_AVAILABLE = True
-except (ImportError, OSError):
-    TORCH_AVAILABLE = False
+torch = None
+
+
+def _load_torch_for_optional_probe():
+    if os.getenv("PHISHING_ENABLE_TORCH_PROBES", "").lower() not in {"1", "true", "yes"}:
+        return None
+    try:
+        import torch as torch_module
+        return torch_module
+    except Exception:
+        return None
+
+
+torch = _load_torch_for_optional_probe()
+TORCH_AVAILABLE = torch is not None
  
 
 from .config import ROOT_DIR, SCREENS_DIR, WHITELISTS_DIR
@@ -206,7 +216,6 @@ async def wait_for_vram(min_free_gb: float = 1.5, poll_interval: float = 0.5):
     if not TORCH_AVAILABLE:
         return
     try:
-        import torch
         if not torch.cuda.is_available():
             return
         while True:
@@ -225,7 +234,7 @@ async def wait_for_vram(min_free_gb: float = 1.5, poll_interval: float = 0.5):
         logger.warning("wait_for_vram check failed: %s â€” proceeding anyway", e)
 
 # ================== RESOURCE MONITOR SINGLETON ==================
-# Imported here so pipeline.py can use it without a separate import chain.
+# Imported here so legacy pipeline code can use it without a separate import chain.
 from .resource_manager import ResourceMonitor
 _resource_monitor = ResourceMonitor()
 

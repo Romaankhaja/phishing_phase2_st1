@@ -3,7 +3,7 @@ from unittest import mock
 
 import numpy as np
 
-from phishing_pipeline import comparison
+from phishing_pipeline import _comparison_legacy as comparison
 from phishing_pipeline.similarity_hashing import (
     best_similarity_against_set,
     canonicalize_ssl_identity,

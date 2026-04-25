@@ -1032,8 +1032,10 @@ async def run_hash_only_pipeline_with_ray_impl(
     ocr_num_gpus = 0.0
     if ocr_required_actor_count > 0:
         try:
-            import torch  # type: ignore
-            if torch.cuda.is_available():
+            torch_probe_enabled = os.getenv("PHISHING_ENABLE_TORCH_PROBES", "").lower() in {"1", "true", "yes"}
+            if torch_probe_enabled:
+                import torch  # type: ignore
+            if torch_probe_enabled and torch.cuda.is_available():
                 ocr_num_gpus = 1.0
         except Exception:
             pass

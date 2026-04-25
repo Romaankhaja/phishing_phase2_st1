@@ -534,6 +534,8 @@ def probe_runtime_resources() -> dict[str, Any]:
             ram_gb = 0.0
 
     try:
+        if os.getenv("PHISHING_ENABLE_TORCH_PROBES", "").lower() not in {"1", "true", "yes"}:
+            raise RuntimeError("PyTorch resource probes disabled")
         import torch  # type: ignore
 
         if torch.cuda.is_available():

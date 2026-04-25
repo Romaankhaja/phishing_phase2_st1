@@ -4,7 +4,8 @@ from unittest import mock
 
 import pandas as pd
 
-from phishing_pipeline import comparison, pipeline
+from phishing_pipeline import _comparison_legacy as comparison
+from phishing_pipeline import _pipeline_legacy as pipeline
 from tests._workspace_temp import workspace_tempdir
 
 

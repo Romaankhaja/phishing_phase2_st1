@@ -20,7 +20,7 @@ class RayRuntimeServerProfileTests(unittest.IsolatedAsyncioTestCase):
             }
 
         try:
-            with mock.patch("phishing_pipeline.pipeline._extract_hash_only_ocr_tvc", new=fake_extract):
+            with mock.patch("phishing_pipeline._pipeline_legacy._extract_hash_only_ocr_tvc", new=fake_extract):
                 tasks = [
                     asyncio.create_task(
                         worker.extract(

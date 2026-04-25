@@ -320,6 +320,8 @@ GPU_QUEUE_BACKLOG_THRESHOLD = max(4, GPU_QUEUE_MAXSIZE // 4)
 
 def _probe_gpu_batch_size() -> int:
     try:
+        if os.getenv("PHISHING_ENABLE_TORCH_PROBES", "").lower() not in {"1", "true", "yes"}:
+            return 16
         import torch
     except Exception:
         return 16

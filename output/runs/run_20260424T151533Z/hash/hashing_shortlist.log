@@ -1,18 +1,17 @@
-2026-04-24 20:50:05,436 | INFO | Hashing shortlist (lexical-only) started | urls=308 | threshold=58.0 | domain_similarity_threshold=0.800 | high_confidence_threshold=78.00 | medium_confidence_threshold=68.00 | typo_top_k=10 | typo_min_score=0.750 | lexical_pass_min_score=0.850
-2026-04-24 20:50:05,437 | INFO | Scoring weights | domain=30, favicon=14, ssl_hash=12, html_hash=6, domain_hash=8, keywords=10
-2026-04-24 20:50:05,437 | INFO | Hashing log file: C:\Users\sathwik.kusuri\Documents\phishing_ml\output\runs\run_20260424T151533Z\hash\hashing_shortlist.log
-2026-04-24 20:50:05,461 | INFO | Stage0 lexical runtime | input_urls=308 | metric_urls=308 | workers=8 | batch_size=256 | inflight_batches=8 | progress_interval_s=1.0
-2026-04-24 20:50:05,462 | INFO | Stage0 lexical executor | kind=thread | workers=8 | shortlist_execution_mode=legacy-batch
-2026-04-24 20:50:09,710 | INFO | Stage0 lexical gate completed | processed=308/308 | rate=80.7 url/s | elapsed=3.8s | hits=138 | misses=170 | skipped=0 | workers=8 | metric_urls=308 | batches=2/2 | avg_batch_latency_ms=276.6
-2026-04-24 20:50:09,710 | INFO | Lexical-only shortlist routing | lexical_hits=138 | lexical_misses=170 | hash_candidates=114 | dns_passthrough=24
-2026-04-24 20:50:25,077 | INFO | Hashing progress | hash_finalized=7/114 | deep_attempted=0 | ok=18 | fail=7 | tout=0 | final_matches=0 | gpu_batches=16 | gpu_items=18 | gpu_queue=0 | active_fetch_limit=16 | avg_gpu_batch=1.12 | urls_per_sec=0.46 | success_ratio=2.571 | timeout_ratio=0.000
-2026-04-24 20:50:40,217 | INFO | Hashing progress | hash_finalized=12/114 | deep_attempted=0 | ok=29 | fail=12 | tout=0 | final_matches=0 | gpu_batches=27 | gpu_items=29 | gpu_queue=0 | active_fetch_limit=16 | avg_gpu_batch=1.07 | urls_per_sec=0.39 | success_ratio=2.417 | timeout_ratio=0.000
-2026-04-24 20:50:55,381 | INFO | Hashing progress | hash_finalized=22/114 | deep_attempted=0 | ok=48 | fail=18 | tout=4 | final_matches=0 | gpu_batches=45 | gpu_items=48 | gpu_queue=0 | active_fetch_limit=16 | avg_gpu_batch=1.07 | urls_per_sec=0.48 | success_ratio=2.182 | timeout_ratio=0.182
-2026-04-24 20:51:10,447 | INFO | Hashing progress | hash_finalized=28/114 | deep_attempted=0 | ok=73 | fail=22 | tout=6 | final_matches=0 | gpu_batches=69 | gpu_items=73 | gpu_queue=0 | active_fetch_limit=16 | avg_gpu_batch=1.06 | urls_per_sec=0.46 | success_ratio=2.607 | timeout_ratio=0.214
-2026-04-24 20:51:25,671 | INFO | Hashing progress | hash_finalized=33/114 | deep_attempted=0 | ok=77 | fail=23 | tout=10 | final_matches=0 | gpu_batches=73 | gpu_items=77 | gpu_queue=0 | active_fetch_limit=16 | avg_gpu_batch=1.05 | urls_per_sec=0.43 | success_ratio=2.333 | timeout_ratio=0.303
-2026-04-24 20:51:38,393 | INFO | RDAP metrics | requests=0 success=0 fallback=0 exception=0 cache_hit=0 inflight_wait=0 cooldown_hit=0
-2026-04-24 20:51:38,394 | INFO | Hashing shortlist completed | deep_attempted=0 | hash_finalized=37 | hashed_success=77 | fetch_failed=24 | fetch_timed_out=13 | final_matches_total=0 | gpu_batches=73 | gpu_items=77 | avg_gpu_batch=1.1 | urls_per_sec=0.42 | threshold=58.0 | elapsed=88.7s
-2026-04-24 20:51:38,394 | INFO | Anchor summary (shortlisted) | typo_anchor=38 | hash_anchor=1 | shortlisted=77
-2026-04-24 20:51:38,396 | INFO | Typo similarity summary (shortlisted) | min=0.3000 | avg=0.7013 | p95=0.8935 | max=1.0000 | typo_min_score=0.7500
-2026-04-24 20:51:38,412 | INFO | Stage2 hash exports written to C:\Users\sathwik.kusuri\Documents\phishing_ml\output\hash_folder (1 files)
-2026-04-24 20:51:38,436 | INFO | Stage0 lexical decisions CSV written to C:\Users\sathwik.kusuri\Documents\phishing_ml\output\runs\run_20260424T151533Z\stage0\stage0_lexical_decisions.csv with 308 rows
+2026-04-25 10:40:11,529 | INFO | Hashing shortlist (lexical-only) started | urls=308 | threshold=58.0 | domain_similarity_threshold=0.800 | high_confidence_threshold=78.00 | medium_confidence_threshold=68.00 | typo_top_k=10 | typo_min_score=0.750 | lexical_pass_min_score=0.850
+2026-04-25 10:40:11,530 | INFO | Scoring weights | domain=30, favicon=14, ssl_hash=12, html_hash=6, domain_hash=8, keywords=10
+2026-04-25 10:40:11,530 | INFO | Hashing log file: c:\Users\sathwik.kusuri\Documents\phishing_ml\output\runs\run_20260424T151533Z\hash\hashing_shortlist.log
+2026-04-25 10:40:11,531 | INFO | Stage0 lexical runtime | input_urls=308 | metric_urls=308 | workers=8 | batch_size=256 | inflight_batches=8 | progress_interval_s=1.0
+2026-04-25 10:40:11,531 | INFO | Stage0 lexical executor | kind=thread | workers=8 | shortlist_execution_mode=legacy-batch
+2026-04-25 10:40:15,394 | INFO | Stage0 lexical gate completed | processed=308/308 | rate=88.3 url/s | elapsed=3.5s | hits=138 | misses=170 | skipped=0 | workers=8 | metric_urls=308 | batches=2/2 | avg_batch_latency_ms=236.0
+2026-04-25 10:40:15,394 | INFO | Lexical-only shortlist routing | lexical_hits=138 | lexical_misses=170 | hash_candidates=113 | dns_passthrough=25
+2026-04-25 10:40:30,451 | INFO | Hashing progress | hash_finalized=12/113 | deep_attempted=0 | ok=27 | fail=12 | tout=0 | final_matches=0 | gpu_batches=23 | gpu_items=27 | gpu_queue=0 | active_fetch_limit=16 | avg_gpu_batch=1.17 | urls_per_sec=0.80 | success_ratio=2.250 | timeout_ratio=0.000
+2026-04-25 10:40:45,587 | INFO | Hashing progress | hash_finalized=17/113 | deep_attempted=0 | ok=49 | fail=17 | tout=0 | final_matches=0 | gpu_batches=42 | gpu_items=49 | gpu_queue=0 | active_fetch_limit=16 | avg_gpu_batch=1.17 | urls_per_sec=0.56 | success_ratio=2.882 | timeout_ratio=0.000
+2026-04-25 10:41:01,164 | INFO | Hashing progress | hash_finalized=24/113 | deep_attempted=0 | ok=76 | fail=22 | tout=2 | final_matches=0 | gpu_batches=68 | gpu_items=76 | gpu_queue=0 | active_fetch_limit=16 | avg_gpu_batch=1.12 | urls_per_sec=0.52 | success_ratio=3.167 | timeout_ratio=0.083
+2026-04-25 10:41:16,411 | INFO | Hashing progress | hash_finalized=27/113 | deep_attempted=0 | ok=83 | fail=24 | tout=3 | final_matches=0 | gpu_batches=74 | gpu_items=83 | gpu_queue=0 | active_fetch_limit=16 | avg_gpu_batch=1.12 | urls_per_sec=0.44 | success_ratio=3.074 | timeout_ratio=0.111
+2026-04-25 10:41:28,597 | INFO | RDAP metrics | requests=0 success=0 fallback=0 exception=0 cache_hit=0 inflight_wait=0 cooldown_hit=0
+2026-04-25 10:41:28,598 | INFO | Hashing shortlist completed | deep_attempted=0 | hash_finalized=30 | hashed_success=83 | fetch_failed=25 | fetch_timed_out=5 | final_matches_total=0 | gpu_batches=74 | gpu_items=83 | avg_gpu_batch=1.1 | urls_per_sec=0.41 | threshold=58.0 | elapsed=73.2s
+2026-04-25 10:41:28,598 | INFO | Anchor summary (shortlisted) | typo_anchor=39 | hash_anchor=1 | shortlisted=83
+2026-04-25 10:41:28,600 | INFO | Typo similarity summary (shortlisted) | min=0.3000 | avg=0.6995 | p95=0.8871 | max=1.0000 | typo_min_score=0.7500
+2026-04-25 10:41:28,633 | INFO | Stage2 hash exports written to c:\Users\sathwik.kusuri\Documents\phishing_ml\output\hash_folder (1 files)
+2026-04-25 10:41:28,664 | INFO | Stage0 lexical decisions CSV written to c:\Users\sathwik.kusuri\Documents\phishing_ml\output\runs\run_20260424T151533Z\stage0\stage0_lexical_decisions.csv with 308 rows

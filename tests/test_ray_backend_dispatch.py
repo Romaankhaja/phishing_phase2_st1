@@ -6,7 +6,8 @@ from unittest import mock
 import pandas as pd
 
 import main_controller
-from phishing_pipeline import comparison, pipeline
+from phishing_pipeline import _comparison_legacy as comparison
+from phishing_pipeline import _pipeline_legacy as pipeline
 from phishing_pipeline.config import resolve_ray_runtime_config
 from tests._workspace_temp import workspace_tempdir
 

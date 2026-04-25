@@ -166,20 +166,19 @@ class StageModuleImportTests(unittest.TestCase):
         self.assertTrue(callable(outputs._submission_record_columns))
         self.assertTrue(callable(orchestration.run_pipeline))
 
-    def test_legacy_facades_alias_original_module_objects(self):
-        import phishing_pipeline.comparison as comparison
-        import phishing_pipeline.pipeline as pipeline
-        import phishing_pipeline.shortlisting as shortlisting
+    def test_legacy_modules_remain_importable_without_public_facades(self):
         import phishing_pipeline._comparison_legacy as comparison_legacy
         import phishing_pipeline._pipeline_legacy as pipeline_legacy
         import phishing_pipeline._shortlisting_legacy as shortlisting_legacy
 
-        self.assertIs(comparison, comparison_legacy)
-        self.assertIs(pipeline, pipeline_legacy)
-        self.assertIs(shortlisting, shortlisting_legacy)
+        self.assertTrue(callable(comparison_legacy.run_hashing_shortlist_async))
+        self.assertTrue(callable(pipeline_legacy.run_pipeline))
+        self.assertTrue(callable(shortlisting_legacy.run_shortlisting_process))
 
     def test_scoring_and_output_schema_parity(self):
-        from phishing_pipeline import comparison, outputs, pipeline, scoring
+        from phishing_pipeline import _comparison_legacy as comparison
+        from phishing_pipeline import _pipeline_legacy as pipeline
+        from phishing_pipeline import outputs, scoring
 
         self.assertEqual(
             comparison._resolve_scoring_config(),
