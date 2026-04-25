@@ -712,6 +712,201 @@ async def main():
             if os.path.isdir(evidence_dir):
                 shutil.rmtree(evidence_dir, ignore_errors=True)
                 logger.info("🧹 Cleared previous evidence directory: %s", evidence_dir)
+    effective_progress_mode = resolve_progress_mode(
+        requested_progress_mode,
+        execution_backend=execution_backend,
+    )
+    logger.info(
+        "Reliability run context | run_id=%s | resume=%s | force_reprocess=%s | manifest=%s | checkpoints=%s | stall_threshold_seconds=%d",
+        run_context.run_id,
+        resuming_existing_run,
+        args.force_reprocess,
+        get_run_artifact_path(run_context, "run_manifest_csv"),
+        get_run_artifact_path(run_context, "checkpoints_csv"),
+        run_context.stall_threshold_seconds,
+    )
+    logger.info(
+        "Progress mode requested=%s resolved=%s | backend=%s | stderr_tty=%s",
+        requested_progress_mode,
+        effective_progress_mode,
+        execution_backend,
+        sys.stderr.isatty(),
+    )
+
+    def _load_checkpoint_store_for_finalize():
+        store = checkpoint_store
+        if store is not None:
+            return store, False
+        store = CheckpointStore(run_context)
+        return store, True
+
+    _apply_runtime_profile_env(runtime_profile_settings)
+
+    components = _load_runtime_components()
+    final_output = components["FINAL_OUTPUT"]
+    close_browser = components["close_browser"]
+    run_pipeline = components["run_pipeline"]
+    package_results = components["package_results"]
+    shortlisting = components["shortlisting"]
+    run_hashing_shortlist_async = components["run_hashing_shortlist_async"]
+    ray_runtime = None
+    ray_runtime_config = {}
+    HashBrowserPreflightError = None
+    if execution_backend == "ray":
+        from phishing_pipeline import ray_runtime as ray_runtime
+        from phishing_pipeline.config import resolve_ray_runtime_config
+        from phishing_pipeline.ray_runtime import HashBrowserPreflightError
+        ray_runtime_config = resolve_ray_runtime_config()
+    effective_runtime_snapshot = {
+        "requested_progress_mode": requested_progress_mode,
+        "effective_progress_mode": effective_progress_mode,
+        "execution_backend": execution_backend,
+        "runtime_profile": runtime_profile_settings,
+        "telemetry_mode": args.telemetry_mode,
+        "trace_record_key": str(args.trace_record_key or ""),
+        "trace_url": str(args.trace_url or ""),
+    }
+    effective_runtime_snapshot["ray_runtime_config"] = dict(ray_runtime_config or {})
+    write_run_artifact_json(
+        run_context,
+        "effective_args_json",
+        {
+            "args": vars(args),
+            "run_id": run_context.run_id,
+            "run_output_dir": run_context.run_output_dir,
+            "latest_output_dir": run_context.latest_output_dir,
+        },
+        best_effort=True,
+    )
+    write_run_artifact_json(
+        run_context,
+        "effective_runtime_json",
+        effective_runtime_snapshot,
+        best_effort=True,
+    )
+    if checkpoint_store is not None:
+        checkpoint_store.update_manifest(
+            metadata_json={**reliability_metadata, "effective_runtime_snapshot": effective_runtime_snapshot}
+        )
+    effective_shortlist_debug_csv = get_run_artifact_path(
+        run_context,
+        "stage0_lexical_decisions_csv",
+        args.shortlist_debug_csv,
+    )
+    canonical_holdout_csv = get_run_artifact_path(
+        run_context,
+        "holdout_csv",
+        os.path.join("output", "holdout.csv"),
+    )
+    logger.info(
+        "Run artifact roots | run_id=%s | run_output_dir=%s | latest_output_dir=%s",
+        run_context.run_id,
+        run_context.run_output_dir,
+        run_context.latest_output_dir,
+    )
+    # --- Ray debug startup diagnostic ---
+    if getattr(args, "ray_debug", False) and execution_backend == "ray":
+        resource_info = _probe_runtime_resources()
+        ray_cfg = dict(ray_runtime_config or {})
+        actor_cpu_total = (
+            ray_cfg["hash_browser_actors"] * 0.5
+            + ray_cfg["classify_actors"] * 1.0
+            + ray_cfg.get("ocr_actors", 1) * 1.0
+        )
+        logger.info("\n" + "-" * 70)
+        logger.info("[RAY-DEBUG] STARTUP DIAGNOSTIC")
+        logger.info("  Physical CPUs:     %d", resource_info["cpu_cores"])
+        logger.info("  System RAM:        %.1f GB", resource_info["ram_gb"])
+        logger.info("  GPU VRAM:          %.1f GB", resource_info["vram_gb"])
+        logger.info("  Actor CPU demand:  %.1f  (browser=%d*0.5 + classify=%d*1.0 + ocr=%d*1.0)",
+            actor_cpu_total,
+            ray_cfg["hash_browser_actors"],
+            ray_cfg["classify_actors"],
+            ray_cfg.get("ocr_actors", 1),
+        )
+        logger.info("  Task CPU per call: 0.5  (stage0_batch, hash_enrich, hash_finalize)")
+        logger.info("  Headroom:          %.1f CPUs  (%s)",
+            resource_info["cpu_cores"] - actor_cpu_total,
+            "✅ OK" if resource_info["cpu_cores"] > actor_cpu_total else "🛑 RISK OF DEADLOCK",
+        )
+        logger.info("  Memory mode:       %s",
+            "very_low" if ray_cfg.get("very_low_memory_mode") else
+            "low" if ray_cfg.get("low_memory_mode") else
+            "critical" if ray_cfg.get("critical_memory_mode") else "normal",
+        )
+        logger.info("-" * 70 + "\n")
+
+    if args.high_confidence_threshold < args.medium_confidence_threshold:
+        raise ValueError("high-confidence-threshold must be >= medium-confidence-threshold")
+    if (
+        args.failed_fetch_suspected_min is not None
+        and args.failed_fetch_review_min is not None
+        and args.failed_fetch_suspected_min < args.failed_fetch_review_min
+    ):
+        raise ValueError("failed-fetch-suspected-min must be >= failed-fetch-review-min")
+    logger.info(
+        "Runtime profile requested=%s resolved=%s | host={cpu=%s,ram_gb=%.1f,vram_gb=%.1f,platform=%s} | ray={browser_actors=%s,classify_actors=%s,stage0_inflight=%s,prewarm=%s,dynamic_control=%s}",
+        runtime_profile_settings["requested_profile"],
+        runtime_profile_settings["resolved_profile"],
+        runtime_profile_settings["resource_info"].get("cpu_cores", "NA"),
+        float(runtime_profile_settings["resource_info"].get("ram_gb", 0.0) or 0.0),
+        float(runtime_profile_settings["resource_info"].get("vram_gb", 0.0) or 0.0),
+        runtime_profile_settings["resource_info"].get("platform", "unknown"),
+        (ray_runtime_config or {}).get("hash_browser_actors", "NA"),
+        (ray_runtime_config or {}).get("classify_actors", "NA"),
+        (ray_runtime_config or {}).get("stage0_inflight", "NA"),
+        (ray_runtime_config or {}).get("prewarm_mode", "NA"),
+        (ray_runtime_config or {}).get("enable_dynamic_control", "NA"),
+    )
+    logger.info(
+        "Effective runtime concurrency | hash={pages=%s,page_concurrency=%s,http_limit=%s,aux_net_limit=%s,active_fetch_floor=%s}",
+        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_PAGES", "NA"),
+        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_PAGE_CONCURRENCY", "NA"),
+        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_HTTP_LIMIT", "NA"),
+        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_AUX_NET_LIMIT", "NA"),
+        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_ACTIVE_PAGES_FLOOR", "NA"),
+    )
+    logger.info(
+        "Hash stage topology | pages=%s | shard_workers=%s | shards=auto | http_limit=%s | aux_net_limit=%s | active_pages_floor=%s",
+        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_PAGES", "NA"),
+        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_PAGE_CONCURRENCY", "NA"),
+        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_HTTP_LIMIT", "NA"),
+        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_AUX_NET_LIMIT", "NA"),
+        runtime_profile_settings.get("env", {}).get("PHISHING_HASH_ACTIVE_PAGES_FLOOR", "NA"),
+    )
+    logger.info(
+        "Strict attempt policy | checkpoint_mode=csv | retries={rdap=0,tls=0,hash=0,classify=0}"
+    )
+
+    # ✅ Ensure whitelist file exists
+    if not os.path.exists(args.whitelist):
+        logger.error("Whitelist file '%s' not found", args.whitelist)
+        raise FileNotFoundError(f"Whitelist file '{args.whitelist}' not found")
+
+    # ✅ Ensure shortlisting folder exists
+    if not os.path.exists(args.shortlisting):
+        logger.error("Shortlisting folder '%s' not found", args.shortlisting)
+        raise FileNotFoundError(f"Shortlisting folder '{args.shortlisting}' not found")
+
+    fatal_stage = "controller_startup"
+    try:
+        # 🧹 Clear GPU memory at the start of every run
+        if execution_backend == "ray" and ray_runtime is not None:
+            ray_runtime.ensure_ray_initialized()
+        clear_gpu_memory()
+
+        if resuming_existing_run:
+            logger.info("Resuming existing compatible run. Output cleanup is skipped for run_id=%s", run_context.run_id)
+        else:
+            # Preserve resumable artifacts unless this is a fresh run.
+            import shutil
+            import glob
+
+            evidence_dir = os.path.join("phishing_pipeline", "PS-02_ISS_NLP_Evidences")
+            packaged_submission_dir = os.path.join("output", "PS-02_ISS_NLP_Submission")
+            if os.path.isdir(evidence_dir):
+                shutil.rmtree(evidence_dir, ignore_errors=True)
+                logger.info("🧹 Cleared previous evidence directory: %s", evidence_dir)
             if os.path.isdir(packaged_submission_dir):
                 shutil.rmtree(packaged_submission_dir, ignore_errors=True)
                 logger.info("🧹 Cleared stale packaged submission directory: %s", packaged_submission_dir)
@@ -719,28 +914,11 @@ async def main():
                 os.remove(xlsx)
                 logger.info("🧹 Removed old submission xlsx: %s", xlsx)
 
-            cleanup_patterns = [
-                os.path.join("output", "*.zip"),
-                os.path.join("output", "output_file.csv"),
-                os.path.join("output", "output_file_filtered.csv"),
-                os.path.join("output", "hash_review_queue.csv"),
-                os.path.join("output", "dns_gate_audit.csv"),
-                os.path.join("output", "dns_rejected_lexical_hits.csv"),
-                os.path.join("output", "parked_page_exclusions.csv"),
-                os.path.join("output", "stage0_lexical_decisions.csv"),
-                os.path.join("output", "stage2_model_debug.csv"),
-                os.path.join("output", "stage3_classification_debug.csv"),
-            ]
-            if args.stage_smoke_test != "classify":
-                cleanup_patterns.append(os.path.join("output", "holdout.csv"))
-            for pattern in cleanup_patterns:
-                for f in glob.glob(pattern):
-                    os.remove(f)
-                    logger.info("🧹 Removed old output: %s", f)
-            legacy_checkpoint_dir = os.path.join("output", "checkpoints")
-            if os.path.isdir(legacy_checkpoint_dir):
-                shutil.rmtree(legacy_checkpoint_dir, ignore_errors=True)
-                logger.info("Removed obsolete checkpoint folder: %s", legacy_checkpoint_dir)
+            try:
+                from phishing_pipeline.outputs import cleanup_fresh_run_outputs
+                cleanup_fresh_run_outputs(args.stage_smoke_test)
+            except Exception as e:
+                logger.warning("Failed to run external cleanup_fresh_run_outputs: %s", e)
 
         logger.info("Using whitelist file: %s", args.whitelist)
         logger.info("Using shortlisting folder: %s", args.shortlisting)
@@ -1025,6 +1203,13 @@ async def main():
                 ray_runtime.shutdown_ray_runtime()
             except Exception as exc:
                 logger.warning("Ray shutdown failed: %s", exc)
+                
+        # 🧹 Output folder limits cleanup
+        try:
+            from phishing_pipeline.outputs import enforce_output_limits
+            enforce_output_limits()
+        except Exception as exc:
+            logger.warning("Output limits cleanup failed: %s", exc)
 
 
 if __name__ == "__main__":
