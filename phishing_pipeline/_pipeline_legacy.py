@@ -1362,9 +1362,8 @@ def _hybrid_hash_decision(
 ):
     lexical_rule_hit = _as_bool_flag(row.get("lexical_rule_hit"))
     brand_token_hit = _as_bool_flag(row.get("brand_token_hit"))
-    old_fuzzy_hit = _as_bool_flag(row.get("old_fuzzy_hit"))
     hybrid_lexical_hit = _as_bool_flag(row.get("hybrid_lexical_hit"))
-    strict_lexical_hit = _as_bool_flag(row.get("strict_lexical_hit")) or lexical_rule_hit or brand_token_hit or old_fuzzy_hit or hybrid_lexical_hit
+    strict_lexical_hit = _as_bool_flag(row.get("strict_lexical_hit")) or lexical_rule_hit or brand_token_hit or hybrid_lexical_hit
     lexical_score_pass = _as_bool_flag(row.get("lexical_score_pass"))
     fallback_rank_only = _as_bool_flag(row.get("fallback_rank_only"))
     fetch_status = str(row.get("fetch_status", "fetched") or "fetched").strip().lower()
@@ -1915,7 +1914,6 @@ async def _run_hash_only_pipeline(
                         "evidence_tier": evidence_tier,
                         "lexical_score": row.get("lexical_score", 0.0),
                         "hash_score": row.get("hash_score", 0.0),
-                        "old_fuzzy_hit": row.get("old_fuzzy_hit", False),
                         "hybrid_lexical_hit": row.get("hybrid_lexical_hit", False),
                         "strict_lexical_hit": row.get("strict_lexical_hit", False),
                         "lexical_score_pass": row.get("lexical_score_pass", False),
@@ -2145,7 +2143,6 @@ async def _run_hash_only_pipeline(
                         "evidence_tier": row.get("evidence_tier", ""),
                         "lexical_score": row.get("lexical_score", 0.0),
                         "hash_score": row.get("hash_score", 0.0),
-                        "old_fuzzy_hit": row.get("old_fuzzy_hit", False),
                         "hybrid_lexical_hit": row.get("hybrid_lexical_hit", False),
                         "strict_lexical_hit": row.get("strict_lexical_hit", False),
                         "lexical_score_pass": row.get("lexical_score_pass", False),
@@ -2428,7 +2425,6 @@ async def _run_hash_only_pipeline(
                     "evidence_tier": evidence_tier,
                     "lexical_score": row.get("lexical_score", 0.0),
                     "hash_score": row.get("hash_score", 0.0),
-                    "old_fuzzy_hit": row.get("old_fuzzy_hit", False),
                     "hybrid_lexical_hit": row.get("hybrid_lexical_hit", False),
                     "strict_lexical_hit": row.get("strict_lexical_hit", False),
                     "lexical_score_pass": row.get("lexical_score_pass", False),

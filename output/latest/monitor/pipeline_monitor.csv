@@ -2479,3 +2479,11 @@ The above exception was the direct cause of the following exception:
 RuntimeError: EasyOCR initialization failed: [WinError 1114] A dynamic link library (DLL) initialization routine failed. Error loading ""C:\Users\sathwik.kusuri\Documents\phishing_ml\venv\Lib\site-packages\torch\lib\c10.dll"" or one of its dependencies.",{}
 run_20260424T151533Z,2026-04-25T08:59:40+00:00,run,,run_start,running,,,,,,,,,,,,,,,,,,,,,,,{}
 run_20260424T151533Z,2026-04-25T10:03:55+00:00,run,,run_end,failed,,,,,,,,,,,,,,,,,,,,,,[WinError 233] No process is on the other end of the pipe,{}
+run_20260424T151533Z,2026-04-25T10:04:03+00:00,run,,run_start,running,,,,,,,,,,,,,,,,,,,,,,,{}
+run_20260424T151533Z,2026-04-25T10:09:02+00:00,run,,run_end,failed,,,,,,,,,,,,,,,,,,,,,,[WinError 233] No process is on the other end of the pipe,{}
+run_20260424T151533Z,2026-04-25T13:08:15+00:00,run,,run_start,running,,,,,,,,,,,,,,,,,,,,,,,{}
+run_20260424T151533Z,2026-04-25T13:14:56+00:00,run,,run_end,failed,,,,,,,,,,,,,,,,,,,,,,[WinError 233] No process is on the other end of the pipe,{}
+run_20260424T151533Z,2026-04-25T13:41:34+00:00,run,,run_start,running,,,,,,,,,,,,,,,,,,,,,,,{}
+run_20260424T151533Z,2026-04-25T13:54:41+00:00,run,,run_end,failed,,,,,,,,,,,,,,,,,,,,,,[WinError 233] No process is on the other end of the pipe,{}
+run_20260424T151533Z,2026-04-25T14:06:41+00:00,run,,run_start,running,,,,,,,,,,,,,,,,,,,,,,,{}
+run_20260424T151533Z,2026-04-25T14:14:31+00:00,run,,run_end,failed,,,,,,,,,,,,,,,,,,,,,,[WinError 233] No process is on the other end of the pipe,{}

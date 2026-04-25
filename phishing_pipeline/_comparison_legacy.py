@@ -10,16 +10,10 @@ import httpx
 import dns.asyncresolver
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from collections import Counter
-from difflib import SequenceMatcher
 from functools import partial
 from typing import Any, NamedTuple
 from urllib.parse import urlparse
 import asyncio
-try:
-    import jellyfish
-except Exception:
-    jellyfish = None
-from rapidfuzz import fuzz
 from rapidfuzz.fuzz import ratio
 import numpy as np
 import csv
@@ -57,10 +51,7 @@ from .reliability import (
     stage_result_patch,
     utc_now_iso,
 )
-from ._shortlisting_legacy import (
-    normalize_url as _legacy_normalize_url,
-    get_primary_part as _legacy_get_primary_part,
-)
+from . import stage0_new_lexical as _stage0_new_lexical
 
 try:
     import aiohttp
@@ -93,30 +84,6 @@ _GENERIC_SERVICE_TOKENS = {
     "service",
     "bank",
     "retail",
-}
-_SHORT_BRAND_SUFFIX_HINTS = {
-    "account",
-    "bank",
-    "card",
-    "cards",
-    "gov",
-    "kyc",
-    "login",
-    "netbanking",
-    "online",
-    "pay",
-    "payment",
-    "payments",
-    "portal",
-    "reward",
-    "rewards",
-    "secure",
-    "service",
-    "sewa",
-    "upi",
-    "verification",
-    "verify",
-    "wallet",
 }
 _GENERIC_ENTITY_NAME_TOKENS = {
     "authority",
@@ -1869,7 +1836,6 @@ def _has_high_risk_prefetch_lexical_seed(
 
     strict_lexical_hit = bool(prefetch_metrics.get("strict_lexical_hit", False))
     lexical_score_pass = bool(prefetch_metrics.get("lexical_score_pass", False))
-    old_fuzzy_hit = bool(prefetch_metrics.get("old_fuzzy_hit", False))
     try:
         best_lexical_score = float(prefetch_metrics.get("best_lexical_score", 0.0) or 0.0)
     except (TypeError, ValueError):
@@ -1886,7 +1852,6 @@ def _has_high_risk_prefetch_lexical_seed(
     return bool(
         strict_lexical_hit
         or lexical_score_pass
-        or old_fuzzy_hit
         or (typo_anchor and best_lexical_score >= lexical_rescue_floor)
     )
 
@@ -1965,8 +1930,6 @@ def _build_prefetch_decision_row(
         "placeholder_or_parking_reason": str(parking_reason or ""),
         "source_workbook": str(prefetch_metrics.get("source_workbook", "") or ""),
         "admitted": False,
-        "old_fuzzy_hit": bool(prefetch_metrics.get("old_fuzzy_hit", False)),
-        "old_fuzzy_cse": prefetch_metrics.get("old_fuzzy_cse", ""),
         "hybrid_lexical_hit": bool(prefetch_metrics.get("hybrid_lexical_hit", False)),
         "strict_lexical_hit": strict_lexical_hit,
         "lexical_score_pass": lexical_score_pass,
@@ -2098,8 +2061,6 @@ def _empty_shortlist_df():
             "dominant_signal_family",
             "survival_path",
             "drop_path",
-            "old_fuzzy_hit",
-            "old_fuzzy_cse",
             "hybrid_lexical_hit",
             "strict_lexical_hit",
             "lexical_score_pass",
@@ -2144,321 +2105,29 @@ def _empty_shortlist_df():
         ]
     )
 
-
-def _legacy_fuzzy_similarity_score(candidate_primary: str, legit_primary: str) -> float:
-    if not candidate_primary or not legit_primary:
-        return 0.0
-    try:
-        jw_score = float(jellyfish.jaro_winkler_similarity(candidate_primary, legit_primary)) if jellyfish is not None else 0.0
-    except Exception:
-        jw_score = 0.0
-    try:
-        token_score = float(fuzz.token_set_ratio(candidate_primary, legit_primary)) / 100.0
-    except Exception:
-        token_score = 0.0
-    return max(jw_score, token_score)
-
-
 def _prepare_target_lexical_features(value: str) -> "_TargetLexicalFeatures":
     normalized_url = normalize_url(str(value or "").strip())
     parsed = urlparse(normalized_url)
     target_domain = parsed.netloc.lower() or normalized_url.lower()
-    ext = _extract_tld(target_domain)
-    target_primary = _domain_label_skeleton(ext.domain)
-    target_host = _domain_label_skeleton(".".join(part for part in [ext.subdomain, ext.domain] if part))
-    legacy_normalized = _legacy_normalize_url(target_domain)
     return _TargetLexicalFeatures(
         normalized_url=normalized_url,
         target_domain=target_domain,
-        primary=target_primary,
-        compact_primary=_compact_lexical_label(target_primary),
-        raw_primary=_compact_lexical_label(ext.domain),
-        host=target_host,
-        first_host_label=_first_host_label_for_similarity(target_domain),
-        suffix=str(ext.suffix or "").strip().lower(),
-        registered_domain=_registered_domain(target_domain),
-        brand_tokens=frozenset(_extract_brand_tokens(target_domain)),
-        primary_generic=_is_generic_service_token(target_primary),
-        legacy_normalized=legacy_normalized,
-        legacy_primary=_legacy_get_primary_part(legacy_normalized),
     )
-
-
-def _legacy_is_similar_from_features(
-    target_features: "_TargetLexicalFeatures",
-    domain_features: "_LexicalDomainFeatures",
-    entity_features: "_LexicalEntityFeatures | None" = None,
-) -> bool:
-    if not target_features.legacy_primary or not domain_features.legacy_primary:
-        return False
-    if target_features.legacy_normalized == domain_features.legacy_normalized:
-        return False
-    if not _has_substantive_lexical_anchor(target_features, domain_features, entity_features):
-        return False
-    try:
-        if jellyfish.jaro_winkler_similarity(target_features.legacy_primary, domain_features.legacy_primary) >= 0.85:
-            return True
-    except Exception:
-        pass
-    try:
-        if fuzz.token_set_ratio(target_features.legacy_primary, domain_features.legacy_primary) >= 90:
-            return True
-    except Exception:
-        pass
-    return False
-
-
-def _typosquat_similarity_from_features(
-    target_features: "_TargetLexicalFeatures",
-    domain_features: "_LexicalDomainFeatures",
-) -> float:
-    if not target_features.primary or not domain_features.normalized_primary:
-        return 0.0
-    if target_features.primary == domain_features.normalized_primary:
-        return 1.0
-
-    sim_primary = ratio(target_features.primary, domain_features.normalized_primary) / 100.0
-    sim_host = (
-        ratio(target_features.host, domain_features.normalized_host) / 100.0
-        if target_features.host and domain_features.normalized_host
-        else 0.0
-    )
-    sim = max(sim_primary, sim_host)
-    if target_features.suffix and target_features.suffix == domain_features.suffix:
-        sim = min(1.0, sim + 0.03)
-    return float(sim)
 
 
 def _evaluate_prefetch_lexical_bundle(
     target_features: "_TargetLexicalFeatures",
     *,
     top_k: int | None = None,
-    lexical_cache: "tuple[_LexicalEntityFeatures, ...] | None" = None,
+    lexical_cache: "tuple[Any, ...] | None" = None,
 ) -> dict:
     cache = lexical_cache or _active_lexical_cache()
-    n_entities = len(cache)
-    if n_entities == 0:
-        empty_scores = np.zeros(0, dtype="float64")
-        empty_mask = np.zeros(0, dtype=bool)
-        return {
-            "hybrid_metrics": {
-                "lexical_scores": empty_scores,
-                "jw_scores": empty_scores,
-                "token_scores": empty_scores,
-                "skeleton_scores": empty_scores,
-                "host_scores": empty_scores,
-                "lexical_rule_hit": empty_mask,
-                "brand_token_hit": empty_mask,
-                "generic_token_only_match": empty_mask,
-                "candidate_mask": empty_mask,
-                "candidate_reasons": [],
-                "best_matching_domains": [],
-            },
-            "legacy_metrics": {
-                "old_fuzzy_hit": False,
-                "old_fuzzy_cse": "",
-                "old_fuzzy_domain": "",
-                "old_fuzzy_score": 0.0,
-            },
-        }
-
-    lexical_scores = np.zeros(n_entities, dtype="float64")
-    jw_scores = np.zeros(n_entities, dtype="float64")
-    token_scores = np.zeros(n_entities, dtype="float64")
-    skeleton_scores = np.zeros(n_entities, dtype="float64")
-    host_scores = np.zeros(n_entities, dtype="float64")
-    lexical_rule_hit = np.zeros(n_entities, dtype=bool)
-    brand_token_hit = np.zeros(n_entities, dtype=bool)
-    generic_token_only_match = np.zeros(n_entities, dtype=bool)
-    candidate_mask = np.zeros(n_entities, dtype=bool)
-    candidate_reasons = [""] * n_entities
-    best_matching_domains = [""] * n_entities
-
-    legacy_best_entity = ""
-    legacy_best_domain = ""
-    legacy_best_score = 0.0
-    legacy_best_hit = False
-
-    for idx, entity_features in enumerate(cache):
-        best_reason_parts = []
-        if _has_anchored_brand_token_hit(target_features, entity_features):
-            brand_token_hit[idx] = True
-            lexical_rule_hit[idx] = True
-            best_reason_parts.append("brand_token_match")
-
-        best_jw = 0.0
-        best_token = 0.0
-
-        best_jw = 0.0
-        best_token = 0.0
-        best_skeleton = 0.0
-        best_host = 0.0
-        best_lexical = 0.0
-        best_domain_reasons = []
-        best_matching_domain = ""
-        best_domain_primary_generic = False
-
-        for domain_features in entity_features.domains:
-            # Inline legacy score calculations
-            legacy_jw = 0.0
-            legacy_token = 0.0
-            if target_features.legacy_primary and domain_features.legacy_primary:
-                try:
-                    legacy_jw = float(jellyfish.jaro_winkler_similarity(target_features.legacy_primary, domain_features.legacy_primary)) if jellyfish is not None else 0.0
-                except Exception:
-                    pass
-                try:
-                    legacy_token = float(fuzz.token_set_ratio(target_features.legacy_primary, domain_features.legacy_primary)) / 100.0
-                except Exception:
-                    pass
-
-            legacy_score = max(legacy_jw, legacy_token)
-            
-            is_legacy_hit = False
-            if target_features.legacy_primary and domain_features.legacy_primary and target_features.legacy_normalized != domain_features.legacy_normalized:
-                if _has_substantive_lexical_anchor(target_features, domain_features, entity_features):
-                    is_legacy_hit = (legacy_jw >= 0.85) or (legacy_token >= 0.90)
-
-            if is_legacy_hit and (not legacy_best_hit or legacy_score > legacy_best_score):
-                legacy_best_entity = entity_features.name
-                legacy_best_domain = domain_features.domain
-                legacy_best_score = legacy_score
-                legacy_best_hit = True
-            elif not legacy_best_hit and legacy_score > legacy_best_score:
-                legacy_best_entity = entity_features.name
-                legacy_best_domain = domain_features.domain
-                legacy_best_score = legacy_score
-
-            entity_primary = domain_features.normalized_primary
-            entity_host = domain_features.normalized_host
-            entity_primary_generic = domain_features.primary_generic
-            substantive_anchor = _has_substantive_lexical_anchor(
-                target_features,
-                domain_features,
-                entity_features,
-            )
-            allow_primary_string_rules = bool(
-                target_features.primary
-                and entity_primary
-                and not target_features.primary_generic
-                and not entity_primary_generic
-                and substantive_anchor
-            )
-
-            # Deduplicate string similarity using exact-match short-circuits and legacy caching
-            if target_features.primary and entity_primary:
-                if target_features.primary == entity_primary:
-                    jw_score = 1.0
-                    token_score = 1.0
-                elif target_features.primary == target_features.legacy_primary and entity_primary == domain_features.legacy_primary:
-                    jw_score = legacy_jw
-                    token_score = legacy_token
-                else:
-                    try:
-                        jw_score = float(jellyfish.jaro_winkler_similarity(target_features.primary, entity_primary)) if jellyfish is not None else 0.0
-                    except Exception:
-                        jw_score = 0.0
-                    try:
-                        token_score = float(fuzz.token_set_ratio(target_features.primary, entity_primary)) / 100.0
-                    except Exception:
-                        token_score = 0.0
-            else:
-                jw_score = 0.0
-                token_score = 0.0
-
-            # Deduplicate Levenshtein ratios
-            host_score = 0.0
-            if target_features.host and entity_host:
-                if target_features.host == entity_host:
-                    host_score = 1.0
-                else:
-                    host_score = float(ratio(target_features.host, entity_host)) / 100.0
-
-            sim_primary = 0.0
-            if target_features.primary and domain_features.normalized_primary:
-                if target_features.primary == domain_features.normalized_primary:
-                    sim_primary = 1.0
-                else:
-                    sim_primary = float(ratio(target_features.primary, domain_features.normalized_primary)) / 100.0
-
-            skeleton_score = max(sim_primary, host_score)
-            if target_features.suffix and target_features.suffix == domain_features.suffix:
-                skeleton_score = min(1.0, skeleton_score + 0.03)
-
-            lexical_score = max(jw_score, token_score, skeleton_score, host_score)
-
-            if lexical_score > best_lexical:
-                best_lexical = lexical_score
-                best_jw = jw_score
-                best_token = token_score
-                best_skeleton = skeleton_score
-                best_host = host_score
-                best_domain_reasons = []
-                best_matching_domain = domain_features.domain
-                best_domain_primary_generic = entity_primary_generic
-                if allow_primary_string_rules and jw_score >= 0.85:
-                    best_domain_reasons.append("jw_primary")
-                if allow_primary_string_rules and token_score >= 0.90:
-                    best_domain_reasons.append("token_set_primary")
-                if allow_primary_string_rules and skeleton_score >= 0.88:
-                    best_domain_reasons.append("skeleton_similarity")
-                if entity_features.brand_tokens and substantive_anchor and host_score >= 0.90:
-                    best_domain_reasons.append("host_similarity")
-
-        lexical_scores[idx] = best_lexical
-        jw_scores[idx] = best_jw
-        token_scores[idx] = best_token
-        skeleton_scores[idx] = best_skeleton
-        host_scores[idx] = best_host
-        best_matching_domains[idx] = best_matching_domain
-
-        if best_domain_reasons:
-            lexical_rule_hit[idx] = True
-            best_reason_parts.extend(best_domain_reasons)
-        elif best_lexical > 0 and not brand_token_hit[idx] and best_domain_primary_generic:
-            generic_token_only_match[idx] = True
-
-        if lexical_rule_hit[idx]:
-            candidate_mask[idx] = True
-            candidate_reasons[idx] = "|".join(dict.fromkeys(best_reason_parts))
-
-    if not candidate_mask.any():
-        fallback_count = _DEFAULT_SCORING_CONFIG["typo_top_k"] if top_k is None else top_k
-        fallback_mask = _select_topk_candidate_mask(lexical_scores, fallback_count)
-        candidate_mask |= fallback_mask
-        fallback_indices = np.where(fallback_mask)[0]
-        for idx in fallback_indices:
-            reason = candidate_reasons[idx]
-            candidate_reasons[idx] = f"{reason}|fallback_top_k".strip("|")
-
-    return {
-        "hybrid_metrics": {
-            "lexical_scores": lexical_scores,
-            "jw_scores": jw_scores,
-            "token_scores": token_scores,
-            "skeleton_scores": skeleton_scores,
-            "host_scores": host_scores,
-            "lexical_rule_hit": lexical_rule_hit,
-            "brand_token_hit": brand_token_hit,
-            "generic_token_only_match": generic_token_only_match,
-            "candidate_mask": candidate_mask,
-            "candidate_reasons": candidate_reasons,
-            "best_matching_domains": best_matching_domains,
-        },
-        "legacy_metrics": {
-            "old_fuzzy_hit": bool(legacy_best_hit),
-            "old_fuzzy_cse": legacy_best_entity if legacy_best_hit else "",
-            "old_fuzzy_domain": legacy_best_domain if legacy_best_hit else "",
-            "old_fuzzy_score": float(legacy_best_score),
-        },
-    }
-
-
-# UNUSED_IN_PROD_RAY_FLOW: unreferenced legacy helper; the live shortlist path reads lexical metrics from
-# _compute_prefetch_lexical_state* instead of this single-item compatibility wrapper.
-# def _compute_legacy_fuzzy_metrics(target_url: str) -> dict:
-#     target_features = _prepare_target_lexical_features(target_url)
-#     return _evaluate_prefetch_lexical_bundle(target_features)["legacy_metrics"]
+    return _stage0_new_lexical.evaluate_prefetch_lexical_bundle(
+        normalized_url=target_features.normalized_url,
+        target_domain=target_features.target_domain,
+        lexical_cache=cache,
+        top_k=top_k,
+    )
 
 
 def _compute_prefetch_lexical_state_from_normalized_url(
@@ -2466,7 +2135,7 @@ def _compute_prefetch_lexical_state_from_normalized_url(
     *,
     typo_top_k: int,
     lexical_pass_min_score: float,
-    lexical_cache: "tuple[_LexicalEntityFeatures, ...] | None" = None,
+    lexical_cache: "tuple[Any, ...] | None" = None,
 ) -> dict:
     target_features = _prepare_target_lexical_features(normalized_url)
     cache = lexical_cache or _active_lexical_cache()
@@ -2477,7 +2146,6 @@ def _compute_prefetch_lexical_state_from_normalized_url(
         lexical_cache=cache,
     )
     lexical_metrics = lexical_bundle["hybrid_metrics"]
-    legacy_metrics = lexical_bundle["legacy_metrics"]
 
     candidate_mask = np.array(lexical_metrics["candidate_mask"], dtype=bool)
     candidate_indices = np.where(candidate_mask)[0]
@@ -2498,8 +2166,14 @@ def _compute_prefetch_lexical_state_from_normalized_url(
     lexical_rule_hit = bool(lexical_metrics["lexical_rule_hit"][best_idx]) if n_entities else False
     brand_token_hit = bool(lexical_metrics["brand_token_hit"][best_idx]) if n_entities else False
     generic_token_only_match = bool(lexical_metrics["generic_token_only_match"][best_idx]) if n_entities else False
+    stage0_metadata_rows = list(lexical_metrics.get("stage0_metadata", []) or [])
+    stage0_metadata = (
+        dict(stage0_metadata_rows[best_idx])
+        if n_entities and len(stage0_metadata_rows) > best_idx
+        else {}
+    )
     hybrid_lexical_hit = bool(lexical_rule_hit or brand_token_hit)
-    strict_lexical_hit = bool((legacy_metrics["old_fuzzy_hit"] or hybrid_lexical_hit) and not generic_token_only_match)
+    strict_lexical_hit = bool(hybrid_lexical_hit and not generic_token_only_match)
     candidate_generation_reason = (
         str(lexical_metrics["candidate_reasons"][best_idx] or "fallback_top_k")
         if n_entities
@@ -2532,6 +2206,16 @@ def _compute_prefetch_lexical_state_from_normalized_url(
         "strict_lexical_hit": strict_lexical_hit,
         "lexical_score_pass": lexical_score_pass,
         "fallback_rank_only": fallback_rank_only,
+        "stage0_match_reason": str(stage0_metadata.get("match_reason", "") or ""),
+        "stage0_final_score": int(stage0_metadata.get("final_score", 0) or 0),
+        "stage0_risk": str(stage0_metadata.get("risk", "") or ""),
+        "stage0_similarity_score": float(stage0_metadata.get("similarity_score", 0.0) or 0.0),
+        "stage0_label_length": int(stage0_metadata.get("label_length", 0) or 0),
+        "stage0_entropy": float(stage0_metadata.get("entropy", 0.0) or 0.0),
+        "stage0_keyword_presence": bool(stage0_metadata.get("keyword_presence", False)),
+        "stage0_phishing_keyword_hits": "|".join(stage0_metadata.get("phishing_keyword_hits", []) or []),
+        "stage0_brand_hits": "|".join(stage0_metadata.get("brand_hits", []) or []),
+        "stage0_keyword_similarity_score": float(stage0_metadata.get("keyword_similarity_score", 0.0) or 0.0),
         "lexical_scores": lexical_metrics["lexical_scores"],
         "jw_scores": lexical_metrics["jw_scores"],
         "token_scores": lexical_metrics["token_scores"],
@@ -2542,7 +2226,6 @@ def _compute_prefetch_lexical_state_from_normalized_url(
         "candidate_mask": lexical_metrics["candidate_mask"],
         "candidate_reasons": lexical_metrics["candidate_reasons"],
         "best_matching_domains": lexical_metrics["best_matching_domains"],
-        **legacy_metrics,
     }
 
 
@@ -2714,8 +2397,6 @@ def _build_dns_passthrough_holdout_row_legacy(
         "dominant_signal_family": "dns_not_mapped_lexical_passthrough",
         "survival_path": passthrough_path,
         "drop_path": "",
-        "old_fuzzy_hit": bool(stage1_row.get("old_fuzzy_hit", False)),
-        "old_fuzzy_cse": stage1_row.get("old_fuzzy_cse", ""),
         "hybrid_lexical_hit": bool(stage1_row.get("hybrid_lexical_hit", False)),
         "strict_lexical_hit": bool(stage1_row.get("strict_lexical_hit", False)),
         "lexical_score_pass": bool(stage1_row.get("lexical_score_pass", False)),
@@ -2813,8 +2494,6 @@ _STAGE1_DEBUG_FIELDNAMES = [
     "drop_path",
     "exclusion_stage",
     "reason",
-    "old_fuzzy_hit",
-    "old_fuzzy_cse",
     "hybrid_lexical_hit",
     "strict_lexical_hit",
     "lexical_score_pass",
@@ -3047,8 +2726,6 @@ def _build_stage1_debug_rows(
             "drop_path": "",
             "exclusion_stage": "",
             "reason": "",
-            "old_fuzzy_hit": bool(prefetch_row.get("old_fuzzy_hit", False)),
-            "old_fuzzy_cse": prefetch_row.get("old_fuzzy_cse", ""),
             "hybrid_lexical_hit": bool(prefetch_row.get("hybrid_lexical_hit", False)),
             "strict_lexical_hit": bool(prefetch_row.get("strict_lexical_hit", False)),
             "lexical_score_pass": bool(prefetch_row.get("lexical_score_pass", False)),
@@ -3937,39 +3614,9 @@ def _extract_tld(value: str):
     return _TLD_EXTRACTOR(str(value or ""))
 
 
-class _LexicalDomainFeatures(NamedTuple):
-    domain: str
-    normalized_primary: str
-    compact_primary: str
-    raw_primary: str
-    normalized_host: str
-    suffix: str
-    registered_domain: str
-    primary_generic: bool
-    legacy_normalized: str
-    legacy_primary: str
-
-
-class _LexicalEntityFeatures(NamedTuple):
-    name: str
-    brand_tokens: frozenset[str]
-    domains: tuple[_LexicalDomainFeatures, ...]
-
-
 class _TargetLexicalFeatures(NamedTuple):
     normalized_url: str
     target_domain: str
-    primary: str
-    compact_primary: str
-    raw_primary: str
-    host: str
-    first_host_label: str
-    suffix: str
-    registered_domain: str
-    brand_tokens: frozenset[str]
-    primary_generic: bool
-    legacy_normalized: str
-    legacy_primary: str
 
 
 def _normalized_host_for_similarity(value: str) -> str:
@@ -3978,63 +3625,6 @@ def _normalized_host_for_similarity(value: str) -> str:
     if not parts:
         return ""
     return _domain_label_skeleton(".".join(parts))
-
-
-def _normalized_primary_for_similarity(value: str) -> str:
-    ext = _extract_tld(str(value or ""))
-    return _domain_label_skeleton(ext.domain)
-
-
-_COMPACT_LEXICAL_RE = re.compile(r"[^a-z0-9]+")
-
-def _compact_lexical_label(value: str) -> str:
-    return _COMPACT_LEXICAL_RE.sub("", str(value or "").strip().lower())
-
-
-def _first_host_label_for_similarity(value: str) -> str:
-    ext = _extract_tld(str(value or ""))
-    host = ".".join(part for part in [ext.subdomain, ext.domain] if part)
-    for token in re.split(r"[^a-z0-9]+", host.lower()):
-        compact = _compact_lexical_label(token)
-        if compact:
-            return compact
-    return ""
-
-
-def _common_prefix_length(text_a: str, text_b: str) -> int:
-    count = 0
-    for char_a, char_b in zip(str(text_a or ""), str(text_b or "")):
-        if char_a != char_b:
-            break
-        count += 1
-    return count
-
-
-def _edit_distance_at_most(text_a: str, text_b: str, limit: int) -> bool:
-    text_a = str(text_a or "")
-    text_b = str(text_b or "")
-    limit = max(0, int(limit))
-    if abs(len(text_a) - len(text_b)) > limit:
-        return False
-    previous = list(range(len(text_b) + 1))
-    for idx_a, char_a in enumerate(text_a, start=1):
-        current = [idx_a] + [0] * len(text_b)
-        for idx_b, char_b in enumerate(text_b, start=1):
-            current[idx_b] = min(
-                previous[idx_b] + 1,
-                current[idx_b - 1] + 1,
-                previous[idx_b - 1] + (char_a != char_b),
-            )
-        if min(current) > limit:
-            return False
-        previous = current
-    return previous[-1] <= limit
-
-
-def _longest_common_substring(text_a: str, text_b: str) -> tuple[int, int, int]:
-    matcher = SequenceMatcher(None, str(text_a or ""), str(text_b or ""))
-    match = matcher.find_longest_match(0, len(text_a or ""), 0, len(text_b or ""))
-    return int(match.size), int(match.a), int(match.b)
 
 
 def _canonical_host(value: str) -> str:
@@ -4142,171 +3732,6 @@ def _extract_entity_name_tokens(value: str) -> set[str]:
     }
 
 
-def _matching_brand_tokens(entity_features: "_LexicalEntityFeatures | None") -> tuple[str, ...]:
-    if entity_features is None:
-        return ()
-    tokens = {
-        _compact_lexical_label(token)
-        for token in entity_features.brand_tokens
-        if token and not _is_generic_service_token(token)
-    }
-    return tuple(sorted((token for token in tokens if len(token) > 2), key=len, reverse=True))
-
-
-def _target_literal_brand_suffix(target_features: "_TargetLexicalFeatures", token: str) -> str | None:
-    token = _compact_lexical_label(token)
-    raw_primary = _compact_lexical_label(target_features.raw_primary)
-    first_label = _compact_lexical_label(target_features.first_host_label)
-    if raw_primary.startswith(token):
-        return raw_primary[len(token):]
-    if first_label.startswith(token):
-        return first_label[len(token):]
-    return None
-
-
-def _short_brand_suffix_allowed(token: str, suffix: str) -> bool:
-    token = _compact_lexical_label(token)
-    suffix = _compact_lexical_label(suffix)
-    if len(token) > 4:
-        return True
-    if not suffix:
-        return True
-    return any(suffix.startswith(hint) for hint in _SHORT_BRAND_SUFFIX_HINTS)
-
-
-def _has_anchored_brand_token_hit(
-    target_features: "_TargetLexicalFeatures",
-    entity_features: "_LexicalEntityFeatures | None",
-) -> bool:
-    target_tokens = {
-        _compact_lexical_label(token)
-        for token in target_features.brand_tokens
-        if token and not _is_generic_service_token(token)
-    }
-    target_primary = _compact_lexical_label(target_features.compact_primary)
-    first_label = _compact_lexical_label(target_features.first_host_label)
-    for token in _matching_brand_tokens(entity_features):
-        if token not in target_tokens and not target_primary.startswith(token) and not first_label.startswith(token):
-            continue
-        literal_suffix = _target_literal_brand_suffix(target_features, token)
-        if literal_suffix is None:
-            continue
-        if _short_brand_suffix_allowed(token, literal_suffix):
-            return True
-    return False
-
-
-def _has_entity_brand_prefix_anchor(
-    target_features: "_TargetLexicalFeatures",
-    entity_features: "_LexicalEntityFeatures | None",
-) -> bool:
-    target_primary = _compact_lexical_label(target_features.compact_primary)
-    first_label = _compact_lexical_label(target_features.first_host_label)
-    for token in _matching_brand_tokens(entity_features):
-        if not (target_primary.startswith(token) or first_label.startswith(token)):
-            continue
-        literal_suffix = _target_literal_brand_suffix(target_features, token)
-        if literal_suffix is None:
-            continue
-        if _short_brand_suffix_allowed(token, literal_suffix):
-            return True
-    return False
-
-
-def _has_disallowed_short_brand_prefix(
-    target_features: "_TargetLexicalFeatures",
-    entity_features: "_LexicalEntityFeatures | None",
-) -> bool:
-    target_primary = _compact_lexical_label(target_features.compact_primary)
-    first_label = _compact_lexical_label(target_features.first_host_label)
-    for token in _matching_brand_tokens(entity_features):
-        if len(token) > 4:
-            continue
-        if not (target_primary.startswith(token) or first_label.startswith(token)):
-            continue
-        literal_suffix = _target_literal_brand_suffix(target_features, token)
-        if literal_suffix is None:
-            continue
-        if not _short_brand_suffix_allowed(token, literal_suffix):
-            return True
-    return False
-
-
-def _has_substantive_lexical_anchor(
-    target_features: "_TargetLexicalFeatures",
-    domain_features: "_LexicalDomainFeatures",
-    entity_features: "_LexicalEntityFeatures | None" = None,
-) -> bool:
-    if domain_features.primary_generic:
-        return False
-
-    target_primary = target_features.compact_primary or ""
-    target_raw_primary = target_features.raw_primary or ""
-    entity_primary = domain_features.compact_primary or _compact_lexical_label(domain_features.normalized_primary)
-    if not target_primary or not entity_primary:
-        return False
-
-    if _has_entity_brand_prefix_anchor(target_features, entity_features):
-        return True
-    if _has_disallowed_short_brand_prefix(target_features, entity_features):
-        return False
-
-    skeleton_prefix = _common_prefix_length(target_primary, entity_primary)
-    raw_prefix = _common_prefix_length(target_raw_primary, entity_primary)
-    if skeleton_prefix >= 5 and raw_prefix >= 3:
-        return True
-
-    shortest = min(len(target_primary), len(entity_primary))
-    if (
-        shortest >= 6
-        and target_raw_primary[:1] == entity_primary[:1]
-        and _edit_distance_at_most(target_primary, entity_primary, 2)
-    ):
-        return True
-
-    if shortest >= 8 and target_raw_primary[:1] == entity_primary[:1]:
-        longest, target_offset, entity_offset = _longest_common_substring(target_primary, entity_primary)
-        if (
-            longest >= max(6, int(shortest * 0.75))
-            and (target_offset == 0 or entity_offset == 0)
-        ):
-            return True
-
-    return False
-
-
-# UNUSED_IN_CURRENT_WORKFLOW: unused private selector; current lexical and redirect logic
-# does not call this best-domain helper.
-# def _best_matching_entity_domain(target_domain: str, entity_domains: list[str]) -> str:
-#     target_domain = str(target_domain or "").strip().lower()
-#     best_domain = ""
-#     best_score = -1.0
-#     for entity_domain in entity_domains or []:
-#         score = max(
-#             _jaro_winkler_similarity(
-#                 _normalized_primary_for_similarity(target_domain),
-#                 _normalized_primary_for_similarity(entity_domain),
-#             ),
-#             typosquat_similarity(target_domain, entity_domain),
-#             domain_similarity(target_domain, entity_domain),
-#         )
-#         if score > best_score:
-#             best_score = score
-#             best_domain = str(entity_domain or "").strip().lower()
-#     return best_domain
-
-
-def _jaro_winkler_similarity(text_a: str, text_b: str) -> float:
-    if not text_a or not text_b:
-        return 0.0
-    if jellyfish is None:
-        return ratio(text_a, text_b) / 100.0
-    try:
-        return float(jellyfish.jaro_winkler_similarity(text_a, text_b))
-    except Exception:
-        return ratio(text_a, text_b) / 100.0
-
-
 def typosquat_similarity(d1: str, d2: str) -> float:
     """Typo/confusable similarity in [0,1] between two domains/hosts."""
     e1 = _extract_tld(str(d1 or ""))
@@ -4337,17 +3762,6 @@ def _compute_hybrid_lexical_metrics(target_domain: str, top_k: int | None = None
 # _compute_hybrid_lexical_metrics() directly.
 # def _compute_typosquat_scores(target_domain: str) -> np.ndarray:
 #     return _compute_hybrid_lexical_metrics(target_domain)["skeleton_scores"]
-
-
-def _select_topk_candidate_mask(typo_scores: np.ndarray, top_k: int) -> np.ndarray:
-    n_entities = int(typo_scores.shape[0])
-    mask = np.zeros(n_entities, dtype=bool)
-    if n_entities == 0:
-        return mask
-    k = max(1, min(int(top_k), n_entities))
-    top_idx = np.argsort(-typo_scores)[:k]
-    mask[top_idx] = True
-    return mask
 
 
 ###############################################
@@ -4424,52 +3838,24 @@ def _build_entity_index(entity_db):
 _entity_index = _build_entity_index(entity_db)
 
 
-def _build_lexical_cache(entity_index: dict) -> tuple[_LexicalEntityFeatures, ...]:
-    lexical_entities = []
-    entity_names = list(entity_index.get("names", []))
-    entity_domains = list(entity_index.get("domains", []))
-    entity_brand_tokens = list(entity_index.get("brand_tokens", []))
-    for idx, name in enumerate(entity_names):
-        domain_features = []
-        for domain in entity_domains[idx]:
-            registered_domain = _registered_domain(domain)
-            normalized_primary = _normalized_primary_for_similarity(domain)
-            legacy_normalized = _legacy_normalize_url(domain)
-            domain_features.append(
-                _LexicalDomainFeatures(
-                    domain=str(domain or "").strip().lower(),
-                    normalized_primary=normalized_primary,
-                    compact_primary=_compact_lexical_label(normalized_primary),
-                    raw_primary=_compact_lexical_label(_extract_tld(domain).domain),
-                    normalized_host=_normalized_host_for_similarity(domain),
-                    suffix=str(_extract_tld(domain).suffix or "").strip().lower(),
-                    registered_domain=registered_domain,
-                    primary_generic=_is_generic_service_token(normalized_primary),
-                    legacy_normalized=legacy_normalized,
-                    legacy_primary=_legacy_get_primary_part(legacy_normalized),
-                )
-            )
-        lexical_entities.append(
-            _LexicalEntityFeatures(
-                name=str(name or ""),
-                brand_tokens=frozenset(entity_brand_tokens[idx]),
-                domains=tuple(domain_features),
-            )
-        )
-    return tuple(lexical_entities)
+def _build_lexical_cache(entity_index: dict) -> tuple[Any, ...]:
+    # OLD LEXICAL CACHE DISABLED:
+    # Build the new whitelist-aware per-entity cache from the same entity DB
+    # index so downstream hash/classification entity alignment is preserved.
+    return _stage0_new_lexical.build_entity_cache(entity_index)
 
 
 _LEXICAL_CACHE = _build_lexical_cache(_entity_index)
-_LEXICAL_WORKER_CACHE: tuple[_LexicalEntityFeatures, ...] | None = None
+_LEXICAL_WORKER_CACHE: tuple[Any, ...] | None = None
 _STAGE1_CPU_WORKER_CONTEXT: dict[str, Any] | None = None
 
 
-def _init_lexical_worker(lexical_cache: tuple[_LexicalEntityFeatures, ...]) -> None:
+def _init_lexical_worker(lexical_cache: tuple[Any, ...]) -> None:
     global _LEXICAL_WORKER_CACHE
     _LEXICAL_WORKER_CACHE = lexical_cache
 
 
-def _active_lexical_cache() -> tuple[_LexicalEntityFeatures, ...]:
+def _active_lexical_cache() -> tuple[Any, ...]:
     return _LEXICAL_WORKER_CACHE if _LEXICAL_WORKER_CACHE is not None else _LEXICAL_CACHE
 
 
@@ -4532,23 +3918,11 @@ def _create_stage0_lexical_executor():
     worker_count = max(1, int(LEXICAL_WORKERS))
     _init_lexical_worker(_LEXICAL_CACHE)
     executor_mode = _resolve_shortlist_cpu_executor_mode()
-    if executor_mode == "thread":
-        return ThreadPoolExecutor(max_workers=worker_count), "thread"
-    try:
-        return (
-            ProcessPoolExecutor(
-                max_workers=worker_count,
-                initializer=_init_lexical_worker,
-                initargs=(_LEXICAL_CACHE,),
-            ),
-            "process",
+    if executor_mode == "process":
+        _hash_logger.info(
+            "Stage0 lexical execution is pinned to local threads; ignoring process-pool override."
         )
-    except Exception as exc:
-        _hash_logger.warning(
-            "Stage0 lexical pool fallback to threads after process-pool init failure: %s",
-            exc,
-        )
-        return ThreadPoolExecutor(max_workers=worker_count), "thread"
+    return ThreadPoolExecutor(max_workers=worker_count), "thread"
 
 # â”€â”€ Top-level helper for ProcessPoolExecutor (must be picklable) â”€â”€
 
@@ -5071,10 +4445,6 @@ async def _fetch_url_payload(
                         "candidate_mask": candidate_mask,
                         "candidate_reasons": candidate_reasons,
                         "best_matching_domains": list(prefetch_metrics.get("best_matching_domains", [])),
-                        "old_fuzzy_hit": prefetch_metrics["old_fuzzy_hit"],
-                        "old_fuzzy_cse": prefetch_metrics["old_fuzzy_cse"],
-                        "old_fuzzy_domain": prefetch_metrics["old_fuzzy_domain"],
-                        "old_fuzzy_score": prefetch_metrics["old_fuzzy_score"],
                         "strict_lexical_hit": prefetch_metrics["strict_lexical_hit"],
                         "lexical_score_pass": prefetch_metrics["lexical_score_pass"],
                         "fallback_rank_only": prefetch_metrics["fallback_rank_only"],
@@ -5593,10 +4963,6 @@ async def _enrich_render_payload_for_hashing(
         "candidate_mask": candidate_mask,
         "candidate_reasons": candidate_reasons,
         "best_matching_domains": list(prefetch_metrics.get("best_matching_domains", [])),
-        "old_fuzzy_hit": prefetch_metrics["old_fuzzy_hit"],
-        "old_fuzzy_cse": prefetch_metrics["old_fuzzy_cse"],
-        "old_fuzzy_domain": prefetch_metrics["old_fuzzy_domain"],
-        "old_fuzzy_score": prefetch_metrics["old_fuzzy_score"],
         "strict_lexical_hit": prefetch_metrics["strict_lexical_hit"],
         "lexical_score_pass": prefetch_metrics["lexical_score_pass"],
         "fallback_rank_only": prefetch_metrics["fallback_rank_only"],
@@ -5854,8 +5220,6 @@ def _build_shortlist_output_row(match: dict, scoring_config: dict) -> dict:
         "dominant_signal_family": match.get("dominant_signal_family", "lexical"),
         "survival_path": match.get("survival_path", ""),
         "drop_path": match.get("drop_path", ""),
-        "old_fuzzy_hit": bool(match.get("old_fuzzy_hit", False)),
-        "old_fuzzy_cse": match.get("old_fuzzy_cse", ""),
         "hybrid_lexical_hit": bool(match.get("hybrid_lexical_hit", False)),
         "strict_lexical_hit": bool(match.get("strict_lexical_hit", False)),
         "lexical_score_pass": bool(match.get("lexical_score_pass", False)),
@@ -6020,10 +5384,8 @@ def _finalize_scored_hash_payload(
     domain_hash_similarity = float(payload.get("domain_hash_similarity", np.zeros(n_entities, dtype="float64"))[best_idx])
     domain_hash_distance = int(payload.get("domain_hash_distance", np.full(n_entities, -1, dtype="int32"))[best_idx])
     direct_brand_evidence_count = _count_shortlist_aligned_page_brand_evidence(best_idx, payload)
-    old_fuzzy_hit = bool(payload.get("old_fuzzy_hit", False))
-    old_fuzzy_cse = str(payload.get("old_fuzzy_cse", "") or "")
     hybrid_lexical_hit = bool(lexical_rule_hit or brand_token_hit)
-    strict_lexical_hit = bool(payload.get("strict_lexical_hit", False) or old_fuzzy_hit or hybrid_lexical_hit)
+    strict_lexical_hit = bool(payload.get("strict_lexical_hit", False) or hybrid_lexical_hit)
     candidate_generation_reason = payload["candidate_reasons"][best_idx] or "fallback_top_k"
     fallback_rank_only = bool(
         payload.get("fallback_rank_only", False)
@@ -6121,8 +5483,6 @@ def _finalize_scored_hash_payload(
             "admitted_to_holdout": admitted_to_holdout,
             "kept_for_review_only": kept_for_review_only,
             "review_only_reason": review_only_reason,
-            "old_fuzzy_hit": old_fuzzy_hit,
-            "old_fuzzy_cse": old_fuzzy_cse,
             "hybrid_lexical_hit": hybrid_lexical_hit,
             "strict_lexical_hit": strict_lexical_hit,
             "lexical_score_pass": lexical_score_pass,
@@ -6189,8 +5549,6 @@ def _finalize_scored_hash_payload(
         "dominant_signal_family": dominant_signal_family,
         "survival_path": "|".join(dict.fromkeys(admission_paths)) if admitted_to_holdout else (review_only_reason if kept_for_review_only else ""),
         "drop_path": "" if admitted_to_holdout else ("not_admitted_after_lexical_and_hash_checks" if not kept_for_review_only else ""),
-        "old_fuzzy_hit": old_fuzzy_hit,
-        "old_fuzzy_cse": old_fuzzy_cse,
         "hybrid_lexical_hit": hybrid_lexical_hit,
         "strict_lexical_hit": strict_lexical_hit,
         "lexical_score_pass": lexical_score_pass,
@@ -10142,8 +9500,6 @@ def _build_dns_passthrough_holdout_row(stage1_analysis: dict, prefetch_metrics: 
         "dominant_signal_family": "lexical",
         "survival_path": DNS_NOT_MAPPED_LEXICAL_PASSTHROUGH_PATH,
         "drop_path": "",
-        "old_fuzzy_hit": bool(prefetch_metrics.get("old_fuzzy_hit", False)),
-        "old_fuzzy_cse": prefetch_metrics.get("old_fuzzy_cse", ""),
         "hybrid_lexical_hit": bool(prefetch_metrics.get("hybrid_lexical_hit", False)),
         "strict_lexical_hit": strict_lexical_hit,
         "lexical_score_pass": lexical_score_pass,
@@ -10269,6 +9625,13 @@ def _build_stage0_debug_rows(
                 "lexical_score_pass": bool(prefetch.get("lexical_score_pass", False)),
                 "fallback_rank_only": bool(prefetch.get("fallback_rank_only", False)),
                 "candidate_generation_reason": str(prefetch.get("candidate_generation_reason", "") or ""),
+                "stage0_match_reason": str(prefetch.get("stage0_match_reason", "") or ""),
+                "stage0_final_score": int(prefetch.get("stage0_final_score", 0) or 0),
+                "stage0_risk": str(prefetch.get("stage0_risk", "") or ""),
+                "stage0_similarity_score": round(float(prefetch.get("stage0_similarity_score", 0.0) or 0.0), 4),
+                "stage0_brand_hits": str(prefetch.get("stage0_brand_hits", "") or ""),
+                "stage0_phishing_keyword_hits": str(prefetch.get("stage0_phishing_keyword_hits", "") or ""),
+                "stage0_keyword_similarity_score": round(float(prefetch.get("stage0_keyword_similarity_score", 0.0) or 0.0), 4),
                 "best_entity": str(prefetch.get("best_entity", "") or ""),
                 "best_matching_domain": str(prefetch.get("best_matching_domain", "") or ""),
                 "lexical_score": round(float(prefetch.get("best_lexical_score", 0.0) or 0.0), 4),
@@ -10299,6 +9662,13 @@ def _write_stage0_debug_csv(rows: list[dict[str, Any]], output_path: str = DEFAU
         "lexical_score_pass",
         "fallback_rank_only",
         "candidate_generation_reason",
+        "stage0_match_reason",
+        "stage0_final_score",
+        "stage0_risk",
+        "stage0_similarity_score",
+        "stage0_brand_hits",
+        "stage0_phishing_keyword_hits",
+        "stage0_keyword_similarity_score",
         "best_entity",
         "best_matching_domain",
         "lexical_score",

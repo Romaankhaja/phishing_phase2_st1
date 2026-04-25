@@ -33,9 +33,6 @@ class Stage0LexicalParallelismTests(unittest.TestCase):
             "strict_lexical_hit",
             "lexical_score_pass",
             "fallback_rank_only",
-            "old_fuzzy_hit",
-            "old_fuzzy_cse",
-            "old_fuzzy_domain",
             "candidate_reasons",
             "best_matching_domains",
         )
@@ -44,7 +41,6 @@ class Stage0LexicalParallelismTests(unittest.TestCase):
             "best_jw_score",
             "best_token_score",
             "best_typo_similarity",
-            "old_fuzzy_score",
         )
         array_keys = (
             "lexical_scores",
@@ -84,7 +80,7 @@ class Stage0LexicalParallelismTests(unittest.TestCase):
         for expected, actual in zip(expected_results, actual_results):
             self._assert_prefetch_state_equal(expected, actual)
 
-    def test_stage0_process_pool_matches_single_item_evaluator(self):
+    def test_stage0_process_override_still_uses_thread_pool(self):
         normalized_urls = [comparison.normalize_url(url) for url in self.urls]
         expected_map = {
             normalized_url: comparison._compute_prefetch_lexical_state(url, self.scoring_config)
@@ -92,20 +88,19 @@ class Stage0LexicalParallelismTests(unittest.TestCase):
         }
 
         with (
+            mock.patch.object(comparison, "_resolve_shortlist_cpu_executor_mode", return_value="process"),
+            mock.patch.object(comparison, "ProcessPoolExecutor", side_effect=AssertionError("process pool should not be used")),
             mock.patch.object(comparison, "LEXICAL_WORKERS", 2),
             mock.patch.object(comparison, "LEXICAL_BATCH_SIZE", 2),
             mock.patch.object(comparison, "LEXICAL_INFLIGHT_BATCHES", 2),
             mock.patch.object(comparison, "LEXICAL_PROGRESS_INTERVAL_S", 60.0),
         ):
-            try:
-                actual_map, stats = comparison._compute_stage0_prefetch_metrics_parallel(
-                    normalized_urls,
-                    self.scoring_config,
-                    original_count=len(normalized_urls),
-                    metric_input_counts={url: 1 for url in normalized_urls},
-                )
-            except PermissionError as exc:
-                self.skipTest(f"ProcessPoolExecutor unavailable in this environment: {exc}")
+            actual_map, stats = comparison._compute_stage0_prefetch_metrics_parallel(
+                normalized_urls,
+                self.scoring_config,
+                original_count=len(normalized_urls),
+                metric_input_counts={url: 1 for url in normalized_urls},
+            )
 
         self.assertEqual(stats["metric_urls_total"], len(normalized_urls))
         self.assertEqual(stats["metric_urls_completed"], len(normalized_urls))
@@ -190,6 +185,16 @@ class Stage0LexicalPrecisionRulesTests(unittest.TestCase):
         ):
             with self.subTest(url=url):
                 self.assertFailsLexicalGate(url)
+
+    def test_new_lexical_metadata_is_exposed(self):
+        metrics = self._prefetch("https://airtel-secure-pay.club")
+
+        self.assertTrue(comparison._passes_lexical_gate(metrics))
+        self.assertEqual(metrics["stage0_match_reason"], "score_threshold_match")
+        self.assertGreaterEqual(metrics["stage0_final_score"], 40)
+        self.assertIn(metrics["stage0_risk"], {"medium", "high"})
+        self.assertIn("airtel", metrics["stage0_brand_hits"])
+        self.assertIn("secure", metrics["stage0_phishing_keyword_hits"])
 
 
 if __name__ == "__main__":
