@@ -1,0 +1,13 @@
+Identified Domain Name,expected_stage0,case
+airtel-secure-pay-zzxq.com,pass,anchored_brand_not_in_ground_truth
+axisupi-login-zzxq.com,pass,anchored_short_brand_with_phishing_suffix_not_in_ground_truth
+sbirewardlogin-zzxq.com,pass,anchored_short_brand_with_phishing_suffix_not_in_ground_truth
+icici-bank-secure-zzxq.com,pass,anchored_brand_not_in_ground_truth
+crsorgi-login-zzxq.com,pass,anchored_cse_primary_not_in_ground_truth
+uidai-service-gov-zzxq.com,pass,anchored_brand_not_in_ground_truth
+5208is-zzxq.com,reject,one_letter_similarity_noise
+art-axis-zzxq.com,reject,unanchored_embedded_short_brand
+axis-network-zzxq.com,reject,short_brand_non_phishing_suffix
+home-loans-zzxq.com,reject,generic_service_token
+nickps-zzxq.net,reject,short_acronym_one_letter_noise
+4csonline-zzxq.digital,reject,loose_partial_primary_overlap
