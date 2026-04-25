@@ -151,5 +151,46 @@ class Stage0LexicalParallelismTests(unittest.TestCase):
             )
 
 
+class Stage0LexicalPrecisionRulesTests(unittest.TestCase):
+    def _prefetch(self, url: str) -> dict:
+        return comparison._compute_prefetch_lexical_state(
+            url,
+            comparison._DEFAULT_SCORING_CONFIG,
+        )
+
+    def assertPassesLexicalGate(self, url: str):
+        metrics = self._prefetch(url)
+        self.assertTrue(comparison._passes_lexical_gate(metrics), url)
+        self.assertTrue(metrics["strict_lexical_hit"], url)
+        self.assertFalse(metrics["fallback_rank_only"], url)
+
+    def assertFailsLexicalGate(self, url: str):
+        metrics = self._prefetch(url)
+        self.assertFalse(comparison._passes_lexical_gate(metrics), url)
+        self.assertFalse(metrics["strict_lexical_hit"], url)
+
+    def test_anchored_url_patterns_pass_without_exact_ground_truth_hosts(self):
+        for url in (
+            "https://airtel-secure-pay.club",
+            "https://axisupi-login.com",
+            "https://sbirewardlogin.com",
+            "https://icici-bank-secure.icu",
+            "https://crsorgi-login.info",
+            "https://uidai-service-gov.com",
+        ):
+            with self.subTest(url=url):
+                self.assertPassesLexicalGate(url)
+
+    def test_one_letter_and_unanchored_matches_are_rejected(self):
+        for url in (
+            "https://5208is.xyz",
+            "https://art-axis.art",
+            "https://axis-network.com",
+            "https://home-loans.website",
+        ):
+            with self.subTest(url=url):
+                self.assertFailsLexicalGate(url)
+
+
 if __name__ == "__main__":
     unittest.main()

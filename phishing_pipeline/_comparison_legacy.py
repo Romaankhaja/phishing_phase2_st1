@@ -10,6 +10,7 @@ import httpx
 import dns.asyncresolver
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from collections import Counter
+from difflib import SequenceMatcher
 from functools import partial
 from typing import Any, NamedTuple
 from urllib.parse import urlparse
@@ -79,12 +80,43 @@ _GENERIC_DOMAIN_PARTS = {
 _GENERIC_SERVICE_TOKENS = {
     "mail",
     "cloud",
+    "contents",
+    "corp",
+    "home",
+    "homeloans",
+    "loan",
+    "loans",
     "login",
     "portal",
     "secure",
     "account",
     "service",
     "bank",
+    "retail",
+}
+_SHORT_BRAND_SUFFIX_HINTS = {
+    "account",
+    "bank",
+    "card",
+    "cards",
+    "gov",
+    "kyc",
+    "login",
+    "netbanking",
+    "online",
+    "pay",
+    "payment",
+    "payments",
+    "portal",
+    "reward",
+    "rewards",
+    "secure",
+    "service",
+    "sewa",
+    "upi",
+    "verification",
+    "verify",
+    "wallet",
 }
 _GENERIC_ENTITY_NAME_TOKENS = {
     "authority",
@@ -2139,7 +2171,10 @@ def _prepare_target_lexical_features(value: str) -> "_TargetLexicalFeatures":
         normalized_url=normalized_url,
         target_domain=target_domain,
         primary=target_primary,
+        compact_primary=_compact_lexical_label(target_primary),
+        raw_primary=_compact_lexical_label(ext.domain),
         host=target_host,
+        first_host_label=_first_host_label_for_similarity(target_domain),
         suffix=str(ext.suffix or "").strip().lower(),
         registered_domain=_registered_domain(target_domain),
         brand_tokens=frozenset(_extract_brand_tokens(target_domain)),
@@ -2152,10 +2187,13 @@ def _prepare_target_lexical_features(value: str) -> "_TargetLexicalFeatures":
 def _legacy_is_similar_from_features(
     target_features: "_TargetLexicalFeatures",
     domain_features: "_LexicalDomainFeatures",
+    entity_features: "_LexicalEntityFeatures | None" = None,
 ) -> bool:
     if not target_features.legacy_primary or not domain_features.legacy_primary:
         return False
     if target_features.legacy_normalized == domain_features.legacy_normalized:
+        return False
+    if not _has_substantive_lexical_anchor(target_features, domain_features, entity_features):
         return False
     try:
         if jellyfish.jaro_winkler_similarity(target_features.legacy_primary, domain_features.legacy_primary) >= 0.85:
@@ -2243,11 +2281,7 @@ def _evaluate_prefetch_lexical_bundle(
 
     for idx, entity_features in enumerate(cache):
         best_reason_parts = []
-        if (
-            entity_features.brand_tokens
-            and target_features.brand_tokens
-            and (entity_features.brand_tokens & target_features.brand_tokens)
-        ):
+        if _has_anchored_brand_token_hit(target_features, entity_features):
             brand_token_hit[idx] = True
             lexical_rule_hit[idx] = True
             best_reason_parts.append("brand_token_match")
@@ -2266,7 +2300,11 @@ def _evaluate_prefetch_lexical_bundle(
                 target_features.legacy_primary,
                 domain_features.legacy_primary,
             )
-            is_legacy_hit = _legacy_is_similar_from_features(target_features, domain_features)
+            is_legacy_hit = _legacy_is_similar_from_features(
+                target_features,
+                domain_features,
+                entity_features,
+            )
             if is_legacy_hit and (not legacy_best_hit or legacy_score > legacy_best_score):
                 legacy_best_entity = entity_features.name
                 legacy_best_domain = domain_features.domain
@@ -2280,11 +2318,17 @@ def _evaluate_prefetch_lexical_bundle(
             entity_primary = domain_features.normalized_primary
             entity_host = domain_features.normalized_host
             entity_primary_generic = domain_features.primary_generic
+            substantive_anchor = _has_substantive_lexical_anchor(
+                target_features,
+                domain_features,
+                entity_features,
+            )
             allow_primary_string_rules = bool(
                 target_features.primary
                 and entity_primary
                 and not target_features.primary_generic
                 and not entity_primary_generic
+                and substantive_anchor
             )
 
             jw_score = _jaro_winkler_similarity(target_features.primary, entity_primary)
@@ -2316,7 +2360,7 @@ def _evaluate_prefetch_lexical_bundle(
                     best_domain_reasons.append("token_set_primary")
                 if allow_primary_string_rules and skeleton_score >= 0.88:
                     best_domain_reasons.append("skeleton_similarity")
-                if entity_features.brand_tokens and host_score >= 0.90:
+                if entity_features.brand_tokens and substantive_anchor and host_score >= 0.90:
                     best_domain_reasons.append("host_similarity")
 
         lexical_scores[idx] = best_lexical
@@ -3854,6 +3898,8 @@ def _extract_tld(value: str):
 class _LexicalDomainFeatures(NamedTuple):
     domain: str
     normalized_primary: str
+    compact_primary: str
+    raw_primary: str
     normalized_host: str
     suffix: str
     registered_domain: str
@@ -3872,7 +3918,10 @@ class _TargetLexicalFeatures(NamedTuple):
     normalized_url: str
     target_domain: str
     primary: str
+    compact_primary: str
+    raw_primary: str
     host: str
+    first_host_label: str
     suffix: str
     registered_domain: str
     brand_tokens: frozenset[str]
@@ -3892,6 +3941,56 @@ def _normalized_host_for_similarity(value: str) -> str:
 def _normalized_primary_for_similarity(value: str) -> str:
     ext = _extract_tld(str(value or ""))
     return _domain_label_skeleton(ext.domain)
+
+
+def _compact_lexical_label(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def _first_host_label_for_similarity(value: str) -> str:
+    ext = _extract_tld(str(value or ""))
+    host = ".".join(part for part in [ext.subdomain, ext.domain] if part)
+    for token in re.split(r"[^a-z0-9]+", host.lower()):
+        compact = _compact_lexical_label(token)
+        if compact:
+            return compact
+    return ""
+
+
+def _common_prefix_length(text_a: str, text_b: str) -> int:
+    count = 0
+    for char_a, char_b in zip(str(text_a or ""), str(text_b or "")):
+        if char_a != char_b:
+            break
+        count += 1
+    return count
+
+
+def _edit_distance_at_most(text_a: str, text_b: str, limit: int) -> bool:
+    text_a = str(text_a or "")
+    text_b = str(text_b or "")
+    limit = max(0, int(limit))
+    if abs(len(text_a) - len(text_b)) > limit:
+        return False
+    previous = list(range(len(text_b) + 1))
+    for idx_a, char_a in enumerate(text_a, start=1):
+        current = [idx_a] + [0] * len(text_b)
+        for idx_b, char_b in enumerate(text_b, start=1):
+            current[idx_b] = min(
+                previous[idx_b] + 1,
+                current[idx_b - 1] + 1,
+                previous[idx_b - 1] + (char_a != char_b),
+            )
+        if min(current) > limit:
+            return False
+        previous = current
+    return previous[-1] <= limit
+
+
+def _longest_common_substring(text_a: str, text_b: str) -> tuple[int, int, int]:
+    matcher = SequenceMatcher(None, str(text_a or ""), str(text_b or ""))
+    match = matcher.find_longest_match(0, len(text_a or ""), 0, len(text_b or ""))
+    return int(match.size), int(match.a), int(match.b)
 
 
 def _canonical_host(value: str) -> str:
@@ -3997,6 +4096,140 @@ def _extract_entity_name_tokens(value: str) -> set[str]:
             and not _is_generic_service_token(token)
         )
     }
+
+
+def _matching_brand_tokens(entity_features: "_LexicalEntityFeatures | None") -> tuple[str, ...]:
+    if entity_features is None:
+        return ()
+    tokens = {
+        _compact_lexical_label(token)
+        for token in entity_features.brand_tokens
+        if token and not _is_generic_service_token(token)
+    }
+    return tuple(sorted((token for token in tokens if len(token) > 2), key=len, reverse=True))
+
+
+def _target_literal_brand_suffix(target_features: "_TargetLexicalFeatures", token: str) -> str | None:
+    token = _compact_lexical_label(token)
+    raw_primary = _compact_lexical_label(target_features.raw_primary)
+    first_label = _compact_lexical_label(target_features.first_host_label)
+    if raw_primary.startswith(token):
+        return raw_primary[len(token):]
+    if first_label.startswith(token):
+        return first_label[len(token):]
+    return None
+
+
+def _short_brand_suffix_allowed(token: str, suffix: str) -> bool:
+    token = _compact_lexical_label(token)
+    suffix = _compact_lexical_label(suffix)
+    if len(token) > 4:
+        return True
+    if not suffix:
+        return True
+    return any(suffix.startswith(hint) for hint in _SHORT_BRAND_SUFFIX_HINTS)
+
+
+def _has_anchored_brand_token_hit(
+    target_features: "_TargetLexicalFeatures",
+    entity_features: "_LexicalEntityFeatures | None",
+) -> bool:
+    target_tokens = {
+        _compact_lexical_label(token)
+        for token in target_features.brand_tokens
+        if token and not _is_generic_service_token(token)
+    }
+    target_primary = _compact_lexical_label(target_features.compact_primary)
+    first_label = _compact_lexical_label(target_features.first_host_label)
+    for token in _matching_brand_tokens(entity_features):
+        if token not in target_tokens and not target_primary.startswith(token) and not first_label.startswith(token):
+            continue
+        literal_suffix = _target_literal_brand_suffix(target_features, token)
+        if literal_suffix is None:
+            continue
+        if _short_brand_suffix_allowed(token, literal_suffix):
+            return True
+    return False
+
+
+def _has_entity_brand_prefix_anchor(
+    target_features: "_TargetLexicalFeatures",
+    entity_features: "_LexicalEntityFeatures | None",
+) -> bool:
+    target_primary = _compact_lexical_label(target_features.compact_primary)
+    first_label = _compact_lexical_label(target_features.first_host_label)
+    for token in _matching_brand_tokens(entity_features):
+        if not (target_primary.startswith(token) or first_label.startswith(token)):
+            continue
+        literal_suffix = _target_literal_brand_suffix(target_features, token)
+        if literal_suffix is None:
+            continue
+        if _short_brand_suffix_allowed(token, literal_suffix):
+            return True
+    return False
+
+
+def _has_disallowed_short_brand_prefix(
+    target_features: "_TargetLexicalFeatures",
+    entity_features: "_LexicalEntityFeatures | None",
+) -> bool:
+    target_primary = _compact_lexical_label(target_features.compact_primary)
+    first_label = _compact_lexical_label(target_features.first_host_label)
+    for token in _matching_brand_tokens(entity_features):
+        if len(token) > 4:
+            continue
+        if not (target_primary.startswith(token) or first_label.startswith(token)):
+            continue
+        literal_suffix = _target_literal_brand_suffix(target_features, token)
+        if literal_suffix is None:
+            continue
+        if not _short_brand_suffix_allowed(token, literal_suffix):
+            return True
+    return False
+
+
+def _has_substantive_lexical_anchor(
+    target_features: "_TargetLexicalFeatures",
+    domain_features: "_LexicalDomainFeatures",
+    entity_features: "_LexicalEntityFeatures | None" = None,
+) -> bool:
+    if domain_features.primary_generic:
+        return False
+
+    target_primary = _compact_lexical_label(target_features.compact_primary)
+    target_raw_primary = _compact_lexical_label(target_features.raw_primary)
+    entity_primary = _compact_lexical_label(domain_features.compact_primary or domain_features.normalized_primary)
+    if not target_primary or not entity_primary:
+        return False
+
+    if _has_entity_brand_prefix_anchor(target_features, entity_features):
+        return True
+    if _has_disallowed_short_brand_prefix(target_features, entity_features):
+        return False
+
+    skeleton_prefix = _common_prefix_length(target_primary, entity_primary)
+    raw_prefix = _common_prefix_length(target_raw_primary, entity_primary)
+    if skeleton_prefix >= 5 and raw_prefix >= 3:
+        return True
+
+    shortest = min(len(target_primary), len(entity_primary))
+    if (
+        shortest >= 6
+        and target_raw_primary[:1] == entity_primary[:1]
+        and _edit_distance_at_most(target_primary, entity_primary, 2)
+    ):
+        return True
+
+    longest, target_offset, entity_offset = _longest_common_substring(target_primary, entity_primary)
+    if (
+        shortest >= 8
+        and target_raw_primary[:1] == entity_primary[:1]
+        and longest >= max(6, int(shortest * 0.75))
+        and (target_offset == 0 or entity_offset == 0)
+    ):
+        return True
+
+    return False
 
 
 # UNUSED_IN_CURRENT_WORKFLOW: unused private selector; current lexical and redirect logic
@@ -4163,6 +4396,8 @@ def _build_lexical_cache(entity_index: dict) -> tuple[_LexicalEntityFeatures, ..
                 _LexicalDomainFeatures(
                     domain=str(domain or "").strip().lower(),
                     normalized_primary=normalized_primary,
+                    compact_primary=_compact_lexical_label(normalized_primary),
+                    raw_primary=_compact_lexical_label(_extract_tld(domain).domain),
                     normalized_host=_normalized_host_for_similarity(domain),
                     suffix=str(_extract_tld(domain).suffix or "").strip().lower(),
                     registered_domain=registered_domain,
