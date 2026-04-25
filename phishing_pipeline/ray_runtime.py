@@ -467,7 +467,7 @@ class _HashBrowserActorImpl:
         async with self._lock:
             if self._browser is not None:
                 return
-            from . import comparison
+            from . import _comparison_legacy as comparison
             from playwright.async_api import async_playwright
 
             self._playwright = await async_playwright().start()
@@ -497,7 +497,7 @@ class _HashBrowserActorImpl:
         }
 
     async def render(self, artifact: dict[str, Any]) -> dict[str, Any]:
-        from . import comparison
+        from . import _comparison_legacy as comparison
 
         await self._ensure_browser()
         async with self._page_semaphore:
@@ -615,7 +615,7 @@ class _OcrWorkerActorImpl:
             return
         if not self._prewarmed:
             await self.warm()
-        from . import pipeline as pipeline_module
+        from . import _pipeline_legacy as pipeline_module
 
         self._batches_processed += 1
         self._items_processed += len(batch)
@@ -714,7 +714,7 @@ class _HashOnlyClassifierActorImpl:
         }
 
     async def classify_row(self, row: dict[str, Any], sequence_number: int, ocr_worker: Any, whois_actor: Any) -> dict[str, Any]:
-        from . import pipeline as pipeline_module
+        from . import _pipeline_legacy as pipeline_module
 
         fetch_status = str(row.get("fetch_status", "fetched") or "fetched").strip().lower()
         if fetch_status in {"fetched", "fetched_visual_missing"} and not pipeline_module._requires_registration_only_enrichment(row):
@@ -742,7 +742,7 @@ class _HashOnlyClassifierActorImpl:
 
 
 def _stage0_batch_task_impl(normalized_urls: list[str], lexical_eval_config: tuple[int, float]) -> dict[str, Any]:
-    from . import comparison
+    from . import _comparison_legacy as comparison
 
     started = time.perf_counter()
     results = comparison._compute_prefetch_lexical_state_batch(normalized_urls, lexical_eval_config)
@@ -758,7 +758,7 @@ def _stage0_batch_task_impl(normalized_urls: list[str], lexical_eval_config: tup
 async def _hash_enrich_task_async_impl(render_payload: dict[str, Any], prefetch_metrics: dict[str, Any], stage1_analysis: dict[str, Any], scoring_config: dict[str, Any]) -> dict[str, Any]:
     import aiohttp
 
-    from . import comparison
+    from . import _comparison_legacy as comparison
 
     connector = aiohttp.TCPConnector(limit=comparison.HASH_AUX_HTTP_LIMIT, ttl_dns_cache=300)
     session = aiohttp.ClientSession(connector=connector)
@@ -786,7 +786,7 @@ def _hash_enrich_task_impl(render_payload: dict[str, Any], prefetch_metrics: dic
 
 
 def _hash_finalize_batch_task_impl(batch: list[dict[str, Any]], threshold: float, scoring_config: dict[str, Any]) -> dict[str, Any]:
-    from . import comparison
+    from . import _comparison_legacy as comparison
 
     metrics = {
         "processed": 0,
@@ -1041,7 +1041,7 @@ async def run_hashing_shortlist_with_ray(
     force_reprocess: bool = False,
     progress_mode: str | None = None,
 ):
-    from .comparison import run_hashing_shortlist_streaming
+    from ._comparison_legacy import run_hashing_shortlist_streaming
 
     return await run_hashing_shortlist_streaming(
         url_list,

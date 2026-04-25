@@ -52,7 +52,7 @@ def run_pipeline(holdout_folder: str) -> bool:
     cmd = [
         VENV_PYTHON,
         "-m",
-        "phishing_pipeline.pipeline",
+        "phishing_pipeline._pipeline_legacy",
         holdout_folder,
         WHITELIST,
         "--package-results",

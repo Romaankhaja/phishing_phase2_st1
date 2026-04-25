@@ -1,15 +1,15 @@
-import tempfile
 import unittest
 from pathlib import Path
 
 import pandas as pd
+from tests._workspace_temp import workspace_tempdir
 
 from phishing_pipeline import recall_tuning, shortlisting
 
 
 class SourceWorkbookTaggingTests(unittest.TestCase):
     def test_duplicate_urls_merge_source_workbooks_across_excel_files(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with workspace_tempdir("recall_tuning") as tmpdir:
             tmpdir_path = Path(tmpdir)
             file_a = tmpdir_path / "urls.xlsx"
             file_b = tmpdir_path / "123456.xlsx"
@@ -49,7 +49,7 @@ class SourceWorkbookTaggingTests(unittest.TestCase):
 
 class RecallTuningHarnessTests(unittest.TestCase):
     def test_copy_tree_contents_skips_nested_tuning_runs(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with workspace_tempdir("recall_summary") as tmpdir:
             tmpdir_path = Path(tmpdir)
             output_dir = tmpdir_path / "output"
             snapshot_dir = tmpdir_path / "snapshot"
@@ -68,7 +68,7 @@ class RecallTuningHarnessTests(unittest.TestCase):
         gt_url = shortlisting.normalize_url("alpha.example")
         gt_targets = [{"gt_domain": "alpha.example", "normalized_url": gt_url}]
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with workspace_tempdir("recall_iteration") as tmpdir:
             iteration_dir = Path(tmpdir)
             pd.DataFrame(
                 [

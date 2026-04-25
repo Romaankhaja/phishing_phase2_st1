@@ -5,9 +5,9 @@ __version__ = "0.1"
 __all__ = ["run_pipeline", "package_results"]
 
 def run_pipeline(*args, **kwargs):
-    from .pipeline import run_pipeline as _run_pipeline
+    from .orchestration import run_pipeline as _run_pipeline
     return _run_pipeline(*args, **kwargs)
  
 def package_results(*args, **kwargs):
-    from .pipeline import package_results as _package_results
+    from .orchestration import package_results as _package_results
     return _package_results(*args, **kwargs)

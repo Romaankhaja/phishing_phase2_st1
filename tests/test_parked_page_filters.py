@@ -1,4 +1,3 @@
-import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -6,6 +5,7 @@ from unittest import mock
 import pandas as pd
 
 from phishing_pipeline import comparison, pipeline
+from tests._workspace_temp import workspace_tempdir
 
 
 def _prefetch_metrics(**overrides):
@@ -172,7 +172,7 @@ class HoldoutReplayTests(unittest.IsolatedAsyncioTestCase):
             async def get(self, *args, **kwargs):
                 return _FakeResponse()
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with workspace_tempdir("parked_sale") as tmpdir:
             tmpdir_path = Path(tmpdir)
             holdout_csv = tmpdir_path / "holdout.csv"
             final_output = tmpdir_path / "output_file.csv"
@@ -276,7 +276,7 @@ class HoldoutReplayTests(unittest.IsolatedAsyncioTestCase):
             async def get(self, *args, **kwargs):
                 return _FakeResponse()
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with workspace_tempdir("parked_placeholder") as tmpdir:
             tmpdir_path = Path(tmpdir)
             final_output = tmpdir_path / "output_file.csv"
             review_queue = tmpdir_path / "hash_review_queue.csv"
@@ -368,7 +368,7 @@ class HoldoutReplayTests(unittest.IsolatedAsyncioTestCase):
             async def get(self, *args, **kwargs):
                 return _Fake404Response()
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with workspace_tempdir("parked_legit") as tmpdir:
             tmpdir_path = Path(tmpdir)
             final_output = tmpdir_path / "output_file.csv"
             review_queue = tmpdir_path / "hash_review_queue.csv"

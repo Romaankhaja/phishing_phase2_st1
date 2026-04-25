@@ -140,5 +140,56 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(10000, config["append_flush_row_interval"])
 
 
+class StageModuleImportTests(unittest.TestCase):
+    def test_stage_modules_import_and_expose_core_entrypoints(self):
+        from phishing_pipeline import (
+            classification,
+            common,
+            hashing,
+            loading,
+            orchestration,
+            outputs,
+            scoring,
+            stage0,
+            stage1,
+            stage2,
+        )
+
+        self.assertTrue(callable(loading.load_url_records_from_excel_folder))
+        self.assertTrue(callable(common.normalize_url))
+        self.assertTrue(callable(stage0._compute_prefetch_lexical_state))
+        self.assertTrue(callable(stage1._run_stage1_http_pipeline))
+        self.assertTrue(callable(stage2._finalize_scored_hash_payload))
+        self.assertTrue(callable(hashing.compute_domain_simhash))
+        self.assertTrue(callable(scoring._resolve_scoring_config))
+        self.assertTrue(callable(classification._hybrid_hash_decision))
+        self.assertTrue(callable(outputs._submission_record_columns))
+        self.assertTrue(callable(orchestration.run_pipeline))
+
+    def test_legacy_facades_alias_original_module_objects(self):
+        import phishing_pipeline.comparison as comparison
+        import phishing_pipeline.pipeline as pipeline
+        import phishing_pipeline.shortlisting as shortlisting
+        import phishing_pipeline._comparison_legacy as comparison_legacy
+        import phishing_pipeline._pipeline_legacy as pipeline_legacy
+        import phishing_pipeline._shortlisting_legacy as shortlisting_legacy
+
+        self.assertIs(comparison, comparison_legacy)
+        self.assertIs(pipeline, pipeline_legacy)
+        self.assertIs(shortlisting, shortlisting_legacy)
+
+    def test_scoring_and_output_schema_parity(self):
+        from phishing_pipeline import comparison, outputs, pipeline, scoring
+
+        self.assertEqual(
+            comparison._resolve_scoring_config(),
+            scoring._resolve_scoring_config(),
+        )
+        self.assertEqual(
+            pipeline._submission_record_columns(),
+            outputs._submission_record_columns(),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

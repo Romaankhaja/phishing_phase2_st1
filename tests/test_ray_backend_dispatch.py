@@ -1,4 +1,3 @@
-import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +8,7 @@ import pandas as pd
 import main_controller
 from phishing_pipeline import comparison, pipeline
 from phishing_pipeline.config import resolve_ray_runtime_config
+from tests._workspace_temp import workspace_tempdir
 
 
 class RayBackendDispatchTests(unittest.IsolatedAsyncioTestCase):
@@ -226,7 +226,7 @@ class RayBackendDispatchTests(unittest.IsolatedAsyncioTestCase):
         whitelist_df = pd.DataFrame({"Legitimate Domains": ["legit.example"]})
         sentinel = pd.DataFrame([{"Application_ID": "x"}])
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with workspace_tempdir("ray_backend") as tmpdir:
             tmpdir_path = Path(tmpdir)
             output_dir = tmpdir_path / "output"
             output_dir.mkdir(parents=True, exist_ok=True)

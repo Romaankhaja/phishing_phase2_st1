@@ -233,7 +233,7 @@ async def classify_hash_only_row_impl(
     import tldextract
     import whois
 
-    from . import pipeline as pipeline_module
+    from . import _pipeline_legacy as pipeline_module
     from .utils import extract_network_features_async
 
     eligible_fetch_statuses = {"fetched", "fetched_visual_missing"}
@@ -489,7 +489,7 @@ async def classify_hash_only_row_impl(
             )
         )
 
-    from . import pipeline as pipeline_module
+    from . import _pipeline_legacy as pipeline_module
 
     html_brand_text = " ".join(
         part
@@ -988,7 +988,7 @@ async def run_hash_only_pipeline_with_ray_impl(
 ) -> pd.DataFrame:
     del checkpoint_store
 
-    from . import pipeline as pipeline_module
+    from . import _pipeline_legacy as pipeline_module
 
     ensure_ray_initialized()
     primitives = _get_ray_primitives()

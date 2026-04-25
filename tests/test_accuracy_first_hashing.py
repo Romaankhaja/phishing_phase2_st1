@@ -1,4 +1,3 @@
-import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -7,6 +6,7 @@ import pandas as pd
 from pandas.errors import EmptyDataError
 
 from phishing_pipeline import comparison, pipeline
+from tests._workspace_temp import workspace_tempdir
 
 
 class LexicalGateTests(unittest.TestCase):
@@ -152,7 +152,7 @@ class AccuracyFirstPipelineTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with workspace_tempdir("accuracy_first") as tmpdir:
             tmpdir_path = Path(tmpdir)
             final_output = tmpdir_path / "output_file.csv"
             review_queue = tmpdir_path / "hash_review_queue.csv"

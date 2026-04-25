@@ -1,11 +1,11 @@
 import asyncio
 import csv
 import os
-import tempfile
 import unittest
 
 from phishing_pipeline import comparison
 from phishing_pipeline.reliability import build_run_context
+from tests._workspace_temp import workspace_tempdir
 
 
 class HashStageScalingTests(unittest.TestCase):
@@ -320,7 +320,7 @@ class HashStageScalingTests(unittest.TestCase):
         self.assertEqual("landing.example", row["final_domain"])
 
     def test_write_stage2_hash_exports_duplicates_multi_workbook_rows(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with workspace_tempdir("hash_stage_exports") as temp_dir:
             run_context = build_run_context(output_dir=temp_dir, run_id="run_test")
             run_context.started_at = "2026-04-07T10:11:12Z"
             written_paths = comparison._write_stage2_hash_exports(
@@ -349,7 +349,7 @@ class HashStageScalingTests(unittest.TestCase):
                 self.assertIn(rows[0]["export_workbook"], {"A.xlsx", "B.xlsx"})
 
     def test_write_stage2_hash_exports_keeps_failure_rows(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with workspace_tempdir("hash_stage_failures") as temp_dir:
             run_context = build_run_context(output_dir=temp_dir, run_id="run_test")
             written_paths = comparison._write_stage2_hash_exports(
                 [
@@ -378,7 +378,7 @@ class HashStageScalingTests(unittest.TestCase):
             self.assertEqual("", rows[0]["html_hash_raw"])
 
     def test_write_stage1_debug_csv_ignores_additive_hash_fields(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with workspace_tempdir("stage1_debug") as temp_dir:
             output_path = os.path.join(temp_dir, "stage1_debug.csv")
             written_path = comparison._write_stage1_debug_csv(
                 [

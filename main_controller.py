@@ -203,7 +203,7 @@ def _load_runtime_components() -> dict[str, Any]:
         logger.warning("Could not import close_browser from visual_features: %s", exc)
 
     try:
-        from phishing_pipeline import pipeline
+        from phishing_pipeline import _pipeline_legacy as pipeline
         components["run_pipeline"] = pipeline.run_pipeline
         components["package_results"] = pipeline.package_results
         logger.info("Imported run_pipeline and package_results from pipeline.py")
@@ -212,14 +212,14 @@ def _load_runtime_components() -> dict[str, Any]:
         raise
 
     try:
-        from phishing_pipeline import shortlisting
+        from phishing_pipeline import _shortlisting_legacy as shortlisting
         components["shortlisting"] = shortlisting
         logger.info("Imported shortlisting module for utils (shortlisting.py)")
     except ImportError as exc:
         logger.warning("Could not import shortlisting.py: %s", exc)
 
     try:
-        from phishing_pipeline.comparison import run_hashing_shortlist_async
+        from phishing_pipeline._comparison_legacy import run_hashing_shortlist_async
         components["run_hashing_shortlist_async"] = run_hashing_shortlist_async
         logger.info("Imported run_hashing_shortlist_async from phishing_pipeline.comparison")
     except ImportError as exc:
