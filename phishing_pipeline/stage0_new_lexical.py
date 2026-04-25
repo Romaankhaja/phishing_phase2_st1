@@ -237,6 +237,34 @@ class Stage0LexicalEntity:
         return frozenset(self.brand_index.brand_tokens)
 
 
+@dataclass(frozen=True)
+class _PreparedDomainProfile:
+    normalized_domain: str
+    domain_label: str
+    flat_label: str
+    domain_parts: tuple[str, ...]
+    label_length: int
+    flat_label_length: int
+    entropy_raw: float
+    entropy_feature: float
+    risk_keyword_hits: tuple[str, ...]
+    structural_component: float
+    phishing_component: float
+
+
+@dataclass(frozen=True)
+class _CompiledStage0LexicalCache:
+    entities: tuple[Stage0LexicalEntity, ...]
+    whitelist_domains: tuple[str, ...]
+    entity_whitelist_indices: tuple[tuple[int, ...], ...]
+    brand_tokens: tuple[str, ...]
+    brand_token_lengths: tuple[int, ...]
+    entity_brand_token_indices: tuple[tuple[int, ...], ...]
+
+
+_COMPILED_STAGE0_CACHE: dict[int, _CompiledStage0LexicalCache] = {}
+
+
 def _stringify(value: Any) -> str:
     if value is None:
         return ""
@@ -448,16 +476,54 @@ def _brand_hits(domain_label: str, brand_tokens: Iterable[str]) -> list[str]:
     ]
 
 
-def score_domain(domain: str, brand_index: BrandIndex) -> dict[str, Any]:
-    """Score a normalized domain for Stage-0 lexical shortlisting."""
+def _prepare_domain_profile(domain: Any) -> _PreparedDomainProfile | None:
+    normalized_domain = normalize_domain(domain)
+    if not normalized_domain:
+        return None
 
-    domain = _stringify(domain).strip().lower()
-    domain_label, _ = split_registrable_domain(domain)
+    domain_label, _ = split_registrable_domain(normalized_domain)
     if not domain_label:
-        domain_label = extract_hostname(domain).split(".", 1)[0]
+        domain_label = extract_hostname(normalized_domain).split(".", 1)[0]
 
     flat_label = flatten_text(domain_label)
-    if not flat_label:
+    domain_parts = tuple(_domain_parts(domain_label))
+    entropy_raw = _shannon_entropy(domain_label) if domain_label else 0.0
+    phishing_hits = [keyword for keyword in PHISHING_KEYWORDS if keyword in flat_label]
+    suffix_hint_hits = [hint for hint in SHORT_BRAND_SUFFIX_HINTS if hint in flat_label]
+    risk_keyword_hits = tuple(sorted(set(phishing_hits) | set(suffix_hint_hits)))
+    structural_component = 0.0
+    if domain_label:
+        structural_component = (_length_component(domain_label) * 0.35) + (
+            _entropy_component(domain_label) * 0.35
+        )
+    phishing_component = (
+        min(12.0, 6.0 + (len(risk_keyword_hits) - 1) * 3.0)
+        if risk_keyword_hits
+        else 0.0
+    )
+    return _PreparedDomainProfile(
+        normalized_domain=normalized_domain,
+        domain_label=domain_label,
+        flat_label=flat_label,
+        domain_parts=domain_parts,
+        label_length=len(domain_label),
+        flat_label_length=len(flat_label),
+        entropy_raw=entropy_raw,
+        entropy_feature=round(entropy_raw, 4),
+        risk_keyword_hits=risk_keyword_hits,
+        structural_component=structural_component,
+        phishing_component=phishing_component,
+    )
+
+
+def _score_prepared_domain(
+    profile: _PreparedDomainProfile | None,
+    brand_tokens: Sequence[str],
+    *,
+    precomputed_brand_hits: Sequence[str] | None = None,
+    precomputed_keyword_similarity: float | None = None,
+) -> dict[str, Any]:
+    if profile is None or not profile.flat_label:
         return {
             "final_score": 0,
             "risk": "low",
@@ -471,28 +537,28 @@ def score_domain(domain: str, brand_index: BrandIndex) -> dict[str, Any]:
             },
         }
 
-    phishing_hits = [keyword for keyword in PHISHING_KEYWORDS if keyword in flat_label]
-    suffix_hint_hits = [hint for hint in SHORT_BRAND_SUFFIX_HINTS if hint in flat_label]
-    risk_keyword_hits = sorted(set(phishing_hits) | set(suffix_hint_hits))
-    brand_hits = _brand_hits(domain_label, brand_index.brand_tokens)
+    if precomputed_brand_hits is None:
+        brand_hits = _brand_hits(profile.domain_label, brand_tokens)
+    else:
+        brand_hits = sorted({str(token or "") for token in precomputed_brand_hits if str(token or "")})
 
-    length_component = _length_component(domain_label)
-    entropy_component = _entropy_component(domain_label)
-    keyword_component = _keyword_component(risk_keyword_hits, brand_hits)
-    similarity_component, keyword_similarity_score = _similarity_component(
-        flat_label,
-        brand_index.brand_tokens,
-    )
-    has_fuzzy_brand_evidence = bool(risk_keyword_hits) and (
+    if precomputed_keyword_similarity is None:
+        similarity_component, keyword_similarity_score = _similarity_component(
+            profile.flat_label,
+            brand_tokens,
+        )
+    else:
+        keyword_similarity_score = float(precomputed_keyword_similarity or 0.0)
+        similarity_component = min(25.0, keyword_similarity_score * 25.0)
+
+    has_fuzzy_brand_evidence = bool(profile.risk_keyword_hits) and (
         keyword_similarity_score >= FUZZY_BRAND_EVIDENCE_THRESHOLD
     )
     has_brand_evidence = bool(brand_hits) or has_fuzzy_brand_evidence
-    structural_component = 0.0
-    if has_brand_evidence:
-        structural_component = (length_component * 0.35) + (entropy_component * 0.35)
-    phishing_component = 0.0
-    if has_brand_evidence and risk_keyword_hits:
-        phishing_component = min(12.0, 6.0 + (len(risk_keyword_hits) - 1) * 3.0)
+    structural_component = profile.structural_component if has_brand_evidence else 0.0
+    phishing_component = (
+        profile.phishing_component if has_brand_evidence and profile.risk_keyword_hits else 0.0
+    )
     brand_component = 0.0
     if brand_hits:
         brand_component = min(32.0, 18.0 + (len(brand_hits) - 1) * 6.0)
@@ -520,14 +586,112 @@ def score_domain(domain: str, brand_index: BrandIndex) -> dict[str, Any]:
         "final_score": final_score,
         "risk": risk,
         "features": {
-            "label_length": len(domain_label),
-            "entropy": round(_shannon_entropy(domain_label), 4),
-                "keyword_presence": bool(risk_keyword_hits or brand_hits),
-                "phishing_keyword_hits": risk_keyword_hits,
-            "brand_hits": sorted(set(brand_hits)),
+            "label_length": profile.label_length,
+            "entropy": profile.entropy_feature,
+            "keyword_presence": bool(profile.risk_keyword_hits or brand_hits),
+            "phishing_keyword_hits": list(profile.risk_keyword_hits),
+            "brand_hits": list(brand_hits),
             "keyword_similarity_score": round(keyword_similarity_score, 4),
         },
     }
+
+
+def _build_classification_result(
+    *,
+    normalized_domain: str,
+    max_similarity: float,
+    best_matching_domain: str,
+    score_result: Mapping[str, Any],
+) -> dict[str, Any]:
+    features = dict(score_result.get("features", {}) or {})
+    final_score = int(score_result.get("final_score", 0) or 0)
+    has_fuzzy_brand_evidence = bool(features.get("phishing_keyword_hits", [])) and (
+        float(features.get("keyword_similarity_score", 0.0) or 0.0) >= WHITELIST_SIMILARITY_THRESHOLD
+    )
+    has_brand_evidence = bool(features.get("brand_hits", [])) or has_fuzzy_brand_evidence
+
+    if max_similarity >= WHITELIST_SIMILARITY_THRESHOLD:
+        label = "lexical"
+        match_reason = "whitelist_similarity_match"
+    elif final_score >= SCORE_THRESHOLD and has_brand_evidence:
+        label = "lexical"
+        match_reason = "score_threshold_match"
+    else:
+        label = "non_lexical"
+        match_reason = "no_match"
+
+    return {
+        "normalized_domain": normalized_domain,
+        "similarity_score": float(max_similarity),
+        "best_matching_domain": str(best_matching_domain or ""),
+        "match_reason": match_reason,
+        "label": label,
+        "final_score": final_score,
+        "risk": str(score_result.get("risk", "low") or "low"),
+        "label_length": int(features.get("label_length", 0) or 0),
+        "entropy": float(features.get("entropy", 0.0) or 0.0),
+        "keyword_presence": bool(features.get("keyword_presence", False)),
+        "phishing_keyword_hits": list(features.get("phishing_keyword_hits", []) or []),
+        "brand_hits": list(features.get("brand_hits", []) or []),
+        "keyword_similarity_score": float(features.get("keyword_similarity_score", 0.0) or 0.0),
+        "has_brand_evidence": has_brand_evidence,
+        "has_fuzzy_brand_evidence": has_fuzzy_brand_evidence,
+    }
+
+
+def _compiled_stage0_cache(
+    lexical_cache: Sequence[Stage0LexicalEntity],
+) -> _CompiledStage0LexicalCache:
+    cache = tuple(lexical_cache or ())
+    cache_key = id(cache)
+    compiled = _COMPILED_STAGE0_CACHE.get(cache_key)
+    if compiled is not None and compiled.entities is cache:
+        return compiled
+
+    whitelist_domains: list[str] = []
+    whitelist_index: dict[str, int] = {}
+    brand_tokens: list[str] = []
+    brand_token_index: dict[str, int] = {}
+    entity_whitelist_indices: list[tuple[int, ...]] = []
+    entity_brand_token_indices: list[tuple[int, ...]] = []
+
+    for entity in cache:
+        entity_domain_indices: list[int] = []
+        for domain in entity.whitelist_domains:
+            idx = whitelist_index.get(domain)
+            if idx is None:
+                idx = len(whitelist_domains)
+                whitelist_index[domain] = idx
+                whitelist_domains.append(domain)
+            entity_domain_indices.append(idx)
+        entity_whitelist_indices.append(tuple(entity_domain_indices))
+
+        entity_token_indices: list[int] = []
+        for token in entity.brand_index.brand_tokens:
+            idx = brand_token_index.get(token)
+            if idx is None:
+                idx = len(brand_tokens)
+                brand_token_index[token] = idx
+                brand_tokens.append(token)
+            entity_token_indices.append(idx)
+        entity_brand_token_indices.append(tuple(entity_token_indices))
+
+    compiled = _CompiledStage0LexicalCache(
+        entities=cache,
+        whitelist_domains=tuple(whitelist_domains),
+        entity_whitelist_indices=tuple(entity_whitelist_indices),
+        brand_tokens=tuple(brand_tokens),
+        brand_token_lengths=tuple(len(token) for token in brand_tokens),
+        entity_brand_token_indices=tuple(entity_brand_token_indices),
+    )
+    _COMPILED_STAGE0_CACHE[cache_key] = compiled
+    return compiled
+
+
+def score_domain(domain: str, brand_index: BrandIndex) -> dict[str, Any]:
+    """Score a normalized domain for Stage-0 lexical shortlisting."""
+    profile = _prepare_domain_profile(domain)
+    return _score_prepared_domain(profile, brand_index.brand_tokens)
 
 
 def normalize_domain(domain: Any) -> str:
@@ -571,57 +735,28 @@ def _similarity_score_with_match(domain: str, whitelist_domains: Sequence[str]) 
 
 def classify_domain(domain: Any, entity: Stage0LexicalEntity) -> dict[str, Any]:
     """Classify one domain against one aligned entity using the new Stage-0 rules."""
-
-    normalized_domain = normalize_domain(domain)
-    if not normalized_domain:
+    profile = _prepare_domain_profile(domain)
+    if profile is None:
         return _build_non_lexical_result(match_reason="empty_or_invalid_domain")
 
     try:
         max_similarity, best_matching_domain = _similarity_score_with_match(
-            normalized_domain,
+            profile.normalized_domain,
             entity.whitelist_domains,
         )
-        score_result = score_domain(normalized_domain, entity.brand_index)
-        features = score_result["features"]
-        final_score = int(score_result["final_score"])
+        score_result = _score_prepared_domain(profile, entity.brand_index.brand_tokens)
     except Exception:
         return _build_non_lexical_result(
-            normalized_domain=normalized_domain,
+            normalized_domain=profile.normalized_domain,
             match_reason="classification_error",
         )
 
-    has_fuzzy_brand_evidence = bool(features["phishing_keyword_hits"]) and (
-        float(features["keyword_similarity_score"]) >= WHITELIST_SIMILARITY_THRESHOLD
+    return _build_classification_result(
+        normalized_domain=profile.normalized_domain,
+        max_similarity=max_similarity,
+        best_matching_domain=best_matching_domain,
+        score_result=score_result,
     )
-    has_brand_evidence = bool(features["brand_hits"]) or has_fuzzy_brand_evidence
-
-    if max_similarity >= WHITELIST_SIMILARITY_THRESHOLD:
-        label = "lexical"
-        match_reason = "whitelist_similarity_match"
-    elif final_score >= SCORE_THRESHOLD and has_brand_evidence:
-        label = "lexical"
-        match_reason = "score_threshold_match"
-    else:
-        label = "non_lexical"
-        match_reason = "no_match"
-
-    return {
-        "normalized_domain": normalized_domain,
-        "similarity_score": max_similarity,
-        "best_matching_domain": best_matching_domain,
-        "match_reason": match_reason,
-        "label": label,
-        "final_score": final_score,
-        "risk": score_result["risk"],
-        "label_length": features["label_length"],
-        "entropy": features["entropy"],
-        "keyword_presence": features["keyword_presence"],
-        "phishing_keyword_hits": list(features["phishing_keyword_hits"]),
-        "brand_hits": list(features["brand_hits"]),
-        "keyword_similarity_score": float(features["keyword_similarity_score"]),
-        "has_brand_evidence": has_brand_evidence,
-        "has_fuzzy_brand_evidence": has_fuzzy_brand_evidence,
-    }
 
 
 def _build_non_lexical_result(normalized_domain: str = "", match_reason: str = "no_match") -> dict[str, Any]:
@@ -698,6 +833,7 @@ def evaluate_prefetch_lexical_bundle(
     target_domain: str,
     lexical_cache: Sequence[Stage0LexicalEntity],
     top_k: int | None = None,
+    include_stage0_metadata: bool = False,
 ) -> dict[str, Any]:
     """Return the current pipeline's expected lexical metric bundle."""
 
@@ -719,6 +855,7 @@ def evaluate_prefetch_lexical_bundle(
                 "candidate_mask": empty_mask,
                 "candidate_reasons": [],
                 "best_matching_domains": [],
+                "stage0_best_metadata": {},
                 "stage0_metadata": [],
             },
         }
@@ -735,31 +872,153 @@ def evaluate_prefetch_lexical_bundle(
     candidate_reasons = [""] * n_entities
     best_matching_domains = [""] * n_entities
     stage0_metadata: list[dict[str, Any]] = []
+    stage0_final_scores = np.zeros(n_entities, dtype="int32")
+    stage0_keyword_similarity_scores = np.zeros(n_entities, dtype="float64")
+    stage0_match_reasons = [""] * n_entities
+    stage0_labels = ["non_lexical"] * n_entities
+    stage0_risks = ["low"] * n_entities
+    stage0_brand_hits_rows: list[list[str]] = [[] for _ in range(n_entities)]
+    stage0_has_brand_evidence = np.zeros(n_entities, dtype=bool)
+    stage0_has_fuzzy_brand_evidence = np.zeros(n_entities, dtype=bool)
 
-    normalized_domain = normalize_domain(target_domain or normalized_url)
+    profile = _prepare_domain_profile(target_domain or normalized_url)
+    if profile is None:
+        if include_stage0_metadata:
+            stage0_metadata = [
+                _build_non_lexical_result(match_reason="empty_or_invalid_domain")
+                for _ in range(n_entities)
+            ]
+    else:
+        compiled = _compiled_stage0_cache(cache)
+        if compiled.whitelist_domains:
+            domain_similarity_scores = np.asarray(
+                rapidfuzz_process.cdist(
+                    [profile.normalized_domain],
+                    compiled.whitelist_domains,
+                    scorer=distance.JaroWinkler.normalized_similarity,
+                )[0],
+                dtype="float64",
+            )
+        else:
+            domain_similarity_scores = np.zeros(0, dtype="float64")
 
-    for idx, entity in enumerate(cache):
-        result = classify_domain(normalized_domain, entity)
-        similarity = float(result.get("similarity_score", 0.0) or 0.0)
-        final_score = int(result.get("final_score", 0) or 0)
-        keyword_similarity = float(result.get("keyword_similarity_score", 0.0) or 0.0)
-        is_lexical = str(result.get("label", "")).strip().lower() == "lexical"
-        has_brand_evidence = bool(result.get("has_brand_evidence", False))
+        matched_brand_tokens = {
+            token
+            for token in compiled.brand_tokens
+            if _token_matches_domain(token, profile.domain_parts)
+        }
+        if compiled.brand_tokens:
+            brand_token_similarity_scores = np.asarray(
+                rapidfuzz_process.cdist(
+                    [profile.flat_label],
+                    compiled.brand_tokens,
+                    scorer=distance.JaroWinkler.normalized_similarity,
+                )[0],
+                dtype="float64",
+            )
+            for token_idx, token_length in enumerate(compiled.brand_token_lengths):
+                if abs(token_length - profile.flat_label_length) > 6:
+                    brand_token_similarity_scores[token_idx] = 0.0
+        else:
+            brand_token_similarity_scores = np.zeros(0, dtype="float64")
 
-        lexical_scores[idx] = max(similarity, final_score / 100.0)
-        jw_scores[idx] = similarity
-        token_scores[idx] = keyword_similarity
-        skeleton_scores[idx] = similarity
-        host_scores[idx] = similarity
-        lexical_rule_hit[idx] = is_lexical
-        brand_token_hit[idx] = bool(is_lexical and has_brand_evidence)
-        best_matching_domains[idx] = str(result.get("best_matching_domain", "") or "")
+        for idx, entity in enumerate(cache):
+            best_matching_domain = ""
+            similarity = 0.0
+            for domain_idx in compiled.entity_whitelist_indices[idx]:
+                candidate_score = float(domain_similarity_scores[domain_idx])
+                if candidate_score > similarity:
+                    similarity = candidate_score
+                    best_matching_domain = compiled.whitelist_domains[domain_idx]
 
-        if is_lexical:
-            candidate_mask[idx] = True
-            candidate_reasons[idx] = str(result.get("match_reason", "") or "stage0_lexical_match")
+            brand_hits = [
+                token
+                for token in entity.brand_index.brand_tokens
+                if token in matched_brand_tokens
+            ]
+            keyword_similarity = 0.0
+            for token_idx in compiled.entity_brand_token_indices[idx]:
+                candidate_score = float(brand_token_similarity_scores[token_idx])
+                if candidate_score > keyword_similarity:
+                    keyword_similarity = candidate_score
 
-        stage0_metadata.append(result)
+            has_fuzzy_brand_evidence = bool(profile.risk_keyword_hits) and (
+                keyword_similarity >= WHITELIST_SIMILARITY_THRESHOLD
+            )
+            has_brand_evidence = bool(brand_hits) or has_fuzzy_brand_evidence
+            structural_component = profile.structural_component if has_brand_evidence else 0.0
+            phishing_component = (
+                profile.phishing_component if has_brand_evidence and profile.risk_keyword_hits else 0.0
+            )
+            brand_component = 0.0
+            if brand_hits:
+                brand_component = min(32.0, 18.0 + (len(brand_hits) - 1) * 6.0)
+            elif has_fuzzy_brand_evidence:
+                brand_component = 12.0
+            similarity_component = min(25.0, keyword_similarity * 25.0)
+            final_score = int(
+                round(
+                    structural_component
+                    + phishing_component
+                    + brand_component
+                    + similarity_component
+                )
+            )
+            final_score = max(0, min(100, final_score))
+
+            if similarity >= WHITELIST_SIMILARITY_THRESHOLD:
+                is_lexical = True
+                match_reason = "whitelist_similarity_match"
+            elif final_score >= SCORE_THRESHOLD and has_brand_evidence:
+                is_lexical = True
+                match_reason = "score_threshold_match"
+            else:
+                is_lexical = False
+                match_reason = "no_match"
+
+            lexical_scores[idx] = max(similarity, final_score / 100.0)
+            jw_scores[idx] = similarity
+            token_scores[idx] = keyword_similarity
+            skeleton_scores[idx] = similarity
+            host_scores[idx] = similarity
+            lexical_rule_hit[idx] = is_lexical
+            brand_token_hit[idx] = bool(is_lexical and has_brand_evidence)
+            best_matching_domains[idx] = best_matching_domain
+
+            if is_lexical:
+                candidate_mask[idx] = True
+                candidate_reasons[idx] = match_reason or "stage0_lexical_match"
+
+            risk = "high" if final_score >= 70 else "medium" if final_score >= 40 else "low"
+            stage0_final_scores[idx] = final_score
+            stage0_keyword_similarity_scores[idx] = keyword_similarity
+            stage0_match_reasons[idx] = match_reason
+            stage0_labels[idx] = "lexical" if is_lexical else "non_lexical"
+            stage0_risks[idx] = risk
+            stage0_brand_hits_rows[idx] = list(brand_hits)
+            stage0_has_brand_evidence[idx] = has_brand_evidence
+            stage0_has_fuzzy_brand_evidence[idx] = has_fuzzy_brand_evidence
+
+            if include_stage0_metadata:
+                stage0_metadata.append(
+                    {
+                        "normalized_domain": profile.normalized_domain,
+                        "similarity_score": similarity,
+                        "best_matching_domain": best_matching_domain,
+                        "match_reason": match_reason,
+                        "label": "lexical" if is_lexical else "non_lexical",
+                        "final_score": final_score,
+                        "risk": risk,
+                        "label_length": profile.label_length,
+                        "entropy": profile.entropy_feature,
+                        "keyword_presence": bool(profile.risk_keyword_hits or brand_hits),
+                        "phishing_keyword_hits": list(profile.risk_keyword_hits),
+                        "brand_hits": list(brand_hits),
+                        "keyword_similarity_score": round(keyword_similarity, 4),
+                        "has_brand_evidence": has_brand_evidence,
+                        "has_fuzzy_brand_evidence": has_fuzzy_brand_evidence,
+                    }
+                )
 
     if not candidate_mask.any():
         fallback_count = 10 if top_k is None else max(1, int(top_k))
@@ -770,6 +1029,39 @@ def evaluate_prefetch_lexical_bundle(
             for idx in fallback_indices:
                 reason = candidate_reasons[idx]
                 candidate_reasons[idx] = f"{reason}|fallback_top_k".strip("|")
+
+    candidate_indices = np.where(candidate_mask)[0]
+    if candidate_indices.size == 0:
+        candidate_indices = np.arange(n_entities, dtype=int)
+    if candidate_indices.size > 0:
+        best_local_idx = int(np.argmax(lexical_scores[candidate_indices]))
+        best_idx = int(candidate_indices[best_local_idx])
+    else:
+        best_idx = 0
+
+    if include_stage0_metadata and len(stage0_metadata) > best_idx:
+        stage0_best_metadata = dict(stage0_metadata[best_idx])
+    elif profile is None:
+        stage0_best_metadata = _build_non_lexical_result(match_reason="empty_or_invalid_domain")
+    else:
+        best_brand_hits = list(stage0_brand_hits_rows[best_idx])
+        stage0_best_metadata = {
+            "normalized_domain": profile.normalized_domain,
+            "similarity_score": float(jw_scores[best_idx]) if n_entities else 0.0,
+            "best_matching_domain": str(best_matching_domains[best_idx] or ""),
+            "match_reason": str(stage0_match_reasons[best_idx] or ""),
+            "label": str(stage0_labels[best_idx] or "non_lexical"),
+            "final_score": int(stage0_final_scores[best_idx] or 0),
+            "risk": str(stage0_risks[best_idx] or "low"),
+            "label_length": profile.label_length,
+            "entropy": profile.entropy_feature,
+            "keyword_presence": bool(profile.risk_keyword_hits or best_brand_hits),
+            "phishing_keyword_hits": list(profile.risk_keyword_hits),
+            "brand_hits": best_brand_hits,
+            "keyword_similarity_score": round(float(stage0_keyword_similarity_scores[best_idx] or 0.0), 4),
+            "has_brand_evidence": bool(stage0_has_brand_evidence[best_idx]),
+            "has_fuzzy_brand_evidence": bool(stage0_has_fuzzy_brand_evidence[best_idx]),
+        }
 
     return {
         "hybrid_metrics": {
@@ -784,6 +1076,7 @@ def evaluate_prefetch_lexical_bundle(
             "candidate_mask": candidate_mask,
             "candidate_reasons": candidate_reasons,
             "best_matching_domains": best_matching_domains,
+            "stage0_best_metadata": stage0_best_metadata,
             "stage0_metadata": stage0_metadata,
         },
     }

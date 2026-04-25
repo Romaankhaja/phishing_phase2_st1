@@ -240,9 +240,9 @@ RELIABILITY_CONFIG = {
 
 PIPELINE_STAGE_CONFIG = {
     "stage0": {
-        "lexical_workers": 12,
-        "batch_size": 512,
-        "inflight_batches": 8,
+        "lexical_workers": 1,
+        "batch_size": 4096,
+        "inflight_batches": 1,
         "execution_mode": "streaming-concurrent",
         "progress_log_interval_seconds": 10,
         "adaptive_downshift": True,

@@ -271,15 +271,15 @@ ACTIVE_FETCH_LIMIT_FLOOR = min(
     ),
 )
 
-_DEFAULT_LEXICAL_WORKERS = min(32, max(4, _CPU_COUNT - 4))
+_DEFAULT_LEXICAL_WORKERS = 1
 LEXICAL_WORKERS = min(
     max(1, _CPU_COUNT),
     _read_env_int("PHISHING_LEXICAL_WORKERS", _DEFAULT_LEXICAL_WORKERS),
 )
-LEXICAL_BATCH_SIZE = _read_env_int("PHISHING_LEXICAL_BATCH_SIZE", 1024)
+LEXICAL_BATCH_SIZE = _read_env_int("PHISHING_LEXICAL_BATCH_SIZE", 4096)
 LEXICAL_INFLIGHT_BATCHES = _read_env_int(
     "PHISHING_LEXICAL_INFLIGHT_BATCHES",
-    max(1, LEXICAL_WORKERS * 2),
+    1 if LEXICAL_WORKERS == 1 else max(1, LEXICAL_WORKERS),
 )
 LEXICAL_PROGRESS_INTERVAL_S = _read_env_float(
     "PHISHING_LEXICAL_PROGRESS_INTERVAL_S",
@@ -2167,11 +2167,13 @@ def _compute_prefetch_lexical_state_from_normalized_url(
     brand_token_hit = bool(lexical_metrics["brand_token_hit"][best_idx]) if n_entities else False
     generic_token_only_match = bool(lexical_metrics["generic_token_only_match"][best_idx]) if n_entities else False
     stage0_metadata_rows = list(lexical_metrics.get("stage0_metadata", []) or [])
-    stage0_metadata = (
-        dict(stage0_metadata_rows[best_idx])
-        if n_entities and len(stage0_metadata_rows) > best_idx
-        else {}
-    )
+    stage0_metadata = dict(lexical_metrics.get("stage0_best_metadata", {}) or {})
+    if not stage0_metadata:
+        stage0_metadata = (
+            dict(stage0_metadata_rows[best_idx])
+            if n_entities and len(stage0_metadata_rows) > best_idx
+            else {}
+        )
     hybrid_lexical_hit = bool(lexical_rule_hit or brand_token_hit)
     strict_lexical_hit = bool(hybrid_lexical_hit and not generic_token_only_match)
     candidate_generation_reason = (

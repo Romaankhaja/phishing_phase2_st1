@@ -196,6 +196,45 @@ class Stage0LexicalPrecisionRulesTests(unittest.TestCase):
         self.assertIn("airtel", metrics["stage0_brand_hits"])
         self.assertIn("secure", metrics["stage0_phishing_keyword_hits"])
 
+    def test_fast_bundle_matches_per_entity_classifier(self):
+        normalized_url = comparison.normalize_url("https://airtel-secure-pay.club")
+        target_features = comparison._prepare_target_lexical_features(normalized_url)
+        cache = comparison._active_lexical_cache()
+
+        bundle = comparison._stage0_new_lexical.evaluate_prefetch_lexical_bundle(
+            normalized_url=target_features.normalized_url,
+            target_domain=target_features.target_domain,
+            lexical_cache=cache,
+            top_k=int(comparison._DEFAULT_SCORING_CONFIG["typo_top_k"]),
+            include_stage0_metadata=True,
+        )
+        bundle_rows = bundle["hybrid_metrics"]["stage0_metadata"]
+
+        self.assertEqual(len(bundle_rows), len(cache))
+        for idx, entity in enumerate(cache):
+            expected = comparison._stage0_new_lexical.classify_domain(
+                target_features.target_domain,
+                entity,
+            )
+            actual = bundle_rows[idx]
+            for key in (
+                "normalized_domain",
+                "best_matching_domain",
+                "match_reason",
+                "label",
+                "final_score",
+                "risk",
+                "label_length",
+                "keyword_presence",
+                "phishing_keyword_hits",
+                "brand_hits",
+                "has_brand_evidence",
+                "has_fuzzy_brand_evidence",
+            ):
+                self.assertEqual(expected[key], actual[key], f"{entity.name}:{key}")
+            for key in ("similarity_score", "entropy", "keyword_similarity_score"):
+                self.assertAlmostEqual(expected[key], actual[key], places=7, msg=f"{entity.name}:{key}")
+
 
 if __name__ == "__main__":
     unittest.main()
