@@ -2920,7 +2920,7 @@ async def run_pipeline(
         )
         if classify_hash_floor > 0 and not df_below_floor.empty:
             import json
-            from .utils import _coalesce_public_output_url, FINAL_OUTPUT, FILTERED_OUTPUT
+            from .utils import _coalesce_public_output_url, FINAL_OUTPUT as UTILS_FINAL_OUTPUT, FILTERED_OUTPUT as UTILS_FILTERED_OUTPUT
             from .checkpoint import make_record_key
             skipped_records = []
             for _, row in df_below_floor.iterrows():
@@ -2961,8 +2961,8 @@ async def run_pipeline(
             df_dropped_formatted = pd.DataFrame(skipped_records, columns=_submission_record_columns())
             df_out = pd.concat([df_out, df_dropped_formatted], ignore_index=True)
             
-            output_file_path = get_run_artifact_path(run_context, "final_output_csv", FINAL_OUTPUT)
-            output_filtered_path = get_run_artifact_path(run_context, "final_output_filtered_csv", FILTERED_OUTPUT)
+            output_file_path = get_run_artifact_path(run_context, "final_output_csv", UTILS_FINAL_OUTPUT)
+            output_filtered_path = get_run_artifact_path(run_context, "final_output_filtered_csv", UTILS_FILTERED_OUTPUT)
             df_out.to_csv(output_file_path, index=False, encoding="utf-8")
             flagged_df = df_out[
                 df_out["Phishing/Suspected Domains (i.e. Class Label)"].isin(["Phishing", "Suspected"])
@@ -2989,12 +2989,12 @@ async def run_pipeline(
                 pass
 
     BAR_FMT = "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
-    print("\n" + "="*70)
-    print(f"📊 STREAMING PIPELINE: {total_domains} domains")
-    print("="*70)
-    print("  📸 Screenshots + Network  →  🔍 OCR (GPU)  →  ⚡ WHOIS/RDAP + Classify")
-    print("  All 3 stages run CONCURRENTLY (streaming)")
-    print("="*70 + "\n")
+    logger.info("%s", "=" * 70)
+    logger.info("STREAMING PIPELINE: %d domains", total_domains)
+    logger.info("%s", "=" * 70)
+    logger.info("Screenshots + Network -> OCR (GPU) -> WHOIS/RDAP + Classify")
+    logger.info("All 3 stages run concurrently (streaming)")
+    logger.info("%s", "=" * 70)
 
     screenshot_pbar = tqdm_sync(
         total=total_domains, desc="📸 Screenshots", unit="dom",
@@ -3327,12 +3327,13 @@ async def run_pipeline(
         logger.warning("⚠ Could not remove temporary file: %s", e)
 
     pipeline_time = time.time() - start_time
-    print("\n" + "="*70)
-    print(f"✅ PIPELINE COMPLETE")
-    print(f"   Total domains: {total_domains}")
-    print(f"   Total time: {pipeline_time/60:.1f} minutes ({pipeline_time:.0f} seconds)")
-    print(f"   Average: {pipeline_time/total_domains:.2f} seconds/domain" if total_domains else "")
-    print("="*70 + "\n")
+    logger.info("%s", "=" * 70)
+    logger.info("PIPELINE COMPLETE")
+    logger.info("Total domains: %d", total_domains)
+    logger.info("Total time: %.1f minutes (%.0f seconds)", pipeline_time / 60, pipeline_time)
+    if total_domains:
+        logger.info("Average: %.2f seconds/domain", pipeline_time / total_domains)
+    logger.info("%s", "=" * 70)
 
     return df_out
 

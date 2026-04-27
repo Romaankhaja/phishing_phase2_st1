@@ -11,9 +11,15 @@ import csv
 import json
 import logging
 import warnings
+import tempfile
 from typing import Any
 
 os.environ.setdefault("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
+os.environ.setdefault(
+    "TLDEXTRACT_CACHE",
+    os.path.join(tempfile.gettempdir(), "phishing-ml-tldextract-cache"),
+)
+os.makedirs(os.environ["TLDEXTRACT_CACHE"], exist_ok=True)
 
 # Event loop policy on Windows
 if sys.platform.startswith("win"):

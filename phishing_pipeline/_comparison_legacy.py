@@ -19,6 +19,7 @@ import numpy as np
 import csv
 import math
 import os
+import tempfile
 import time
 from datetime import datetime, timezone
 import logging as _logging
@@ -3609,7 +3610,17 @@ def _domain_label_skeleton(label: str) -> str:
     return normalized.translate(_TYPO_CONFUSABLE_MAP)
 
 
-_TLD_EXTRACTOR = tldextract.TLDExtract(suffix_list_urls=None)
+_TLD_EXTRACTOR_CACHE_DIR = os.path.join(
+    tempfile.gettempdir(),
+    "phishing-ml-comparison-tldextract",
+)
+os.makedirs(_TLD_EXTRACTOR_CACHE_DIR, exist_ok=True)
+
+_TLD_EXTRACTOR = tldextract.TLDExtract(
+    cache_dir=_TLD_EXTRACTOR_CACHE_DIR,
+    suffix_list_urls=None,
+    fallback_to_snapshot=True,
+)
 
 
 def _extract_tld(value: str):

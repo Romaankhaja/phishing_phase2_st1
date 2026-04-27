@@ -1,0 +1,10 @@
+2026-04-26 12:22:46,097 | INFO | Hashing shortlist (lexical-only) started | urls=10 | threshold=58.0 | domain_similarity_threshold=0.800 | high_confidence_threshold=78.00 | medium_confidence_threshold=68.00 | typo_top_k=10 | typo_min_score=0.750 | lexical_pass_min_score=0.850
+2026-04-26 12:22:46,097 | INFO | Scoring weights | domain=30, favicon=14, ssl_hash=12, html_hash=6, domain_hash=8, keywords=10
+2026-04-26 12:22:46,097 | INFO | Hashing log file: D:\phishing_ml\output\runs\run_20260426T065038Z\hash\hashing_shortlist.log
+2026-04-26 12:22:46,099 | INFO | Stage0 lexical runtime | input_urls=10 | metric_urls=10 | workers=4 | batch_size=256 | inflight_batches=8 | progress_interval_s=1.0
+2026-04-26 12:22:46,099 | INFO | Stage0 lexical executor | kind=thread | workers=4 | shortlist_execution_mode=legacy-batch
+2026-04-26 12:22:49,125 | INFO | Stage0 lexical gate completed | processed=10/10 | rate=3.3 url/s | elapsed=3.0s | hits=1 | misses=9 | skipped=0 | workers=4 | metric_urls=10 | batches=1/1 | avg_batch_latency_ms=7.0
+2026-04-26 12:22:49,125 | INFO | Lexical-only shortlist routing | lexical_hits=1 | lexical_misses=9 | hash_candidates=0 | dns_passthrough=1
+2026-04-26 12:22:49,126 | INFO | Hashing shortlist completed | deep_attempted=0 | hash_finalized=0 | hashed_success=0 | fetch_failed=0 | fetch_timed_out=0 | final_matches_total=0 | gpu_batches=0 | gpu_items=0 | avg_gpu_batch=0.0 | urls_per_sec=0.00 | threshold=58.0 | elapsed=0.0s
+2026-04-26 12:22:49,126 | INFO | Anchor summary (shortlisted) | typo_anchor=0 | hash_anchor=0 | shortlisted=0
+2026-04-26 12:22:49,136 | INFO | Stage0 lexical decisions CSV written to D:\phishing_ml\output\runs\run_20260426T065038Z\stage0\stage0_lexical_decisions.csv with 10 rows

@@ -1,46 +1,46 @@
 {
   "artifact_paths": {
-    "checkpoints_csv": "c:\\Users\\sathwik.kusuri\\Documents\\phishing_ml\\output\\runs\\run_20260424T151533Z\\events\\checkpoints.csv",
-    "latest_output_dir": "c:\\Users\\sathwik.kusuri\\Documents\\phishing_ml\\output\\latest",
-    "pipeline_run_results_csv": "c:\\Users\\sathwik.kusuri\\Documents\\phishing_ml\\output\\runs\\run_20260424T151533Z\\events\\pipeline_run_results.csv",
-    "pipeline_stage_events_csv": "c:\\Users\\sathwik.kusuri\\Documents\\phishing_ml\\output\\runs\\run_20260424T151533Z\\events\\pipeline_stage_events.csv",
-    "run_manifest_json": "c:\\Users\\sathwik.kusuri\\Documents\\phishing_ml\\output\\runs\\run_20260424T151533Z\\run_manifest.json",
-    "run_output_dir": "c:\\Users\\sathwik.kusuri\\Documents\\phishing_ml\\output\\runs\\run_20260424T151533Z",
-    "run_summary_json": "c:\\Users\\sathwik.kusuri\\Documents\\phishing_ml\\output\\runs\\run_20260424T151533Z\\run_summary.json",
-    "stage_metrics_csv": "c:\\Users\\sathwik.kusuri\\Documents\\phishing_ml\\output\\runs\\run_20260424T151533Z\\events\\stage_metrics.csv",
-    "stall_events_csv": "c:\\Users\\sathwik.kusuri\\Documents\\phishing_ml\\output\\runs\\run_20260424T151533Z\\events\\stall_events.csv",
-    "submission_dir": "c:\\Users\\sathwik.kusuri\\Documents\\phishing_ml\\output\\runs\\run_20260424T151533Z\\submission\\PS-02_ISS_NLP_Submission",
-    "submission_zip": "c:\\Users\\sathwik.kusuri\\Documents\\phishing_ml\\output\\runs\\run_20260424T151533Z\\submission\\Submission-holdout_sets.zip",
-    "worker_heartbeats_csv": "c:\\Users\\sathwik.kusuri\\Documents\\phishing_ml\\output\\runs\\run_20260424T151533Z\\events\\worker_heartbeats.csv"
+    "checkpoints_csv": "D:\\phishing_ml\\output\\runs\\run_20260426T065038Z\\events\\checkpoints.csv",
+    "latest_output_dir": "D:\\phishing_ml\\output\\latest",
+    "pipeline_run_results_csv": "D:\\phishing_ml\\output\\runs\\run_20260426T065038Z\\events\\pipeline_run_results.csv",
+    "pipeline_stage_events_csv": "D:\\phishing_ml\\output\\runs\\run_20260426T065038Z\\events\\pipeline_stage_events.csv",
+    "run_manifest_json": "D:\\phishing_ml\\output\\runs\\run_20260426T065038Z\\run_manifest.json",
+    "run_output_dir": "D:\\phishing_ml\\output\\runs\\run_20260426T065038Z",
+    "run_summary_json": "D:\\phishing_ml\\output\\runs\\run_20260426T065038Z\\run_summary.json",
+    "stage_metrics_csv": "D:\\phishing_ml\\output\\runs\\run_20260426T065038Z\\events\\stage_metrics.csv",
+    "stall_events_csv": "D:\\phishing_ml\\output\\runs\\run_20260426T065038Z\\events\\stall_events.csv",
+    "submission_dir": "D:\\phishing_ml\\output\\runs\\run_20260426T065038Z\\submission\\PS-02_ISS_NLP_Submission",
+    "submission_zip": "D:\\phishing_ml\\output\\runs\\run_20260426T065038Z\\submission\\Submission-temp_inputs.zip",
+    "worker_heartbeats_csv": "D:\\phishing_ml\\output\\runs\\run_20260426T065038Z\\events\\worker_heartbeats.csv"
   },
-  "completed_at": "2026-04-25T14:14:31+00:00",
+  "completed_at": "2026-04-26T06:53:03+00:00",
   "consistency_guard": {
-    "effective_args_run_id": "run_20260424T151533Z",
-    "manifest_run_id": "run_20260424T151533Z",
+    "effective_args_run_id": "run_20260426T065038Z",
+    "manifest_run_id": "run_20260426T065038Z",
     "mixed_run_bundle_detected": false,
-    "summary_run_id": "run_20260424T151533Z"
+    "summary_run_id": "run_20260426T065038Z"
   },
-  "fatal_error_message": "[WinError 233] No process is on the other end of the pipe",
-  "fatal_error_type": "OSError",
-  "fatal_stage": "shortlist",
+  "fatal_error_message": "",
+  "fatal_error_type": "",
+  "fatal_stage": "",
   "final_decision_counts": {},
   "mixed_run_bundle_detected": false,
   "pipeline_status_counts": {
-    "holdout_ready": 25,
-    "pending": 283
+    "holdout_ready": 1,
+    "pending": 9
   },
-  "run_id": "run_20260424T151533Z",
-  "started_at": "2026-04-24T15:15:33+00:00",
-  "status": "failed",
+  "run_id": "run_20260426T065038Z",
+  "started_at": "2026-04-26T06:50:38+00:00",
+  "status": "completed",
   "telemetry_mode": "sampled",
   "totals": {
-    "stage_events": 2262,
+    "stage_events": 22,
     "stage_metrics": 0,
     "stall_events": 0,
     "submission_records_emitted": 0,
     "terminal_records": 0,
-    "tracked_records": 308,
+    "tracked_records": 10,
     "worker_heartbeats": 0
   },
-  "updated_at": "2026-04-25T14:14:31+00:00"
+  "updated_at": "2026-04-26T06:53:03+00:00"
 }

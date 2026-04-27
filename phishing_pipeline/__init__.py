@@ -1,6 +1,15 @@
 # phishing_pipeline/__init__.py
 """Lightweight package init — avoid importing heavy submodules at import time."""
 
+import os
+import tempfile
+
+os.environ.setdefault(
+    "TLDEXTRACT_CACHE",
+    os.path.join(tempfile.gettempdir(), "phishing-ml-tldextract-cache"),
+)
+os.makedirs(os.environ["TLDEXTRACT_CACHE"], exist_ok=True)
+
 __version__ = "0.1"
 __all__ = ["run_pipeline", "package_results"]
 
